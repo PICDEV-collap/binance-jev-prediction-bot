@@ -168,12 +168,24 @@ export default function DashboardPage() {
 
           if (message.type === 'INITIAL_SNAPSHOT') {
             if (message.system_status) setStatus(message.system_status);
-            if (message.active_markets?.length > 0) setMarkets(message.active_markets);
+            if (message.active_markets?.length > 0) {
+              setMarkets(message.active_markets);
+              setSelectedMarketId((curr) => {
+                if (!curr || !message.active_markets.some((m: MarketItem) => m.market_id === curr)) {
+                  return message.active_markets[0].market_id;
+                }
+                return curr;
+              });
+            }
             if (message.recent_decisions?.length > 0) setRecords(message.recent_decisions);
             if (message.orders?.length > 0) setOrders(message.orders);
+          } else if (message.type === 'HEARTBEAT') {
+            if (message.system_status) setStatus(message.system_status);
+            if (message.active_markets?.length > 0) setMarkets(message.active_markets);
           } else if (message.type === 'MARKET_EVALUATION') {
             const newRecord: TelemetryRecord = message.data;
             if (message.system_status) setStatus(message.system_status);
+            if (message.active_markets?.length > 0) setMarkets(message.active_markets);
 
             setRecords((prev) => [newRecord, ...prev.slice(0, 49)]);
 
@@ -181,19 +193,30 @@ export default function DashboardPage() {
               setOrders((prev) => [newRecord.order!, ...prev.slice(0, 49)]);
             }
 
-            // Update market list in place
+            // Update market list in place by market_id or symbol
             setMarkets((prevMarkets) => {
-              const idx = prevMarkets.findIndex((m) => m.market_id === newRecord.market_id);
+              const idx = prevMarkets.findIndex(
+                (m) => m.market_id === newRecord.market_id || m.symbol === newRecord.symbol
+              );
+              const updatedItem: MarketItem = {
+                market_id: newRecord.market_id,
+                symbol: newRecord.symbol,
+                question: newRecord.question,
+                odds_yes: newRecord.odds_yes,
+                odds_no: newRecord.odds_no,
+                spread: newRecord.spread ?? 0.012,
+                volume_24h: newRecord.volume_24h ?? 1845000,
+                time_left_seconds: newRecord.time_left_seconds ?? 450,
+                underlying_price: newRecord.underlying_price ?? 0,
+                target_price: newRecord.target_price ?? 0,
+                momentum_pct: newRecord.momentum_pct ?? 0,
+              };
               if (idx !== -1) {
                 const updated = [...prevMarkets];
-                updated[idx] = {
-                  ...updated[idx],
-                  odds_yes: newRecord.odds_yes,
-                  odds_no: newRecord.odds_no,
-                };
+                updated[idx] = { ...updated[idx], ...updatedItem };
                 return updated;
               }
-              return prevMarkets;
+              return [...prevMarkets, updatedItem];
             });
           }
         } catch (err) {
@@ -362,7 +385,10 @@ export default function DashboardPage() {
     });
   };
 
-  const latestRecord = records[0] || null;
+  const selectedRecord = records.find(
+    (r) => r.market_id === selectedMarketId || r.symbol === selectedMarketId?.split('-')[0]
+  );
+  const latestRecord = selectedRecord || records[0] || null;
   const currentThreshold = status?.risk_guard?.confidence_threshold ?? 0.80;
 
   // Protect desk behind Account Identification Gate

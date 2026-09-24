@@ -97,6 +97,8 @@ class TradingBotCoordinator:
         # Telemetry storage
         self.recent_decisions: List[Dict[str, Any]] = []
         self.ws_clients: Set[WebSocket] = set()
+        self._last_eval_time: Dict[str, float] = {}
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start trading core and all network sessions."""
@@ -111,13 +113,47 @@ class TradingBotCoordinator:
         await self.jev_client.start()
         await self.binance_client.start()
         await self.ws_listener.start()
+        self._heartbeat_task = asyncio.create_task(self._dashboard_heartbeat_loop())
 
     async def stop(self) -> None:
         """Stop all subsystems and clean up sessions."""
         logger.info("Stopping Trading Bot Coordinator...")
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
         await self.ws_listener.stop()
         await self.binance_client.close()
         await self.jev_client.close()
+
+    async def _dashboard_heartbeat_loop(self) -> None:
+        """Periodic 1s heartbeat ensuring dashboard clock, status, and markets update continuously."""
+        while True:
+            try:
+                await asyncio.sleep(1.0)
+                if self.ws_clients:
+                    status = self.get_system_status()
+                    markets = self.ws_listener.get_active_markets()
+                    msg = {
+                        "type": "HEARTBEAT",
+                        "system_status": status,
+                        "active_markets": markets,
+                    }
+                    disconnected: List[WebSocket] = []
+                    for client in list(self.ws_clients):
+                        try:
+                            await client.send_json(msg)
+                        except Exception:
+                            disconnected.append(client)
+                    for dead in disconnected:
+                        self.ws_clients.discard(dead)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Dashboard heartbeat notice: {e}")
+
     def start_bot(self) -> None:
         """Start or resume trading execution."""
         self.bot_status = "RUNNING"
@@ -138,6 +174,14 @@ class TradingBotCoordinator:
         if self.bot_status != "RUNNING" or self.is_paused:
             return
 
+        # Throttle evaluation per symbol to once every 2.5s to avoid API rate limits,
+        # but always evaluate on the first tick for that symbol
+        now = time.time()
+        last_eval = self._last_eval_time.get(market.symbol, 0.0)
+        if now - last_eval < 2.5:
+            return
+        self._last_eval_time[market.symbol] = now
+
         # Step 1: AI Evaluation via Jev AI Decision Engine
         decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
 
@@ -149,7 +193,7 @@ class TradingBotCoordinator:
             current_open_positions_count=open_positions
         )
 
-        # Store telemetry record
+        # Store rich telemetry record
         record = {
             "timestamp": time.time(),
             "market_id": market.market_id,
@@ -157,6 +201,12 @@ class TradingBotCoordinator:
             "question": market.question,
             "odds_yes": market.odds_yes,
             "odds_no": market.odds_no,
+            "underlying_price": market.underlying_price,
+            "target_price": market.target_price,
+            "momentum_pct": market.momentum_pct,
+            "spread": market.spread,
+            "volume_24h": market.volume_24h,
+            "time_left_seconds": market.time_left_seconds,
             "decision": decision.model_dump(),
             "risk_validation": risk_result.model_dump(),
             "order": None,
@@ -193,11 +243,12 @@ class TradingBotCoordinator:
         message = {
             "type": "MARKET_EVALUATION",
             "data": event_data,
-            "system_status": self.get_system_status()
+            "system_status": self.get_system_status(),
+            "active_markets": self.ws_listener.get_active_markets(),
         }
 
         disconnected: List[WebSocket] = []
-        for client in self.ws_clients:
+        for client in list(self.ws_clients):
             try:
                 await client.send_json(message)
             except Exception:

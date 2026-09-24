@@ -28,7 +28,7 @@ class Settings(BaseSettings):
         alias="BINANCE_PREDICTION_BASE_URL"
     )
     binance_prediction_ws_url: str = Field(
-        default="wss://fstream.binance.com/ws",
+        default="wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker",
         alias="BINANCE_PREDICTION_WS_URL"
     )
     binance_recv_window: int = Field(default=5000, alias="BINANCE_RECV_WINDOW")

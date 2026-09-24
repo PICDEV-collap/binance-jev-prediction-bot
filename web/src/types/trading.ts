@@ -102,6 +102,12 @@ export interface TelemetryRecord {
   question: string;
   odds_yes: number;
   odds_no: number;
+  underlying_price?: number;
+  target_price?: number;
+  momentum_pct?: number;
+  spread?: number;
+  volume_24h?: number;
+  time_left_seconds?: number;
   decision: JevDecision;
   risk_validation: RiskValidation;
   order?: OrderItem | null;
