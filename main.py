@@ -183,13 +183,12 @@ class TradingBotCoordinator:
         if self.bot_status != "RUNNING" or self.is_paused:
             return
 
-        # Throttle evaluation per symbol to once every 2.5s to avoid API rate limits,
-        # but always evaluate on the first tick for that symbol
+        # Throttle evaluation per market_id to once every 3.0s to avoid API rate limits
         now = time.time()
-        last_eval = self._last_eval_time.get(market.symbol, 0.0)
-        if now - last_eval < 2.5:
+        last_eval = self._last_eval_time.get(market.market_id, 0.0)
+        if now - last_eval < 3.0:
             return
-        self._last_eval_time[market.symbol] = now
+        self._last_eval_time[market.market_id] = now
 
         # Step 1: AI Evaluation via Jev AI Decision Engine
         decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
@@ -208,10 +207,12 @@ class TradingBotCoordinator:
             "market_id": market.market_id,
             "symbol": market.symbol,
             "question": market.question,
+            "timeframe": market.timeframe,
             "odds_yes": market.odds_yes,
             "odds_no": market.odds_no,
             "underlying_price": market.underlying_price,
             "target_price": market.target_price,
+            "price_diff": market.price_diff,
             "momentum_pct": market.momentum_pct,
             "spread": market.spread,
             "volume_24h": market.volume_24h,

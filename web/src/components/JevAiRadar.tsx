@@ -39,8 +39,8 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
   // Determine color accent based on decision and confidence
   const isHighConfidence = confidence >= confidenceThreshold;
   let gaugeColor = '#f59e0b'; // Amber
-  if (action === 'BUY_YES' && isHighConfidence) gaugeColor = '#10b981'; // Emerald
-  else if (action === 'BUY_NO' && isHighConfidence) gaugeColor = '#f43f5e'; // Rose
+  if ((action === 'UP' || action === 'BUY_YES') && isHighConfidence) gaugeColor = '#10b981'; // Emerald
+  else if ((action === 'DOWN' || action === 'BUY_NO') && isHighConfidence) gaugeColor = '#f43f5e'; // Rose
   else if (!isHighConfidence) gaugeColor = '#64748b'; // Slate
 
   return (
@@ -127,16 +127,16 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
               Engine Recommended Action
             </span>
             <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl border text-sm font-mono font-bold tracking-wide ${
-              action === 'BUY_YES'
+              action === 'UP' || action === 'BUY_YES'
                 ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300 shadow-lg shadow-emerald-950/50'
-                : action === 'BUY_NO'
+                : action === 'DOWN' || action === 'BUY_NO'
                 ? 'bg-rose-500/20 border-rose-500/50 text-rose-300 shadow-lg shadow-rose-950/50'
                 : 'bg-slate-800/80 border-slate-700 text-slate-300'
             }`}>
-              {action === 'BUY_YES' && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
-              {action === 'BUY_NO' && <XCircle className="w-4 h-4 text-rose-400" />}
+              {(action === 'UP' || action === 'BUY_YES') && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
+              {(action === 'DOWN' || action === 'BUY_NO') && <XCircle className="w-4 h-4 text-rose-400" />}
               {action === 'PASS' && <MinusCircle className="w-4 h-4 text-slate-400" />}
-              <span>{action}</span>
+              <span>{action === 'BUY_YES' ? 'PREDICT UP ▲' : action === 'UP' ? 'PREDICT UP ▲' : action === 'BUY_NO' ? 'PREDICT DOWN ▼' : action === 'DOWN' ? 'PREDICT DOWN ▼' : 'PASS —'}</span>
             </div>
           </div>
 

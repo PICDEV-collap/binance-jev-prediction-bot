@@ -163,7 +163,7 @@ class RiskGuard:
             )
 
         # Gate 5: Odds Pricing and Skew Sanity Check
-        target_price = market.odds_yes if decision.action == "BUY_YES" else market.odds_no
+        target_price = market.odds_yes if decision.action in ("BUY_YES", "UP") else market.odds_no
         if target_price <= 0.02 or target_price > self.max_odds_cap:
             self._record_rejection("EXTREME_ODDS_RISK")
             return RiskEvaluationResult(

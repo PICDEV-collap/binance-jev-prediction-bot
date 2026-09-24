@@ -28,10 +28,15 @@ class Settings(BaseSettings):
         alias="BINANCE_PREDICTION_BASE_URL"
     )
     binance_prediction_ws_url: str = Field(
-        default="wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker",
+        default="wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker/bnbusdt@ticker/dogeusdt@ticker/xrpusdt@ticker",
         alias="BINANCE_PREDICTION_WS_URL"
     )
     binance_recv_window: int = Field(default=5000, alias="BINANCE_RECV_WINDOW")
+    active_timeframes: str = Field(default="5m,15m,1h,1d", alias="ACTIVE_TIMEFRAMES")
+    active_symbols: str = Field(
+        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT,XRPUSDT",
+        alias="ACTIVE_SYMBOLS"
+    )
 
     # --- Jev AI Decision Engine Configuration ---
     jev_ai_api_key: str = Field(default="", alias="JEV_AI_API_KEY")

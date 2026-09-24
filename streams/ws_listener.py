@@ -10,8 +10,10 @@ Features:
 
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import random
 import time
 from enum import Enum
@@ -25,10 +27,18 @@ from engine.jev_client import MarketContext
 
 logger = logging.getLogger("ws_listener")
 
+SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "XRPUSDT")
+TIMEFRAMES: List[tuple[str, int]] = [
+    ("5m", 300),
+    ("15m", 900),
+    ("1h", 3600),
+    ("1d", 86400),
+]
+
 SPOT_COMBINED_STREAM_URL = (
-    "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker"
+    "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker/bnbusdt@ticker/dogeusdt@ticker/xrpusdt@ticker"
 )
-REST_TICKER_API = "https://api.binance.com/api/v3/ticker/24hr?symbols=%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22%5D"
+REST_TICKER_API = "https://api.binance.com/api/v3/ticker/24hr?symbols=%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22BNBUSDT%22,%22DOGEUSDT%22,%22XRPUSDT%22%5D"
 
 
 class ConnectionState(str, Enum):
@@ -89,6 +99,7 @@ class BinanceWSListener:
         self._last_event_time: float = 0.0
         self._active_markets: Dict[str, MarketContext] = {}
         self._price_history: Dict[str, List[tuple[float, float]]] = {}
+        self._round_base_prices: Dict[str, float] = {}
 
     async def start(self) -> None:
         """Start the WebSocket listener and background watchdog loop."""
@@ -259,19 +270,18 @@ class BinanceWSListener:
                         self._process_single_tick(item)
 
     def _process_single_tick(self, data: Dict[str, Any]) -> None:
-        """Normalize and dispatch a single tick dictionary."""
+        """Normalize and dispatch ticks for all active timeframes."""
         try:
-            market_context = self._normalize_market_data(data)
-            if market_context:
-                # Key by symbol and market_id for fast lookup
-                self._active_markets[market_context.symbol] = market_context
-                self._active_markets[market_context.market_id] = market_context
-                self._last_event_time = time.time()
+            contexts = self._normalize_market_data(data)
+            if contexts:
+                for market_context in contexts:
+                    self._active_markets[market_context.market_id] = market_context
+                    self._last_event_time = time.time()
 
-                # Non-blocking distribution to trading core
-                if self.on_market_event:
-                    self._events_dispatched += 1
-                    asyncio.create_task(self._safe_dispatch_event(market_context))
+                    # Non-blocking distribution to trading core
+                    if self.on_market_event:
+                        self._events_dispatched += 1
+                        asyncio.create_task(self._safe_dispatch_event(market_context))
         except Exception as err:
             logger.error(f"Error processing single tick: {err}", exc_info=True)
 
@@ -283,21 +293,21 @@ class BinanceWSListener:
         except Exception as e:
             logger.error(f"Error in on_market_event handler task: {e}", exc_info=True)
 
-    def _normalize_market_data(self, payload: Dict[str, Any]) -> Optional[MarketContext]:
-        """Convert Binance raw stream tick into standardized MarketContext."""
+    def _normalize_market_data(self, payload: Dict[str, Any]) -> List[MarketContext]:
+        """Convert Binance raw stream tick into standardized MarketContext for all active timeframes."""
         symbol = payload.get("s", payload.get("symbol", "")).upper()
-        if not symbol or symbol not in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
-            return None
+        if not symbol or symbol not in SUPPORTED_SYMBOLS:
+            return []
 
         # Extract current market price (c=close/last, p=mark/last)
         price_str = payload.get("c") or payload.get("p") or payload.get("price")
         if not price_str:
-            return None
+            return []
 
         try:
             mark_price = float(price_str)
         except (ValueError, TypeError):
-            return None
+            return []
 
         # Volume quote asset (q = quote volume, v = base volume)
         try:
@@ -311,27 +321,8 @@ class BinanceWSListener:
         except (ValueError, TypeError):
             change_24h_pct = 0.0
 
-        # Current 15-minute prediction round
+        # Calculate real rolling momentum from live price history
         now = time.time()
-        round_period = 900  # 15 minutes
-        round_id = f"{symbol}-15M-R{int(now // round_period)}"
-        time_left = round_period - int(now % round_period)
-
-        # Realistic prediction strike price
-        if "BTC" in symbol:
-            strike = round(round(mark_price * 1.0015 / 50.0) * 50.0, 2)
-            base_spread = 0.012
-        elif "ETH" in symbol:
-            strike = round(round(mark_price * 1.0015 / 10.0) * 10.0, 2)
-            base_spread = 0.015
-        elif "SOL" in symbol:
-            strike = round(round(mark_price * 1.0015 / 0.5) * 0.5, 2)
-            base_spread = 0.018
-        else:
-            strike = round(mark_price * 1.0015, 2)
-            base_spread = 0.015
-
-        # Calculate real rolling 5m momentum from live price history
         history = self._price_history.setdefault(symbol, [])
         history.append((now, mark_price))
         cutoff = now - 300.0
@@ -341,33 +332,74 @@ class BinanceWSListener:
         if len(history) > 1 and history[0][1] > 0:
             momentum_pct = round(((mark_price - history[0][1]) / history[0][1]) * 100.0, 3)
         else:
-            # Fallback to scaled 24h momentum
             momentum_pct = round(change_24h_pct / 48.0, 3)
 
-        # Implied odds calculation from distance to strike and momentum
-        diff_ratio = (mark_price - strike) / mark_price
-        odds_yes = round(max(0.08, min(0.92, 0.50 + (diff_ratio * 40.0) + (momentum_pct * 0.05))), 3)
-        odds_no = round(1.0 - odds_yes, 3)
-
         # Realistic bid/ask spread for binary prediction contract
-        spread = base_spread
+        if "BTC" in symbol:
+            base_spread = 0.012
+        elif "ETH" in symbol or "BNB" in symbol:
+            base_spread = 0.015
+        elif "SOL" in symbol:
+            base_spread = 0.018
+        else:
+            base_spread = 0.020
 
         clean_symbol = symbol.replace("USDT", "")
-        question = f"Will {clean_symbol} settle >= ${strike:,.2f} at 15m expiration?"
+        results: List[MarketContext] = []
 
-        return MarketContext(
-            market_id=round_id,
-            symbol=symbol,
-            question=question,
-            odds_yes=odds_yes,
-            odds_no=odds_no,
-            spread=spread,
-            volume_24h=volume_24h,
-            time_left_seconds=time_left,
-            underlying_price=mark_price,
-            target_price=strike,
-            momentum_pct=momentum_pct
-        )
+        for tf, round_period in TIMEFRAMES:
+            round_idx = int(now // round_period)
+            round_id = f"{symbol}-{tf.upper()}-R{round_idx}"
+            time_left = round_period - int(now % round_period)
+
+            # Determine fixed Price to Beat for this round
+            if round_id not in self._round_base_prices:
+                h = int(hashlib.md5(round_id.encode()).hexdigest()[:6], 16)
+                pct_offset = ((h % 100) - 50) / 100.0 * (
+                    0.0008 if tf == "5m" else 0.0020 if tf == "15m" else 0.0050 if tf == "1h" else 0.0120
+                )
+                seed_price = mark_price * (1.0 + pct_offset)
+                if "BTC" in symbol or "ETH" in symbol or "BNB" in symbol:
+                    strike = round(seed_price, 2)
+                elif "SOL" in symbol:
+                    strike = round(seed_price, 2)
+                else:
+                    strike = round(seed_price, 4)
+                self._round_base_prices[round_id] = strike
+            else:
+                strike = self._round_base_prices[round_id]
+
+            price_diff = round(mark_price - strike, 4)
+
+            # Realistic Binance Up/Down implied odds:
+            diff_ratio = (mark_price - strike) / strike
+            vol = 0.004 * math.sqrt(max(10, time_left) / max(60, round_period))
+            z = (diff_ratio + (momentum_pct * 0.0005)) / max(0.0001, vol)
+            prob_up = 1.0 / (1.0 + math.exp(-max(-10.0, min(10.0, 1.8 * z))))
+            odds_up = round(max(0.01, min(0.99, prob_up)), 3)
+            odds_down = round(1.0 - odds_up, 3)
+
+            question = f"{clean_symbol} Up or Down {tf}"
+
+            results.append(
+                MarketContext(
+                    market_id=round_id,
+                    symbol=symbol,
+                    question=question,
+                    timeframe=tf,
+                    odds_yes=odds_up,
+                    odds_no=odds_down,
+                    spread=base_spread,
+                    volume_24h=volume_24h,
+                    time_left_seconds=time_left,
+                    underlying_price=mark_price,
+                    target_price=strike,
+                    price_diff=price_diff,
+                    momentum_pct=momentum_pct
+                )
+            )
+
+        return results
 
     async def _watchdog_rest_poller(self) -> None:
         """
@@ -450,16 +482,26 @@ class BinanceWSListener:
                 await asyncio.sleep(2.0)
 
     def get_active_markets(self) -> List[Dict[str, Any]]:
-        """Return snapshot of unique currently active prediction markets (BTC, ETH, SOL)."""
-        unique_markets: Dict[str, MarketContext] = {}
-        for m in self._active_markets.values():
-            unique_markets[m.symbol] = m
-        return [m.model_dump() for m in unique_markets.values()]
+        """Return snapshot of currently active prediction markets across all assets and timeframes."""
+        now = time.time()
+        # Clean up stale rounds from active markets
+        for k in list(self._active_markets.keys()):
+            m = self._active_markets[k]
+            if m.time_left_seconds <= 0:
+                self._active_markets.pop(k, None)
+
+        sym_order = {s: i for i, s in enumerate(SUPPORTED_SYMBOLS)}
+        tf_order = {"5m": 0, "15m": 1, "1h": 2, "1d": 3}
+
+        def sort_key(m: MarketContext):
+            return (sym_order.get(m.symbol, 99), tf_order.get(m.timeframe, 99))
+
+        sorted_markets = sorted(self._active_markets.values(), key=sort_key)
+        return [m.model_dump() for m in sorted_markets]
 
     @property
     def metrics(self) -> Dict[str, Any]:
         """WebSocket connection telemetry."""
-        unique_count = len(set(m.symbol for m in self._active_markets.values()))
         return {
             "state": self.state.value,
             "stream_url": self.stream_url,
@@ -467,7 +509,7 @@ class BinanceWSListener:
             "messages_received": self._messages_received,
             "events_dispatched": self._events_dispatched,
             "last_event_time": self._last_event_time,
-            "active_markets_count": unique_count if unique_count > 0 else len(self._active_markets),
+            "active_markets_count": len(self._active_markets),
             "reconnect_attempts": self._reconnect_attempts,
             "ping_interval": self.ping_interval,
             "ping_timeout": self.ping_timeout,

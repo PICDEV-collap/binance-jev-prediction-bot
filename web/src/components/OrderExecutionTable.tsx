@@ -87,9 +87,11 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({ orders
               filteredOrders.map((order, idx) => {
                 const date = new Date(order.timestamp * 1000);
                 const timeStr = date.toTimeString().split(' ')[0] + '.' + String(date.getMilliseconds()).padStart(3, '0');
-                const isYes = order.side === 'BUY_YES';
+                const isUp = order.side === 'UP' || order.side === 'BUY_YES';
                 const notional = (order.contracts * order.price).toFixed(2);
                 const uniqueKey = order.order_id ? `${order.order_id}_${idx}` : `${order.client_order_id}_${idx}`;
+                const cleanSym = order.symbol.replace('USDT', '');
+                const tf = order.timeframe || (order.market_id.includes('-5M-') ? '5m' : order.market_id.includes('-1H-') ? '1h' : order.market_id.includes('-1D-') ? '1d' : '15m');
 
                 return (
                   <tr key={uniqueKey} className="hover:bg-slate-900/50 transition-colors">
@@ -107,20 +109,25 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({ orders
 
                     {/* Market ID & Symbol */}
                     <td className="py-2.5 px-3 whitespace-nowrap">
-                      <span className="font-bold text-white mr-1.5">{order.symbol}</span>
-                      <span className="text-[11px] text-slate-500">
-                        {order.market_id.split('-').slice(1).join('-')}
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-bold text-white">{cleanSym}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 font-semibold border border-slate-700">
+                          {tf}
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-slate-500 block truncate max-w-[150px]">
+                        {order.market_id}
                       </span>
                     </td>
 
                     {/* Side */}
                     <td className="py-2.5 px-3 whitespace-nowrap">
-                      <span className={`px-2 py-0.5 rounded font-bold text-[11px] border ${
-                        isYes
-                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                          : 'bg-rose-500/10 border-rose-500/30 text-rose-400'
+                      <span className={`px-2.5 py-0.5 rounded font-bold text-[11px] border inline-flex items-center gap-1 ${
+                        isUp
+                          ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400'
+                          : 'bg-rose-500/15 border-rose-500/40 text-rose-400'
                       }`}>
-                        {order.side}
+                        <span>{isUp ? '▲ UP' : '▼ DOWN'}</span>
                       </span>
                     </td>
 

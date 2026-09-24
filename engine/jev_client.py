@@ -24,20 +24,22 @@ class MarketContext(BaseModel):
     market_id: str
     symbol: str
     question: str
-    odds_yes: float = Field(..., ge=0.0, le=1.0)
-    odds_no: float = Field(..., ge=0.0, le=1.0)
+    timeframe: str = "15m"  # "5m", "15m", "1h", "1d"
+    odds_yes: float = Field(..., ge=0.0, le=1.0)  # UP Odds
+    odds_no: float = Field(..., ge=0.0, le=1.0)   # DOWN Odds
     spread: float = 0.01
     volume_24h: float = 0.0
     time_left_seconds: int = 300
-    underlying_price: float = 0.0
-    target_price: float = 0.0
+    underlying_price: float = 0.0  # Current Price
+    target_price: float = 0.0      # Price to Beat
+    price_diff: float = 0.0        # Current Price - Price to Beat
     momentum_pct: float = 0.0
     timestamp: float = Field(default_factory=time.time)
 
 
 class JevEvaluationResult(BaseModel):
     """Structured decision returned by Jev AI."""
-    action: Literal["BUY_YES", "BUY_NO", "PASS"]
+    action: Literal["UP", "DOWN", "PASS", "BUY_YES", "BUY_NO"]
     confidence: float = Field(..., ge=0.0, le=1.0)
     reasoning: str
     model: str = "jev-predict-v1"
@@ -117,15 +119,17 @@ class JevClient:
             await self.start()
 
         if "systemone" in self.endpoint:
+            clean_sym = context.symbol.replace("USDT", "")
+            diff_str = f"{context.price_diff:+,.2f}" if context.price_diff else f"{context.underlying_price - context.target_price:+,.2f}"
             market_state = (
-                f"Binary Prediction Market Analysis:\n"
-                f"Market: {context.question} (ID: {context.market_id})\n"
-                f"Symbol: {context.symbol}\n"
-                f"Spot Price: ${context.underlying_price:,.2f} | Target Strike: ${context.target_price:,.2f}\n"
-                f"Current Market Odds: YES {context.odds_yes:.3f} ({context.odds_yes*100:.1f}%) | "
-                f"NO {context.odds_no:.3f} ({context.odds_no*100:.1f}%)\n"
+                f"Binance Up or Down Prediction Market Analysis:\n"
+                f"Market: {clean_sym} Up or Down {context.timeframe} (ID: {context.market_id})\n"
+                f"Symbol: {context.symbol} | Timeframe: {context.timeframe}\n"
+                f"Current Price: ${context.underlying_price:,.2f} | Price to Beat: ${context.target_price:,.2f} (Diff: {diff_str})\n"
+                f"Current Market Odds: UP {context.odds_yes:.3f} ({context.odds_yes*100:.1f}%) | "
+                f"DOWN {context.odds_no:.3f} ({context.odds_no*100:.1f}%)\n"
                 f"Spread: {context.spread:.3f} | 24h Volume: ${context.volume_24h:,.0f}\n"
-                f"5-Minute Momentum: {context.momentum_pct:+.3f}%\n"
+                f"Momentum: {context.momentum_pct:+.3f}%\n"
                 f"Time Remaining to Expiration: {context.time_left_seconds} seconds."
             )
             payload = {
@@ -134,16 +138,16 @@ class JevClient:
                 "questions": {
                     "action": {
                         "type": "choice",
-                        "instructions": "Predict optimal binary market trading decision for 15-minute expiration",
+                        "instructions": f"Predict optimal Binance trading action (UP, DOWN, or PASS) for {context.timeframe} expiration",
                         "criteria": {
-                            "BUY_YES": "High probability that spot price will settle greater than or equal to strike",
-                            "BUY_NO": "High probability that spot price will settle below strike",
-                            "PASS": "Neutral price action, fair valuation, or edge is insufficient"
+                            "UP": "High conviction that Current Price will settle greater than or equal to Price to Beat at round expiration",
+                            "DOWN": "High conviction that Current Price will settle strictly below Price to Beat at round expiration",
+                            "PASS": "Neutral price action, fairly priced market odds, or edge is insufficient"
                         }
                     },
-                    "settle_above_strike": {
+                    "settle_above_price_to_beat": {
                         "type": "noul",
-                        "instructions": "Will the underlying spot price settle greater than or equal to the strike price at expiration?"
+                        "instructions": "Will the underlying market price settle greater than or equal to the Price to Beat at expiration?"
                     }
                 }
             }
@@ -241,35 +245,40 @@ class JevClient:
             if "answers" in data:
                 answers = data.get("answers", {})
                 action_ans = answers.get("action", {})
-                action = str(action_ans.get("choice", "PASS")).upper()
-                if action not in ["BUY_YES", "BUY_NO", "PASS"]:
+                raw_action = str(action_ans.get("choice", "PASS")).upper()
+                if raw_action in ["UP", "BUY_YES"]:
+                    action = "UP"
+                elif raw_action in ["DOWN", "BUY_NO"]:
+                    action = "DOWN"
+                else:
                     action = "PASS"
 
                 probs = action_ans.get("probabilities", {})
                 prob_choice = probs.get(action, action_ans.get("confidence", 0.50))
-                yes_prob = answers.get("settle_above_strike", {}).get("noul", context.odds_yes if context else 0.50)
+                yes_ans = answers.get("settle_above_price_to_beat", answers.get("settle_above_strike", {}))
+                yes_prob = yes_ans.get("noul", context.odds_yes if context else 0.50)
 
                 confidence = round(max(0.0, min(1.0, float(prob_choice))), 3)
 
                 odds_yes = context.odds_yes if context else 0.50
                 odds_no = context.odds_no if context else 0.50
 
-                if action == "BUY_YES":
+                if action == "UP":
                     edge = yes_prob - odds_yes
                     reasoning = (
-                        f"Jev AI bullish conviction: Model P(Yes) {yes_prob:.1%} exceeds market odds ({odds_yes:.1%}) "
+                        f"Jev AI UP conviction: Model P(UP) {yes_prob:.1%} exceeds market odds ({odds_yes:.1%}) "
                         f"by {edge*100:+.1f}%. Model confidence: {confidence*100:.1f}%."
                     )
-                elif action == "BUY_NO":
+                elif action == "DOWN":
                     edge = (1.0 - yes_prob) - odds_no
                     reasoning = (
-                        f"Jev AI bearish conviction: Model P(No) {1.0 - yes_prob:.1%} exceeds market odds ({odds_no:.1%}) "
+                        f"Jev AI DOWN conviction: Model P(DOWN) {1.0 - yes_prob:.1%} exceeds market odds ({odds_no:.1%}) "
                         f"by {edge*100:+.1f}%. Model confidence: {confidence*100:.1f}%."
                     )
                 else:
                     reasoning = (
-                        f"Jev AI neutral evaluation: Market odds ({odds_yes:.1%}/{odds_no:.1%}) "
-                        f"fairly priced. P(Yes)={yes_prob:.1%}. Insufficient quantitative edge."
+                        f"Jev AI neutral evaluation: Market odds ({odds_yes:.1%} UP / {odds_no:.1%} DOWN) "
+                        f"fairly priced. P(UP)={yes_prob:.1%}. Insufficient quantitative edge."
                     )
 
                 return JevEvaluationResult(
@@ -366,31 +375,31 @@ class JevClient:
         edge_yes = theoretical_prob - context.odds_yes
         edge_no = (1.0 - theoretical_prob) - context.odds_no
 
-        action: Literal["BUY_YES", "BUY_NO", "PASS"] = "PASS"
+        action: Literal["UP", "DOWN", "PASS"] = "PASS"
         confidence: float = 0.50
         reasoning: str = ""
 
         # Threshold to trigger an entry (must have at least +6% edge)
         if edge_yes > 0.06 and context.odds_yes <= 0.88:
-            action = "BUY_YES"
+            action = "UP"
             # Confidence scales with edge and momentum convergence
             confidence = min(0.96, 0.75 + (edge_yes * 1.5))
             reasoning = (
-                f"Bullish skew: Model prob ({theoretical_prob:.1%}) exceeds market odds ({context.odds_yes:.1%}) "
+                f"Bullish skew: Model UP prob ({theoretical_prob:.1%}) exceeds market odds ({context.odds_yes:.1%}) "
                 f"by +{edge_yes*100:.1f}%. Momentum {momentum:+.2f}% with {time_left}s remaining."
             )
         elif edge_no > 0.06 and context.odds_no <= 0.88:
-            action = "BUY_NO"
+            action = "DOWN"
             confidence = min(0.96, 0.75 + (edge_no * 1.5))
             reasoning = (
-                f"Bearish skew: Model No prob ({1.0 - theoretical_prob:.1%}) exceeds market odds ({context.odds_no:.1%}) "
+                f"Bearish skew: Model DOWN prob ({1.0 - theoretical_prob:.1%}) exceeds market odds ({context.odds_no:.1%}) "
                 f"by +{edge_no*100:.1f}%. Momentum {momentum:+.2f}% with {time_left}s remaining."
             )
         else:
             action = "PASS"
             confidence = max(0.40, 0.65 - max(abs(edge_yes), abs(edge_no)))
             reasoning = (
-                f"Neutral/Fair valuation: Market odds ({context.odds_yes:.1%}/{context.odds_no:.1%}) "
+                f"Neutral/Fair valuation: Market odds ({context.odds_yes:.1%} UP / {context.odds_no:.1%} DOWN) "
                 f"fairly price theoretical probability ({theoretical_prob:.1%}). Insufficient edge."
             )
 

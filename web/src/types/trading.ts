@@ -1,18 +1,21 @@
-export type ActionType = 'BUY_YES' | 'BUY_NO' | 'PASS';
+export type ActionType = 'UP' | 'DOWN' | 'PASS' | 'BUY_YES' | 'BUY_NO';
 export type OrderStatus = 'FILLED' | 'REJECTED' | 'SIMULATED' | 'NEW' | 'CANCELED';
 export type ConnectionStateType = 'CONNECTED' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED';
+export type TimeFrameType = 'all' | '5m' | '15m' | '1h' | '1d';
 
 export interface MarketItem {
   market_id: string;
   symbol: string;
   question: string;
-  odds_yes: number;
-  odds_no: number;
+  timeframe?: string;
+  odds_yes: number; // UP Odds
+  odds_no: number;  // DOWN Odds
   spread: number;
   volume_24h: number;
   time_left_seconds: number;
-  underlying_price: number;
-  target_price: number;
+  underlying_price: number; // Current Price
+  target_price: number;     // Price to Beat
+  price_diff?: number;      // Difference (Current - Price to Beat)
   momentum_pct: number;
   timestamp?: number;
 }
@@ -48,6 +51,8 @@ export interface OrderItem {
   price: number;
   status: OrderStatus;
   latency_ms: number;
+  timeframe?: string;
+  price_to_beat?: number;
   error_message?: string;
   timestamp: number;
 }

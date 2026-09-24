@@ -26,11 +26,13 @@ class OrderResult(BaseModel):
     client_order_id: str
     market_id: str
     symbol: str
-    side: str  # "BUY_YES" or "BUY_NO"
+    side: str  # "UP" or "DOWN"
     contracts: int
     price: float
     status: str  # "FILLED", "REJECTED", "SIMULATED", "NEW"
     latency_ms: float
+    timeframe: str = "15m"
+    price_to_beat: float = 0.0
     error_message: Optional[str] = None
     timestamp: float = Field(default_factory=time.time)
 
@@ -40,11 +42,12 @@ class PositionInfo(BaseModel):
     position_id: str
     market_id: str
     symbol: str
-    side: str
+    side: str  # "UP" or "DOWN"
     contracts: int
     entry_price: float
     current_price: float
-    target_price: float = 0.0
+    target_price: float = 0.0  # Price to Beat
+    timeframe: str = "15m"
     unrealized_pnl: float
     entry_time: float = Field(default_factory=time.time)
 
@@ -275,6 +278,15 @@ class BinanceClient:
         await asyncio.sleep(0.02)
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
+        clean_side = "UP" if side in ("UP", "BUY_YES") else "DOWN" if side in ("DOWN", "BUY_NO") else side
+
+        # Extract timeframe from market_id (e.g. BTCUSDT-5M-R... -> 5m)
+        tf = "15m"
+        for candidate in ["5M", "15M", "1H", "1D"]:
+            if f"-{candidate}-" in market_id:
+                tf = candidate.lower()
+                break
+
         # Small simulated fill slippage
         executed_price = round(target_price, 4)
         order_cost = executed_price * contracts
@@ -286,11 +298,13 @@ class BinanceClient:
                 client_order_id=client_order_id,
                 market_id=market_id,
                 symbol=symbol,
-                side=side,
+                side=clean_side,
                 contracts=contracts,
                 price=executed_price,
                 status="REJECTED",
                 latency_ms=round(elapsed_ms, 2),
+                timeframe=tf,
+                price_to_beat=target_price,
                 error_message="Insufficient paper balance"
             )
             self._order_history.append(result)
@@ -298,17 +312,18 @@ class BinanceClient:
 
         # Deduct balance and open position
         self._paper_balance_usdt -= order_cost
-        position_id = f"POS_{market_id}_{side}_{uuid.uuid4().hex[:4]}"
+        position_id = f"POS_{market_id}_{clean_side}_{uuid.uuid4().hex[:4]}"
 
         self._paper_positions[position_id] = PositionInfo(
             position_id=position_id,
             market_id=market_id,
             symbol=symbol,
-            side=side,
+            side=clean_side,
             contracts=contracts,
             entry_price=executed_price,
             current_price=executed_price,
             target_price=target_price,
+            timeframe=tf,
             unrealized_pnl=0.0
         )
 
@@ -317,11 +332,13 @@ class BinanceClient:
             client_order_id=client_order_id,
             market_id=market_id,
             symbol=symbol,
-            side=side,
+            side=clean_side,
             contracts=contracts,
             price=executed_price,
             status="SIMULATED",
-            latency_ms=round(elapsed_ms, 2)
+            latency_ms=round(elapsed_ms, 2),
+            timeframe=tf,
+            price_to_beat=target_price
         )
 
         self._total_orders_dispatched += 1
@@ -329,7 +346,7 @@ class BinanceClient:
         self._order_history.append(result)
 
         logger.info(
-            f"[PAPER] Order Filled: {side} {contracts} contracts on {market_id} "
+            f"[PAPER] Order Filled: {clean_side} {contracts} contracts on {market_id} ({tf}) "
             f"@ {executed_price:.3f} | Latency: {elapsed_ms:.1f}ms | Rem. Balance: ${self._paper_balance_usdt:.2f}"
         )
         return result
@@ -340,7 +357,7 @@ class BinanceClient:
         current_prices: Dict[str, float]
     ) -> float:
         """
-        Settle prediction contracts whose 15-minute round has ended.
+        Settle prediction contracts whose round has ended.
         Picks up final settlement: $1.00 USDT payout per winning contract.
         Returns total net realized PnL.
         """
@@ -360,7 +377,7 @@ class BinanceClient:
             cost = pos.contracts * pos.entry_price
 
             # Binary outcome settlement: $1.00 per contract
-            if pos.side == "BUY_YES":
+            if pos.side in ("UP", "BUY_YES"):
                 won = spot >= pos.target_price
             else:
                 won = spot < pos.target_price
@@ -375,9 +392,9 @@ class BinanceClient:
 
             total_net_pnl += realized_pnl
             logger.info(
-                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id}) SETTLED! "
+                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe}) SETTLED! "
                 f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
-                f"(Spot: ${spot:.2f}, Strike: ${pos.target_price:.2f}) | Rem. Balance: ${self._paper_balance_usdt:.2f}"
+                f"(Current Spot: ${spot:.2f}, Price to Beat: ${pos.target_price:.2f}) | Rem. Balance: ${self._paper_balance_usdt:.2f}"
             )
 
         return round(total_net_pnl, 2)
