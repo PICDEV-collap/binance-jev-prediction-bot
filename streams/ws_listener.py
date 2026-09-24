@@ -70,6 +70,7 @@ class BinanceWSListener:
         self._last_heartbeat_time: float = 0.0
         self._last_event_time: float = 0.0
         self._active_markets: Dict[str, MarketContext] = {}
+        self._price_history: Dict[str, List[tuple[float, float]]] = {}
 
     async def start(self) -> None:
         """Start the WebSocket listener loop."""
@@ -232,6 +233,19 @@ class BinanceWSListener:
             odds_yes = round(max(0.05, min(0.95, 0.50 + (diff_ratio * 25.0))), 3)
             odds_no = round(1.0 - odds_yes, 3)
 
+            # Calculate real rolling 5m momentum from live price history
+            now = time.time()
+            history = self._price_history.setdefault(symbol, [])
+            history.append((now, mark_price))
+            cutoff = now - 300.0
+            while len(history) > 1 and history[0][0] < cutoff:
+                history.pop(0)
+
+            if len(history) > 1 and history[0][1] > 0:
+                momentum_pct = round(((mark_price - history[0][1]) / history[0][1]) * 100.0, 3)
+            else:
+                momentum_pct = 0.0
+
             return MarketContext(
                 market_id=round_id,
                 symbol=symbol,
@@ -243,7 +257,7 @@ class BinanceWSListener:
                 time_left_seconds=time_left,
                 underlying_price=mark_price,
                 target_price=strike,
-                momentum_pct=round(random.uniform(-0.4, 0.4), 2)
+                momentum_pct=momentum_pct
             )
 
         # Handle direct prediction market ticker format if present
