@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     telemetry_port: int = Field(default=8899, alias="TELEMETRY_PORT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # --- Dashboard Access & Identity Protection ---
+    dashboard_username: str = Field(default="admin", alias="DASHBOARD_USERNAME")
+    dashboard_password: str = Field(default="trader2026", alias="DASHBOARD_PASSWORD")
+    dashboard_auth_token: str = Field(
+        default="jev-auth-secret-session-key-2026",
+        alias="DASHBOARD_AUTH_TOKEN"
+    )
+
     @property
     def is_live_trading(self) -> bool:
         """Returns True if both live trading is enabled and Binance API keys exist."""

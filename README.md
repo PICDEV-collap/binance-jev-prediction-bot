@@ -197,6 +197,24 @@ npm run dev
 | `MAX_DAILY_LOSS_USDT` | `200.0` | ขีดจำกัดขาดทุนรายวันก่อนตัดการทำงาน |
 | `TELEMETRY_PORT` | `8899` | พอร์ตของ FastAPI & WebSocket สำหรับหน้า Dashboard (ป้องกันการชนกับพอร์ต 8000) |
 | `NEXT_PUBLIC_BOT_PORT` | `8899` | พอร์ตที่ Next.js Dashboard ใช้เชื่อมต่อไปยัง Python Core |
+| `DASHBOARD_USERNAME` | `admin` | ชื่อผู้ใช้สำหรับยืนยันตัวตนเข้าสู่หน้า Web Dashboard (Account Identify) |
+| `DASHBOARD_PASSWORD` | `trader2026` | รหัสผ่าน Master Key / PIN สำหรับปลดล็อคหน้าแดชบอร์ด |
+
+---
+
+## 🔐 ระบบยืนยันตัวตนและการควบคุมบอทผ่านหน้าเว็บ (Web Operator Controls)
+
+1. **ระบบป้องกัน Account Identification:**
+   - เมื่อเข้าหน้าแดชบอร์ดครั้งแรก ระบบจะแสดงหน้าต่าง **Identity Access Gateway** บังคับให้ยืนยันตัวตนด้วย Username และ Master PIN ก่อนเข้าสู่ระบบควบคุม
+   - ค่าเริ่มต้น:
+     - **Username:** `admin`
+     - **Password:** `trader2026`
+   - เมื่อยืนยันตัวตนผ่าน ระบบจะจำกัด Session ไว้ในเบราว์เซอร์อย่างปลอดภัย พร้อมปุ่ม **Sign Out / Lock Desk** ที่แถบเมนูด้านบน
+
+2. **ปุ่มสั่งการ START / STOP บอทสดจากหน้าเว็บ:**
+   - **START BOT (สีเขียว):** สั่งเริ่มทำงานหรือปลดล็อคให้บอทเริ่มดักจับราคาและส่งคำสั่งเทรดอัตโนมัติ
+   - **STOP BOT (สีแดง):** สั่งหยุดการทำงานฉุกเฉิน (Freeze/Halt) คำสั่งเทรดทั้งหมดจะถูกระงับทันที
+   - แสดงสถานะแบบเรียลไทม์: `● BOT ACTIVE (RUNNING)` หรือ `■ BOT STOPPED (IDLE)`
 
 ---
 

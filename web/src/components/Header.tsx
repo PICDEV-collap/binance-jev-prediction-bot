@@ -6,30 +6,38 @@ import {
   ShieldAlert, 
   Sliders, 
   Play, 
-  Pause, 
+  Square, 
   Cpu, 
   Radio, 
-  ExternalLink 
+  User, 
+  LogOut 
 } from 'lucide-react';
 import { SystemStatus } from '../types/trading';
 
 interface HeaderProps {
   status: SystemStatus | null;
   isConnected: boolean;
-  onTogglePause: () => void;
+  botStatus: 'RUNNING' | 'STOPPED';
+  operatorName: string;
+  onStartBot: () => void;
+  onStopBot: () => void;
   onOpenSettings: () => void;
   onResetCircuitBreaker: () => void;
+  onLogout: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   status,
   isConnected,
-  onTogglePause,
+  botStatus,
+  operatorName,
+  onStartBot,
+  onStopBot,
   onOpenSettings,
   onResetCircuitBreaker,
+  onLogout,
 }) => {
   const isPaper = status?.trading_mode !== 'LIVE_TRADING';
-  const isPaused = status?.is_paused ?? false;
   const circuitTripped = status?.risk_guard?.circuit_breaker_active ?? false;
   const wsState = status?.ws_stream?.state ?? (isConnected ? 'CONNECTED' : 'CONNECTING');
 
@@ -45,10 +53,10 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
             <span className="absolute -bottom-1 -right-1 flex h-3.5 w-3.5">
               <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                isConnected ? 'bg-emerald-400' : 'bg-amber-400'
+                botStatus === 'RUNNING' ? 'bg-emerald-400' : 'bg-rose-400'
               }`} />
               <span className={`relative inline-flex rounded-full h-3.5 w-3.5 ${
-                isConnected ? 'bg-emerald-500' : 'bg-amber-500'
+                botStatus === 'RUNNING' ? 'bg-emerald-500' : 'bg-rose-500'
               }`} />
             </span>
           </div>
@@ -73,15 +81,14 @@ export const Header: React.FC<HeaderProps> = ({
         {/* Real-time Status Badges & Controls */}
         <div className="flex flex-wrap items-center gap-2.5">
           
-          {/* WebSocket Ingress Indicator */}
-          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs font-mono">
-            <Radio className={`w-3.5 h-3.5 ${
-              wsState === 'CONNECTED' ? 'text-emerald-400 animate-pulse' : 'text-amber-400'
-            }`} />
-            <span className="text-slate-400">WS Ingress:</span>
-            <span className={wsState === 'CONNECTED' ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'}>
-              {wsState}
-            </span>
+          {/* Bot State Indicator */}
+          <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono font-bold ${
+            botStatus === 'RUNNING'
+              ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-400 shadow-sm shadow-emerald-950/40'
+              : 'bg-rose-500/10 border-rose-500/40 text-rose-400'
+          }`}>
+            <span className={`w-2 h-2 rounded-full ${botStatus === 'RUNNING' ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`} />
+            <span>{botStatus === 'RUNNING' ? 'BOT ACTIVE' : 'BOT STOPPED'}</span>
           </div>
 
           {/* Operating Mode Badge */}
@@ -91,7 +98,7 @@ export const Header: React.FC<HeaderProps> = ({
               : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300 shadow-sm shadow-emerald-500/20'
           }`}>
             <span className={`w-2 h-2 rounded-full ${isPaper ? 'bg-amber-400' : 'bg-emerald-400'}`} />
-            <span>{isPaper ? 'PAPER TRADING' : 'LIVE CAPITAL'}</span>
+            <span>{isPaper ? 'PAPER' : 'LIVE'}</span>
           </div>
 
           {/* Circuit Breaker Warning (if tripped) */}
@@ -102,21 +109,38 @@ export const Header: React.FC<HeaderProps> = ({
               title="Click to reset circuit breaker"
             >
               <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
-              <span>CIRCUIT TRIPPED (RESET)</span>
+              <span>TRIPPED (RESET)</span>
             </button>
           )}
 
-          {/* Pause / Resume Button */}
+          {/* START BOT BUTTON */}
           <button
-            onClick={onTogglePause}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all border ${
-              isPaused
-                ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-400 shadow-lg shadow-emerald-900/40'
-                : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+            onClick={onStartBot}
+            disabled={botStatus === 'RUNNING'}
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-mono font-bold transition-all border ${
+              botStatus === 'RUNNING'
+                ? 'bg-slate-900/60 text-slate-600 border-slate-800 cursor-not-allowed opacity-50'
+                : 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-400 shadow-lg shadow-emerald-950/60 active:scale-95'
             }`}
+            title="Start Trading Bot & Market Evaluation"
           >
-            {isPaused ? <Play className="w-3.5 h-3.5 fill-current" /> : <Pause className="w-3.5 h-3.5" />}
-            <span>{isPaused ? 'RESUME BOT' : 'PAUSE'}</span>
+            <Play className="w-3.5 h-3.5 fill-current" />
+            <span>START BOT</span>
+          </button>
+
+          {/* STOP BOT BUTTON */}
+          <button
+            onClick={onStopBot}
+            disabled={botStatus === 'STOPPED'}
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-mono font-bold transition-all border ${
+              botStatus === 'STOPPED'
+                ? 'bg-slate-900/60 text-slate-600 border-slate-800 cursor-not-allowed opacity-50'
+                : 'bg-rose-600 hover:bg-rose-500 text-white border-rose-400 shadow-lg shadow-rose-950/60 active:scale-95'
+            }`}
+            title="Stop Trading Bot & Halt Orders"
+          >
+            <Square className="w-3.5 h-3.5 fill-current" />
+            <span>STOP BOT</span>
           </button>
 
           {/* Risk Config Modal Button */}
@@ -128,6 +152,22 @@ export const Header: React.FC<HeaderProps> = ({
             <Sliders className="w-3.5 h-3.5 text-cyan-400" />
             <span>CONFIG</span>
           </button>
+
+          {/* Operator Profile & Sign Out */}
+          <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+            <div className="hidden sm:flex items-center gap-1.5 text-xs font-mono text-slate-400 bg-slate-900/80 px-2.5 py-1.5 rounded-lg border border-slate-800">
+              <User className="w-3.5 h-3.5 text-cyan-400" />
+              <span className="font-semibold text-slate-200">{operatorName}</span>
+            </div>
+            <button
+              onClick={onLogout}
+              className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-rose-400 border border-slate-800 transition-colors"
+              title="Sign Out / Lock Trading Desk"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
         </div>
 
       </div>

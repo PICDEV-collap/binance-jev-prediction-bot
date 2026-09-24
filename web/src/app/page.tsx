@@ -8,6 +8,7 @@ import { JevAiRadar } from '../components/JevAiRadar';
 import { OrderExecutionTable } from '../components/OrderExecutionTable';
 import { LiveTerminalLog } from '../components/LiveTerminalLog';
 import { RiskControlsModal } from '../components/RiskControlsModal';
+import { AuthGate } from '../components/AuthGate';
 import { 
   SystemStatus, 
   MarketItem, 
@@ -68,13 +69,31 @@ export default function DashboardPage() {
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isConfigOpen, setIsConfigOpen] = useState<boolean>(false);
   const [serverUrl, setServerUrl] = useState<string>('http://localhost:8899');
+  
+  // Authentication & Operator Identity State
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [operator, setOperator] = useState<{ username: string; token: string }>({ username: 'admin', token: '' });
+  const [botStatus, setBotStatus] = useState<'RUNNING' | 'STOPPED'>('RUNNING');
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Load custom server URL from localStorage on client mount & set initial demo state
+  // Load custom server URL & authentication session from localStorage
   useEffect(() => {
     if (typeof window !== 'undefined') {
+      const savedAuth = localStorage.getItem('quant_auth_session');
+      if (savedAuth) {
+        try {
+          const parsed = JSON.parse(savedAuth);
+          if (parsed?.username) {
+            setOperator(parsed);
+            setIsAuthenticated(true);
+          }
+        } catch {
+          localStorage.removeItem('quant_auth_session');
+        }
+      }
+
       const saved = localStorage.getItem('bot_server_url');
       if (saved) setServerUrl(saved);
     }
@@ -241,16 +260,46 @@ export default function DashboardPage() {
     }
   };
 
-  // Actions
-  const handleTogglePause = async () => {
-    try {
-      const res = await fetch(getApiUrl('/api/pause'), { method: 'POST' });
-      const data = await res.json();
-      setStatus((prev) => (prev ? { ...prev, is_paused: data.is_paused } : null));
-    } catch {
-      // Local demo fallback
-      setStatus((prev) => (prev ? { ...prev, is_paused: !prev.is_paused } : null));
+  // Authentication Handlers
+  const handleLoginSuccess = (user: { username: string; token: string }) => {
+    setOperator(user);
+    setIsAuthenticated(true);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('quant_auth_session', JSON.stringify(user));
     }
+  };
+
+  const handleLogout = () => {
+    setIsAuthenticated(false);
+    setOperator({ username: 'admin', token: '' });
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('quant_auth_session');
+    }
+  };
+
+  // Bot Start & Stop Actions
+  const handleStartBot = async () => {
+    try {
+      const res = await fetch(getApiUrl('/api/bot/start'), { method: 'POST' });
+      if (res.ok) {
+        setBotStatus('RUNNING');
+      }
+    } catch {
+      setBotStatus('RUNNING');
+    }
+    setStatus((prev) => (prev ? { ...prev, is_paused: false } : null));
+  };
+
+  const handleStopBot = async () => {
+    try {
+      const res = await fetch(getApiUrl('/api/bot/stop'), { method: 'POST' });
+      if (res.ok) {
+        setBotStatus('STOPPED');
+      }
+    } catch {
+      setBotStatus('STOPPED');
+    }
+    setStatus((prev) => (prev ? { ...prev, is_paused: true } : null));
   };
 
   const handleResetCircuitBreaker = async () => {
@@ -316,15 +365,24 @@ export default function DashboardPage() {
   const latestRecord = records[0] || null;
   const currentThreshold = status?.risk_guard?.confidence_threshold ?? 0.80;
 
+  // Protect desk behind Account Identification Gate
+  if (!isAuthenticated) {
+    return <AuthGate serverUrl={serverUrl} onLoginSuccess={handleLoginSuccess} />;
+  }
+
   return (
     <div className="min-h-screen bg-[#06090f] text-slate-100 flex flex-col">
-      {/* Header Bar */}
+      {/* Header Bar with Start/Stop and Operator Identity */}
       <Header
         status={status}
         isConnected={isConnected}
-        onTogglePause={handleTogglePause}
+        botStatus={botStatus}
+        operatorName={operator.username}
+        onStartBot={handleStartBot}
+        onStopBot={handleStopBot}
         onOpenSettings={() => setIsConfigOpen(true)}
         onResetCircuitBreaker={handleResetCircuitBreaker}
+        onLogout={handleLogout}
       />
 
       {/* Main Dashboard Layout */}

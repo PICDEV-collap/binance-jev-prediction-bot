@@ -42,6 +42,11 @@ class ConfigUpdateRequest(BaseModel):
     paper_trading: bool | None = None
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 class TradingBotCoordinator:
     """
     Master coordinator orchestrating the event-driven trading lifecycle.
@@ -50,6 +55,7 @@ class TradingBotCoordinator:
     def __init__(self) -> None:
         self.start_time = time.time()
         self.is_paused: bool = False
+        self.bot_status: str = "RUNNING"  # "RUNNING" or "STOPPED"
 
         # Initialize core components
         self.jev_client = JevClient(
@@ -112,14 +118,24 @@ class TradingBotCoordinator:
         await self.ws_listener.stop()
         await self.binance_client.close()
         await self.jev_client.close()
-        logger.info("Trading Bot Coordinator stopped successfully.")
+    def start_bot(self) -> None:
+        """Start or resume trading execution."""
+        self.bot_status = "RUNNING"
+        self.is_paused = False
+        logger.info("[OPERATOR COMMAND] Bot status changed to: RUNNING")
+
+    def stop_bot(self) -> None:
+        """Halt or freeze trading execution."""
+        self.bot_status = "STOPPED"
+        self.is_paused = True
+        logger.info("[OPERATOR COMMAND] Bot status changed to: STOPPED")
 
     async def on_market_tick(self, market: MarketContext) -> None:
         """
         Event-driven callback triggered on every market tick from WebSocket.
         Executes non-blocking inference, risk gating, and order dispatch.
         """
-        if self.is_paused:
+        if self.bot_status != "RUNNING" or self.is_paused:
             return
 
         # Step 1: AI Evaluation via Jev AI Decision Engine
@@ -194,6 +210,7 @@ class TradingBotCoordinator:
         """Aggregate system telemetry for dashboard inspection."""
         uptime_seconds = int(time.time() - self.start_time)
         return {
+            "bot_status": self.bot_status,
             "is_paused": self.is_paused,
             "uptime_seconds": uptime_seconds,
             "uptime_formatted": f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s",
@@ -286,12 +303,49 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
     }
 
 
+@app.post("/api/auth/login")
+async def login_endpoint(req: LoginRequest) -> Dict[str, Any]:
+    """Authenticate dashboard operator identity."""
+    if req.username == settings.dashboard_username and req.password == settings.dashboard_password:
+        return {
+            "status": "success",
+            "token": settings.dashboard_auth_token,
+            "username": req.username,
+            "message": "Authentication successful"
+        }
+    from fastapi import HTTPException
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+
+@app.post("/api/bot/start")
+async def start_bot_endpoint() -> Dict[str, Any]:
+    """Web command to start/activate bot trading."""
+    bot.start_bot()
+    return {
+        "bot_status": bot.bot_status,
+        "message": "Trading bot activated successfully",
+        "system_status": bot.get_system_status()
+    }
+
+
+@app.post("/api/bot/stop")
+async def stop_bot_endpoint() -> Dict[str, Any]:
+    """Web command to stop/freeze bot trading."""
+    bot.stop_bot()
+    return {
+        "bot_status": bot.bot_status,
+        "message": "Trading bot halted successfully",
+        "system_status": bot.get_system_status()
+    }
+
+
 @app.post("/api/pause")
 async def toggle_pause() -> Dict[str, Any]:
     """Pause or resume trading execution."""
     bot.is_paused = not bot.is_paused
-    logger.info(f"Trading bot paused state changed: {bot.is_paused}")
-    return {"is_paused": bot.is_paused}
+    bot.bot_status = "STOPPED" if bot.is_paused else "RUNNING"
+    logger.info(f"Trading bot state changed: {bot.bot_status} (paused={bot.is_paused})")
+    return {"bot_status": bot.bot_status, "is_paused": bot.is_paused}
 
 
 @app.post("/api/circuit-breaker/reset")
