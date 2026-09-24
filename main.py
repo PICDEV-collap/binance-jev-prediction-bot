@@ -42,6 +42,19 @@ class ConfigUpdateRequest(BaseModel):
     paper_trading: bool | None = None
 
 
+class TargetMarketRequest(BaseModel):
+    target_symbol: str = "BTCUSDT"
+    target_timeframe: str = "15m"
+
+
+class ManualTradeRequest(BaseModel):
+    market_id: str
+    symbol: str
+    side: str  # "UP" or "DOWN"
+    contracts: int = 10
+    target_price: float
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -50,12 +63,19 @@ class LoginRequest(BaseModel):
 class TradingBotCoordinator:
     """
     Master coordinator orchestrating the event-driven trading lifecycle.
+    Features token-efficient AI inference (1x per round) on target market only,
+    and supports full dual-sided (UP and DOWN) trading.
     """
 
     def __init__(self) -> None:
         self.start_time = time.time()
         self.is_paused: bool = False
         self.bot_status: str = "RUNNING"  # "RUNNING" or "STOPPED"
+
+        # User-selected Target Pair & Timeframe for AI evaluation (Token efficiency)
+        self.target_symbol: str = getattr(settings, "target_symbol", "BTCUSDT").upper()
+        self.target_timeframe: str = getattr(settings, "target_timeframe", "15m").lower()
+        self.evaluated_rounds: Set[str] = set()
 
         # Initialize core components
         self.jev_client = JevClient(
@@ -135,13 +155,15 @@ class TradingBotCoordinator:
                 await asyncio.sleep(1.0)
                 markets = self.ws_listener.get_active_markets()
 
-                # Settle paper trading positions when a 15-minute round expires
+                # Settle paper trading positions when a round expires
                 if markets:
                     active_market_ids = {m["market_id"] for m in markets}
                     current_prices = {m["symbol"]: m["underlying_price"] for m in markets}
                     pnl = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
                     if pnl != 0.0:
                         self.risk_guard.record_pnl(pnl)
+                    # Prune expired rounds from memory set
+                    self.evaluated_rounds = {rid for rid in self.evaluated_rounds if rid in active_market_ids}
 
                 if self.ws_clients:
                     status = self.get_system_status()
@@ -177,18 +199,34 @@ class TradingBotCoordinator:
 
     async def on_market_tick(self, market: MarketContext) -> None:
         """
-        Event-driven callback triggered on every market tick from WebSocket.
-        Executes non-blocking inference, risk gating, and order dispatch.
+        Event-driven callback triggered on market tick from WebSocket.
+        TOKEN-EFFICIENT POLICY:
+        1. Only evaluates the user-selected pair (e.g. BTCUSDT) and timeframe (e.g. 15m).
+        2. Evaluates EXACTLY 1 TIME PER ROUND to save API tokens (99.9% cost reduction).
+        3. Supports dual-sided prediction orders (UP / DOWN).
         """
         if self.bot_status != "RUNNING" or self.is_paused:
             return
 
-        # Throttle evaluation per market_id to once every 3.0s to avoid API rate limits
-        now = time.time()
-        last_eval = self._last_eval_time.get(market.market_id, 0.0)
-        if now - last_eval < 3.0:
+        # Token Filter 1: Check selected symbol
+        if self.target_symbol != "ALL" and market.symbol.upper() != self.target_symbol.upper():
             return
-        self._last_eval_time[market.market_id] = now
+
+        # Token Filter 2: Check selected timeframe
+        if self.target_timeframe != "ALL" and market.timeframe.lower() != self.target_timeframe.lower():
+            return
+
+        # Token Filter 3: Check if already evaluated this round (1x per round)
+        if market.market_id in self.evaluated_rounds:
+            return
+
+        # Mark round as evaluated immediately to guarantee strictly 1 AI call per round
+        self.evaluated_rounds.add(market.market_id)
+
+        logger.info(
+            f"[AI EVALUATION TRIGGERED: 1x/Round] Symbol: {market.symbol} | TF: {market.timeframe} | "
+            f"Round: {market.market_id} | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f}"
+        )
 
         # Step 1: AI Evaluation via Jev AI Decision Engine
         decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
@@ -208,6 +246,8 @@ class TradingBotCoordinator:
             "symbol": market.symbol,
             "question": market.question,
             "timeframe": market.timeframe,
+            "odds_up": getattr(market, "odds_up", market.odds_yes),
+            "odds_down": getattr(market, "odds_down", market.odds_no),
             "odds_yes": market.odds_yes,
             "odds_no": market.odds_no,
             "underlying_price": market.underlying_price,
@@ -222,16 +262,17 @@ class TradingBotCoordinator:
             "order": None,
         }
 
-        # Step 3: Order Execution (if approved by Risk Guard)
-        if risk_result.approved:
+        # Step 3: Order Execution (UP or DOWN if approved by Risk Guard)
+        if risk_result.approved and risk_result.action in ("UP", "DOWN", "BUY_YES", "BUY_NO"):
+            clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
             logger.info(
-                f">>> DISPATCHING ORDER: {risk_result.action} {risk_result.adjusted_contracts}x "
-                f"on {market.market_id} @ {risk_result.target_price:.3f}"
+                f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
+                f"on {market.market_id} ({market.timeframe}) @ {risk_result.target_price:.3f}"
             )
             order_result: OrderResult = await self.binance_client.place_prediction_order(
                 market_id=market.market_id,
                 symbol=market.symbol,
-                side=risk_result.action,
+                side=clean_action,
                 contracts=risk_result.adjusted_contracts,
                 target_price=risk_result.target_price,
             )
@@ -276,6 +317,12 @@ class TradingBotCoordinator:
             "uptime_seconds": uptime_seconds,
             "uptime_formatted": f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s",
             "trading_mode": "PAPER_TRADING" if self.binance_client.paper_trading else "LIVE_TRADING",
+            "target_market": {
+                "target_symbol": self.target_symbol,
+                "target_timeframe": self.target_timeframe,
+                "evaluated_rounds_count": len(self.evaluated_rounds),
+                "evaluation_policy": "1x_per_round",
+            },
             "ws_stream": self.ws_listener.metrics,
             "jev_ai": self.jev_client.stats,
             "risk_guard": self.risk_guard.metrics,
@@ -414,6 +461,81 @@ async def reset_circuit_breaker() -> Dict[str, Any]:
     """Reset daily loss circuit breaker."""
     bot.risk_guard.reset_circuit_breaker()
     return {"status": "reset", "message": "Circuit breaker reset to active"}
+
+
+@app.get("/api/target")
+async def get_target_endpoint() -> Dict[str, Any]:
+    """Get currently targeted pair and timeframe for AI evaluation."""
+    return {
+        "target_symbol": bot.target_symbol,
+        "target_timeframe": bot.target_timeframe,
+        "evaluated_rounds_count": len(bot.evaluated_rounds),
+        "policy": "1x_per_round",
+    }
+
+
+@app.post("/api/target")
+async def set_target_endpoint(req: TargetMarketRequest) -> Dict[str, Any]:
+    """Dynamically switch the targeted asset and timeframe for AI evaluation."""
+    bot.target_symbol = req.target_symbol.upper()
+    bot.target_timeframe = req.target_timeframe.lower()
+    logger.info(f"[TARGET SWITCH] Target set to {bot.target_symbol} ({bot.target_timeframe})")
+    return {
+        "status": "success",
+        "target_symbol": bot.target_symbol,
+        "target_timeframe": bot.target_timeframe,
+        "message": f"Target updated to {bot.target_symbol} ({bot.target_timeframe})",
+        "system_status": bot.get_system_status()
+    }
+
+
+@app.post("/api/trade/manual")
+async def manual_trade_endpoint(req: ManualTradeRequest) -> Dict[str, Any]:
+    """Manually place an UP or DOWN prediction order without waiting for AI."""
+    clean_side = "UP" if req.side.upper() in ("UP", "BUY_YES") else "DOWN"
+    order_result = await bot.binance_client.place_prediction_order(
+        market_id=req.market_id,
+        symbol=req.symbol,
+        side=clean_side,
+        contracts=req.contracts,
+        target_price=req.target_price,
+    )
+    return {
+        "status": "success",
+        "order": order_result.model_dump(),
+        "account": bot.binance_client.get_account_summary(),
+    }
+
+
+@app.post("/api/evaluate/force")
+async def force_evaluate_endpoint(market_id: str) -> Dict[str, Any]:
+    """Force an immediate single AI evaluation on specific market round."""
+    markets = {m["market_id"]: m for m in bot.ws_listener.get_active_markets()}
+    if market_id not in markets:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Market not found in active streams")
+
+    m_info = markets[market_id]
+    ctx = MarketContext(
+        market_id=m_info["market_id"],
+        symbol=m_info["symbol"],
+        question=m_info["question"],
+        timeframe=m_info.get("timeframe", "15m"),
+        odds_yes=m_info["odds_yes"],
+        odds_no=m_info["odds_no"],
+        underlying_price=m_info["underlying_price"],
+        target_price=m_info["target_price"],
+        price_diff=m_info.get("price_diff", 0.0),
+        momentum_pct=m_info.get("momentum_pct", 0.0),
+        spread=m_info["spread"],
+        volume_24h=m_info["volume_24h"],
+        time_left_seconds=m_info["time_left_seconds"],
+        bid=m_info.get("bid", 0.49),
+        ask=m_info.get("ask", 0.51),
+    )
+    bot.evaluated_rounds.discard(market_id)
+    await bot.on_market_tick(ctx)
+    return {"status": "success", "message": f"Forced evaluation executed for {market_id}"}
 
 
 @app.websocket("/ws/stream")

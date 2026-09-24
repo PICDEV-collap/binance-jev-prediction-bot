@@ -182,7 +182,7 @@ class BinanceClient:
 
         # Map side to Binance prediction contract side
         order_side = "BUY"
-        prediction_choice = "YES" if "YES" in side.upper() else "NO"
+        prediction_choice = "UP" if ("UP" in side.upper() or "YES" in side.upper()) else "DOWN"
 
         params = {
             "symbol": symbol,

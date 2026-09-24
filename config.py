@@ -37,6 +37,9 @@ class Settings(BaseSettings):
         default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT,XRPUSDT",
         alias="ACTIVE_SYMBOLS"
     )
+    target_symbol: str = Field(default="BTCUSDT", alias="TARGET_SYMBOL")
+    target_timeframe: str = Field(default="15m", alias="TARGET_TIMEFRAME")
+    evaluations_per_round: int = Field(default=1, alias="EVALUATIONS_PER_ROUND")
 
     # --- Jev AI Decision Engine Configuration ---
     jev_ai_api_key: str = Field(default="", alias="JEV_AI_API_KEY")

@@ -98,6 +98,12 @@ export interface SystemStatus {
     total_orders: number;
     total_fills: number;
   };
+  target_market?: {
+    target_symbol: string;
+    target_timeframe: string;
+    evaluated_rounds_count: number;
+    evaluation_policy: string;
+  };
 }
 
 export interface TelemetryRecord {

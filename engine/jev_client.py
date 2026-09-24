@@ -36,6 +36,14 @@ class MarketContext(BaseModel):
     momentum_pct: float = 0.0
     timestamp: float = Field(default_factory=time.time)
 
+    @property
+    def odds_up(self) -> float:
+        return self.odds_yes
+
+    @property
+    def odds_down(self) -> float:
+        return self.odds_no
+
 
 class JevEvaluationResult(BaseModel):
     """Structured decision returned by Jev AI."""
@@ -65,9 +73,9 @@ class JevClient:
         self.endpoint = endpoint
         self.model = model
         self.timeout = aiohttp.ClientTimeout(
-            total=timeout_seconds,
-            connect=1.0,
-            sock_read=timeout_seconds
+            total=max(timeout_seconds, 6.0),
+            connect=4.0,
+            sock_read=max(timeout_seconds, 6.0)
         )
         self._session: Optional[aiohttp.ClientSession] = None
         self._total_evaluations: int = 0

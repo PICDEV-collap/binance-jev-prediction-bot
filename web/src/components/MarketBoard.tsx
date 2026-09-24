@@ -16,6 +16,10 @@ interface MarketBoardProps {
   markets: MarketItem[];
   selectedMarketId: string | null;
   onSelectMarket: (marketId: string) => void;
+  targetSymbol?: string;
+  targetTimeframe?: string;
+  onSetAiTarget?: (symbol: string, timeframe: string) => void;
+  onManualTrade?: (market: MarketItem, side: 'UP' | 'DOWN') => void;
 }
 
 const TIMEFRAMES: { label: string; value: TimeFrameType }[] = [
@@ -40,6 +44,10 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
   markets,
   selectedMarketId,
   onSelectMarket,
+  targetSymbol,
+  targetTimeframe,
+  onSetAiTarget,
+  onManualTrade,
 }) => {
   const [selectedTf, setSelectedTf] = useState<TimeFrameType>('all');
   const [selectedAsset, setSelectedAsset] = useState<string>('all');
@@ -142,16 +150,36 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
               : market.underlying_price - market.target_price;
             const isAboveStrike = diff >= 0;
 
+            const isAiTarget = Boolean(
+              targetSymbol && 
+              targetTimeframe && 
+              (market.symbol.toUpperCase() === targetSymbol.toUpperCase() || targetSymbol === 'ALL') &&
+              (tf.toLowerCase() === targetTimeframe.toLowerCase() || targetTimeframe === 'ALL')
+            );
+
             return (
               <div
                 key={market.market_id}
                 onClick={() => onSelectMarket(market.market_id)}
-                className={`rounded-xl p-4 transition-all cursor-pointer border ${
-                  isSelected
-                    ? 'bg-slate-900/95 border-emerald-500/70 shadow-lg shadow-emerald-950/40 ring-1 ring-emerald-500/40'
+                className={`rounded-xl p-4 transition-all cursor-pointer border relative ${
+                  isAiTarget
+                    ? 'bg-slate-900/95 border-emerald-500/70 shadow-lg shadow-emerald-950/40 ring-1 ring-emerald-500/50'
+                    : isSelected
+                    ? 'bg-slate-900/90 border-cyan-500/60 shadow-md ring-1 ring-cyan-500/40'
                     : 'bg-slate-900/40 border-slate-800/80 hover:bg-slate-900/70 hover:border-slate-700'
                 }`}
               >
+                {/* Target Ribbon Badge on Card */}
+                {isAiTarget && (
+                  <div className="mb-2 flex items-center justify-between bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-1 rounded-lg text-[10px] font-mono font-bold text-emerald-300">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                      🎯 AI Target (1x/Round)
+                    </span>
+                    <span className="text-emerald-400/80">Token-Saving</span>
+                  </div>
+                )}
+
                 {/* Header: Title & Timeframe & Timer */}
                 <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-2">
@@ -174,35 +202,53 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
                   </div>
                 </div>
 
-                {/* Big Up / Down Action & Percentage Boxes (Binance Style) */}
+                {/* Big Up / Down Action & Percentage Boxes with Quick Trade */}
                 <div className="grid grid-cols-2 gap-2 mb-3">
                   
                   {/* UP Box */}
-                  <div className={`p-2.5 rounded-xl border text-center transition-all ${
-                    isAboveStrike
-                      ? 'bg-emerald-500/15 border-emerald-500/50 shadow-sm shadow-emerald-950/40'
-                      : 'bg-slate-950/60 border-slate-800/80'
-                  }`}>
+                  <div 
+                    onClick={(e) => {
+                      if (onManualTrade) {
+                        e.stopPropagation();
+                        onManualTrade(market, 'UP');
+                      }
+                    }}
+                    title="Click to place manual prediction UP"
+                    className={`p-2.5 rounded-xl border text-center transition-all group ${
+                      isAboveStrike
+                        ? 'bg-emerald-500/15 border-emerald-500/50 shadow-sm shadow-emerald-950/40 hover:bg-emerald-500/25'
+                        : 'bg-slate-950/60 border-slate-800/80 hover:bg-emerald-950/30 hover:border-emerald-500/40'
+                    }`}
+                  >
                     <div className="flex items-center justify-center gap-1 text-emerald-400 text-base font-black font-mono">
                       <ArrowUp className="w-4 h-4 stroke-[3]" />
                       <span>{upPct.toFixed(0)}%</span>
                     </div>
-                    <div className="text-[11px] font-mono text-emerald-300/80 font-semibold uppercase tracking-wider">
+                    <div className="text-[11px] font-mono text-emerald-300/80 font-semibold uppercase tracking-wider group-hover:text-emerald-300">
                       Up ({market.odds_yes.toFixed(3)})
                     </div>
                   </div>
 
                   {/* DOWN Box */}
-                  <div className={`p-2.5 rounded-xl border text-center transition-all ${
-                    !isAboveStrike
-                      ? 'bg-rose-500/15 border-rose-500/50 shadow-sm shadow-rose-950/40'
-                      : 'bg-slate-950/60 border-slate-800/80'
-                  }`}>
+                  <div 
+                    onClick={(e) => {
+                      if (onManualTrade) {
+                        e.stopPropagation();
+                        onManualTrade(market, 'DOWN');
+                      }
+                    }}
+                    title="Click to place manual prediction DOWN"
+                    className={`p-2.5 rounded-xl border text-center transition-all group ${
+                      !isAboveStrike
+                        ? 'bg-rose-500/15 border-rose-500/50 shadow-sm shadow-rose-950/40 hover:bg-rose-500/25'
+                        : 'bg-slate-950/60 border-slate-800/80 hover:bg-rose-950/30 hover:border-rose-500/40'
+                    }`}
+                  >
                     <div className="flex items-center justify-center gap-1 text-rose-400 text-base font-black font-mono">
                       <ArrowDown className="w-4 h-4 stroke-[3]" />
                       <span>{downPct.toFixed(0)}%</span>
                     </div>
-                    <div className="text-[11px] font-mono text-rose-300/80 font-semibold uppercase tracking-wider">
+                    <div className="text-[11px] font-mono text-rose-300/80 font-semibold uppercase tracking-wider group-hover:text-rose-300">
                       Down ({market.odds_no.toFixed(3)})
                     </div>
                   </div>
@@ -243,10 +289,22 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
                   />
                 </div>
 
-                {/* Bottom Metadata: Volume & Spread */}
-                <div className="flex items-center justify-between text-[10px] font-mono text-slate-500">
-                  <span>Pool Vol: ${(market.volume_24h / 1000).toFixed(0)}k</span>
-                  <span>Spread: {(market.spread * 100).toFixed(2)}%</span>
+                {/* Bottom Metadata: Volume & Set Target Action */}
+                <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 pt-1">
+                  <span>Pool: ${(market.volume_24h / 1000).toFixed(0)}k</span>
+                  
+                  {!isAiTarget && onSetAiTarget && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSetAiTarget(market.symbol, tf);
+                      }}
+                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-emerald-500/20 text-slate-400 hover:text-emerald-300 border border-slate-700 hover:border-emerald-500/40 transition-all font-semibold"
+                    >
+                      🎯 Focus AI
+                    </button>
+                  )}
                 </div>
 
               </div>

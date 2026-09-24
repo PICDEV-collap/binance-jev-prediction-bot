@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Header } from '../components/Header';
 import { MetricsBar } from '../components/MetricsBar';
+import { AiTargetRibbon } from '../components/AiTargetRibbon';
 import { MarketBoard } from '../components/MarketBoard';
 import { JevAiRadar } from '../components/JevAiRadar';
 import { OrderExecutionTable } from '../components/OrderExecutionTable';
@@ -488,6 +489,61 @@ export default function DashboardPage() {
     });
   };
 
+  const handleSetAiTarget = async (symbol: string, timeframe: string) => {
+    try {
+      const res = await fetch(getApiUrl('/api/target'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_symbol: symbol, target_timeframe: timeframe }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.system_status) setStatus(data.system_status);
+        else {
+          setStatus((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  target_market: {
+                    target_symbol: symbol,
+                    target_timeframe: timeframe,
+                    evaluated_rounds_count: prev.target_market?.evaluated_rounds_count ?? 0,
+                    evaluation_policy: '1x_per_round',
+                  },
+                }
+              : null
+          );
+        }
+      }
+    } catch (e) {
+      console.error('Failed to set AI target:', e);
+    }
+  };
+
+  const handleManualTrade = async (market: MarketItem, side: 'UP' | 'DOWN') => {
+    try {
+      const res = await fetch(getApiUrl('/api/trade/manual'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          market_id: market.market_id,
+          symbol: market.symbol,
+          side: side,
+          contracts: 10,
+          target_price: side === 'UP' ? market.odds_yes : market.odds_no,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.order) {
+          setOrders((prev) => [data.order, ...prev.slice(0, 49)]);
+        }
+      }
+    } catch (e) {
+      console.error('Manual trade error:', e);
+    }
+  };
+
   const selectedRecord = records.find(
     (r) => r.market_id === selectedMarketId || r.symbol === selectedMarketId?.split('-')[0]
   );
@@ -520,6 +576,13 @@ export default function DashboardPage() {
         {/* Top Executive Metrics Ribbon */}
         <MetricsBar status={status} />
 
+        {/* AI Target Market & Token Saving Ribbon */}
+        <AiTargetRibbon
+          status={status}
+          serverUrl={serverUrl}
+          onTargetChanged={handleSetAiTarget}
+        />
+
         {/* Core Trading & AI Intelligence Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
           
@@ -529,6 +592,10 @@ export default function DashboardPage() {
               markets={markets}
               selectedMarketId={selectedMarketId}
               onSelectMarket={setSelectedMarketId}
+              targetSymbol={status?.target_market?.target_symbol || 'BTCUSDT'}
+              targetTimeframe={status?.target_market?.target_timeframe || '15m'}
+              onSetAiTarget={handleSetAiTarget}
+              onManualTrade={handleManualTrade}
             />
           </div>
 
