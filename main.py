@@ -133,9 +133,18 @@ class TradingBotCoordinator:
         while True:
             try:
                 await asyncio.sleep(1.0)
+                markets = self.ws_listener.get_active_markets()
+
+                # Settle paper trading positions when a 15-minute round expires
+                if markets:
+                    active_market_ids = {m["market_id"] for m in markets}
+                    current_prices = {m["symbol"]: m["underlying_price"] for m in markets}
+                    pnl = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
+                    if pnl != 0.0:
+                        self.risk_guard.record_pnl(pnl)
+
                 if self.ws_clients:
                     status = self.get_system_status()
-                    markets = self.ws_listener.get_active_markets()
                     msg = {
                         "type": "HEARTBEAT",
                         "system_status": status,

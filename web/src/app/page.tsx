@@ -138,12 +138,25 @@ export default function DashboardPage() {
     };
 
     setRecords([demoRecord]);
-    setOrders([demoRecord.order!]);
+    setOrders([]);
   }, []);
 
   // Connect to live backend WebSocket or fallback gracefully
   const connectWebSocket = useCallback(() => {
     if (typeof window === 'undefined') return;
+
+    // Prevent duplicate connections if socket is already open or currently connecting
+    if (
+      wsRef.current &&
+      (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
 
     let wsUrl = 'ws://localhost:8899/ws/stream';
     try {
@@ -177,8 +190,22 @@ export default function DashboardPage() {
                 return curr;
               });
             }
-            if (message.recent_decisions?.length > 0) setRecords(message.recent_decisions);
-            if (message.orders?.length > 0) setOrders(message.orders);
+            if (message.recent_decisions?.length > 0) {
+              setRecords(message.recent_decisions);
+            }
+            if (message.orders?.length > 0) {
+              // Deduplicate initial snapshot orders by order_id or client_order_id
+              const seen = new Set<string>();
+              const deduped: OrderItem[] = [];
+              for (const ord of message.orders) {
+                const key = ord.order_id || ord.client_order_id;
+                if (!seen.has(key)) {
+                  seen.add(key);
+                  deduped.push(ord);
+                }
+              }
+              setOrders(deduped);
+            }
           } else if (message.type === 'HEARTBEAT') {
             if (message.system_status) setStatus(message.system_status);
             if (message.active_markets?.length > 0) setMarkets(message.active_markets);
@@ -187,10 +214,22 @@ export default function DashboardPage() {
             if (message.system_status) setStatus(message.system_status);
             if (message.active_markets?.length > 0) setMarkets(message.active_markets);
 
-            setRecords((prev) => [newRecord, ...prev.slice(0, 49)]);
+            setRecords((prev) => {
+              if (prev.length > 0 && prev[0].timestamp === newRecord.timestamp && prev[0].market_id === newRecord.market_id) {
+                return prev;
+              }
+              return [newRecord, ...prev.slice(0, 49)];
+            });
 
             if (newRecord.order) {
-              setOrders((prev) => [newRecord.order!, ...prev.slice(0, 49)]);
+              setOrders((prev) => {
+                const key = newRecord.order!.order_id || newRecord.order!.client_order_id;
+                // Strict deduplication: ignore if order with same ID is already in the list
+                if (prev.some((o) => (o.order_id === key || o.client_order_id === key))) {
+                  return prev;
+                }
+                return [newRecord.order!, ...prev.slice(0, 49)];
+              });
             }
 
             // Update market list in place by market_id or symbol
@@ -226,7 +265,9 @@ export default function DashboardPage() {
 
       socket.onclose = () => {
         setIsConnected(false);
-        // Attempt reconnect after 3 seconds
+        if (wsRef.current === socket) {
+          wsRef.current = null;
+        }
         reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
       };
 
@@ -238,13 +279,23 @@ export default function DashboardPage() {
       setIsConnected(false);
       reconnectTimeoutRef.current = setTimeout(connectWebSocket, 5000);
     }
-  }, []);
+  }, [serverUrl]);
 
   useEffect(() => {
     connectWebSocket();
     return () => {
-      if (wsRef.current) wsRef.current.close();
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [connectWebSocket]);
 

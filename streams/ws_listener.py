@@ -349,16 +349,8 @@ class BinanceWSListener:
         odds_yes = round(max(0.08, min(0.92, 0.50 + (diff_ratio * 40.0) + (momentum_pct * 0.05))), 3)
         odds_no = round(1.0 - odds_yes, 3)
 
-        # Best bid/ask spread if available
-        try:
-            best_bid = float(payload.get("b", 0.0))
-            best_ask = float(payload.get("a", 0.0))
-            if best_bid > 0 and best_ask > 0:
-                spread = round((best_ask - best_bid) / mark_price, 4)
-            else:
-                spread = base_spread
-        except Exception:
-            spread = base_spread
+        # Realistic bid/ask spread for binary prediction contract
+        spread = base_spread
 
         clean_symbol = symbol.replace("USDT", "")
         question = f"Will {clean_symbol} settle >= ${strike:,.2f} at 15m expiration?"

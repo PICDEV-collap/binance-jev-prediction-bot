@@ -44,6 +44,7 @@ class PositionInfo(BaseModel):
     contracts: int
     entry_price: float
     current_price: float
+    target_price: float = 0.0
     unrealized_pnl: float
     entry_time: float = Field(default_factory=time.time)
 
@@ -297,7 +298,7 @@ class BinanceClient:
 
         # Deduct balance and open position
         self._paper_balance_usdt -= order_cost
-        position_id = f"POS_{market_id}_{side}"
+        position_id = f"POS_{market_id}_{side}_{uuid.uuid4().hex[:4]}"
 
         self._paper_positions[position_id] = PositionInfo(
             position_id=position_id,
@@ -307,6 +308,7 @@ class BinanceClient:
             contracts=contracts,
             entry_price=executed_price,
             current_price=executed_price,
+            target_price=target_price,
             unrealized_pnl=0.0
         )
 
@@ -331,6 +333,54 @@ class BinanceClient:
             f"@ {executed_price:.3f} | Latency: {elapsed_ms:.1f}ms | Rem. Balance: ${self._paper_balance_usdt:.2f}"
         )
         return result
+
+    def settle_expired_positions(
+        self,
+        active_market_ids: Set[str],
+        current_prices: Dict[str, float]
+    ) -> float:
+        """
+        Settle prediction contracts whose 15-minute round has ended.
+        Picks up final settlement: $1.00 USDT payout per winning contract.
+        Returns total net realized PnL.
+        """
+        if not self.paper_trading:
+            return 0.0
+
+        expired_pos_ids = [
+            pid for pid, pos in self._paper_positions.items()
+            if pos.market_id not in active_market_ids
+        ]
+
+        total_net_pnl = 0.0
+
+        for pid in expired_pos_ids:
+            pos = self._paper_positions.pop(pid)
+            spot = current_prices.get(pos.symbol, pos.entry_price)
+            cost = pos.contracts * pos.entry_price
+
+            # Binary outcome settlement: $1.00 per contract
+            if pos.side == "BUY_YES":
+                won = spot >= pos.target_price
+            else:
+                won = spot < pos.target_price
+
+            if won:
+                payout = pos.contracts * 1.00
+                realized_pnl = payout - cost
+                self._paper_balance_usdt += payout
+            else:
+                payout = 0.0
+                realized_pnl = -cost
+
+            total_net_pnl += realized_pnl
+            logger.info(
+                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id}) SETTLED! "
+                f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
+                f"(Spot: ${spot:.2f}, Strike: ${pos.target_price:.2f}) | Rem. Balance: ${self._paper_balance_usdt:.2f}"
+            )
+
+        return round(total_net_pnl, 2)
 
     def get_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the most recent order execution log."""

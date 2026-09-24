@@ -116,59 +116,91 @@ class JevClient:
         if self._session is None or self._session.closed:
             await self.start()
 
-        payload = {
-            "model": self.model,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "prediction_decision",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["BUY_YES", "BUY_NO", "PASS"]
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "description": "Confidence score from 0.0 to 1.0"
-                            },
-                            "reasoning": {
-                                "type": "string",
-                                "description": "Concise quantitative rationale for decision"
-                            }
-                        },
-                        "required": ["action", "confidence", "reasoning"],
-                        "additionalProperties": False
+        if "systemone" in self.endpoint:
+            market_state = (
+                f"Binary Prediction Market Analysis:\n"
+                f"Market: {context.question} (ID: {context.market_id})\n"
+                f"Symbol: {context.symbol}\n"
+                f"Spot Price: ${context.underlying_price:,.2f} | Target Strike: ${context.target_price:,.2f}\n"
+                f"Current Market Odds: YES {context.odds_yes:.3f} ({context.odds_yes*100:.1f}%) | "
+                f"NO {context.odds_no:.3f} ({context.odds_no*100:.1f}%)\n"
+                f"Spread: {context.spread:.3f} | 24h Volume: ${context.volume_24h:,.0f}\n"
+                f"5-Minute Momentum: {context.momentum_pct:+.3f}%\n"
+                f"Time Remaining to Expiration: {context.time_left_seconds} seconds."
+            )
+            payload = {
+                "model": self.model or "jev-latest",
+                "state": market_state,
+                "questions": {
+                    "action": {
+                        "type": "choice",
+                        "instructions": "Predict optimal binary market trading decision for 15-minute expiration",
+                        "criteria": {
+                            "BUY_YES": "High probability that spot price will settle greater than or equal to strike",
+                            "BUY_NO": "High probability that spot price will settle below strike",
+                            "PASS": "Neutral price action, fair valuation, or edge is insufficient"
+                        }
+                    },
+                    "settle_above_strike": {
+                        "type": "noul",
+                        "instructions": "Will the underlying spot price settle greater than or equal to the strike price at expiration?"
                     }
                 }
-            },
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Jev AI, an ultra-low latency quantitative decision engine "
-                        "specialized in prediction markets. Output ONLY a valid JSON object matching "
-                        "the schema with action, confidence, and reasoning."
-                    )
+            }
+        else:
+            payload = {
+                "model": self.model,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "prediction_decision",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["BUY_YES", "BUY_NO", "PASS"]
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "description": "Confidence score from 0.0 to 1.0"
+                                },
+                                "reasoning": {
+                                    "type": "string",
+                                    "description": "Concise quantitative rationale for decision"
+                                }
+                            },
+                            "required": ["action", "confidence", "reasoning"],
+                            "additionalProperties": False
+                        }
+                    }
                 },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Evaluate prediction market opportunity:\n"
-                        f"Market: {context.question} (ID: {context.market_id})\n"
-                        f"Symbol: {context.symbol}\n"
-                        f"Current Odds - Yes: {context.odds_yes:.3f} | No: {context.odds_no:.3f}\n"
-                        f"Spread: {context.spread:.4f} | 24h Volume: ${context.volume_24h:,.0f}\n"
-                        f"Time Remaining: {context.time_left_seconds}s\n"
-                        f"Underlying Spot: ${context.underlying_price:,.2f} | Target: ${context.target_price:,.2f}\n"
-                        f"5m Momentum: {context.momentum_pct:+.2f}%\n"
-                        f"Determine if there is edge to BUY_YES, BUY_NO, or PASS."
-                    )
-                }
-            ]
-        }
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Jev AI, an ultra-low latency quantitative decision engine "
+                            "specialized in prediction markets. Output ONLY a valid JSON object matching "
+                            "the schema with action, confidence, and reasoning."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Evaluate prediction market opportunity:\n"
+                            f"Market: {context.question} (ID: {context.market_id})\n"
+                            f"Symbol: {context.symbol}\n"
+                            f"Current Odds - Yes: {context.odds_yes:.3f} | No: {context.odds_no:.3f}\n"
+                            f"Spread: {context.spread:.4f} | 24h Volume: ${context.volume_24h:,.0f}\n"
+                            f"Time Remaining: {context.time_left_seconds}s\n"
+                            f"Underlying Spot: ${context.underlying_price:,.2f} | Target: ${context.target_price:,.2f}\n"
+                            f"5m Momentum: {context.momentum_pct:+.2f}%\n"
+                            f"Determine if there is edge to BUY_YES, BUY_NO, or PASS."
+                        )
+                    }
+                ]
+            }
 
         try:
             assert self._session is not None
@@ -177,7 +209,7 @@ class JevClient:
                 if resp.status == 200:
                     data = await resp.json()
                     # Parse Jev AI structured response
-                    parsed_result = self._parse_api_response(data, elapsed_ms)
+                    parsed_result = self._parse_api_response(data, elapsed_ms, context)
                     self._update_stats(elapsed_ms)
                     return parsed_result
                 else:
@@ -197,10 +229,59 @@ class JevClient:
             logger.error(f"Jev AI client exception: {e}. Falling back to heuristic.")
             return await self._evaluate_heuristic(context, start_time)
 
-    def _parse_api_response(self, data: Dict[str, Any], elapsed_ms: float) -> JevEvaluationResult:
+    def _parse_api_response(
+        self,
+        data: Dict[str, Any],
+        elapsed_ms: float,
+        context: Optional[MarketContext] = None
+    ) -> JevEvaluationResult:
         """Parse structured JSON from Jev AI API response."""
         try:
-            # Handle typical OpenAI/Typesafe AI response envelope
+            # Handle Typesafe SystemOne format response
+            if "answers" in data:
+                answers = data.get("answers", {})
+                action_ans = answers.get("action", {})
+                action = str(action_ans.get("choice", "PASS")).upper()
+                if action not in ["BUY_YES", "BUY_NO", "PASS"]:
+                    action = "PASS"
+
+                probs = action_ans.get("probabilities", {})
+                prob_choice = probs.get(action, action_ans.get("confidence", 0.50))
+                yes_prob = answers.get("settle_above_strike", {}).get("noul", context.odds_yes if context else 0.50)
+
+                confidence = round(max(0.0, min(1.0, float(prob_choice))), 3)
+
+                odds_yes = context.odds_yes if context else 0.50
+                odds_no = context.odds_no if context else 0.50
+
+                if action == "BUY_YES":
+                    edge = yes_prob - odds_yes
+                    reasoning = (
+                        f"Jev AI bullish conviction: Model P(Yes) {yes_prob:.1%} exceeds market odds ({odds_yes:.1%}) "
+                        f"by {edge*100:+.1f}%. Model confidence: {confidence*100:.1f}%."
+                    )
+                elif action == "BUY_NO":
+                    edge = (1.0 - yes_prob) - odds_no
+                    reasoning = (
+                        f"Jev AI bearish conviction: Model P(No) {1.0 - yes_prob:.1%} exceeds market odds ({odds_no:.1%}) "
+                        f"by {edge*100:+.1f}%. Model confidence: {confidence*100:.1f}%."
+                    )
+                else:
+                    reasoning = (
+                        f"Jev AI neutral evaluation: Market odds ({odds_yes:.1%}/{odds_no:.1%}) "
+                        f"fairly priced. P(Yes)={yes_prob:.1%}. Insufficient quantitative edge."
+                    )
+
+                return JevEvaluationResult(
+                    action=action,
+                    confidence=confidence,
+                    reasoning=reasoning,
+                    model=data.get("model", self.model),
+                    latency_ms=round(elapsed_ms, 2),
+                    is_mock=False
+                )
+
+            # Handle typical OpenAI response envelope
             content = ""
             if "choices" in data and len(data["choices"]) > 0:
                 content = data["choices"][0]["message"]["content"]
@@ -222,6 +303,16 @@ class JevClient:
                 action=action,
                 confidence=confidence,
                 reasoning=reasoning,
+                model=self.model,
+                latency_ms=round(elapsed_ms, 2),
+                is_mock=False
+            )
+        except Exception as err:
+            logger.error(f"Failed to parse Jev AI structured payload: {err}")
+            return JevEvaluationResult(
+                action="PASS",
+                confidence=0.5,
+                reasoning=f"Parsing error: {err}",
                 model=self.model,
                 latency_ms=round(elapsed_ms, 2),
                 is_mock=False

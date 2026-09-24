@@ -36,10 +36,10 @@ class Settings(BaseSettings):
     # --- Jev AI Decision Engine Configuration ---
     jev_ai_api_key: str = Field(default="", alias="JEV_AI_API_KEY")
     jev_ai_endpoint: str = Field(
-        default="https://api.typesafe.ai/v1/evaluate",
+        default="https://api.typesafe.ai/v1/systemone",
         alias="JEV_AI_ENDPOINT"
     )
-    jev_ai_model: str = Field(default="jev-predict-v1", alias="JEV_AI_MODEL")
+    jev_ai_model: str = Field(default="jev-latest", alias="JEV_AI_MODEL")
     jev_ai_timeout_seconds: float = Field(
         default=3.5,
         alias="JEV_AI_TIMEOUT_SECONDS"

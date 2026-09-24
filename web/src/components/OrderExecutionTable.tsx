@@ -84,14 +84,15 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({ orders
                 </td>
               </tr>
             ) : (
-              filteredOrders.map((order) => {
+              filteredOrders.map((order, idx) => {
                 const date = new Date(order.timestamp * 1000);
                 const timeStr = date.toTimeString().split(' ')[0] + '.' + String(date.getMilliseconds()).padStart(3, '0');
                 const isYes = order.side === 'BUY_YES';
                 const notional = (order.contracts * order.price).toFixed(2);
+                const uniqueKey = order.order_id ? `${order.order_id}_${idx}` : `${order.client_order_id}_${idx}`;
 
                 return (
-                  <tr key={order.client_order_id} className="hover:bg-slate-900/50 transition-colors">
+                  <tr key={uniqueKey} className="hover:bg-slate-900/50 transition-colors">
                     {/* Time */}
                     <td className="py-2.5 px-3 text-slate-400 whitespace-nowrap">
                       {timeStr}

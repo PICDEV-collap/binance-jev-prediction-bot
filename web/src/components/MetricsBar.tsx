@@ -43,7 +43,9 @@ export const MetricsBar: React.FC<MetricsBarProps> = ({ status }) => {
         </div>
         <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono mt-1.5 pt-1.5 border-t border-slate-800/60">
           <span>Active Positions:</span>
-          <span className="text-white font-semibold">{positionsCount} contracts</span>
+          <span className="text-white font-semibold">
+            {positionsCount} {positionsCount === 1 ? 'position' : 'positions'}
+          </span>
         </div>
       </div>
 
