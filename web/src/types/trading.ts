@@ -1,0 +1,108 @@
+export type ActionType = 'BUY_YES' | 'BUY_NO' | 'PASS';
+export type OrderStatus = 'FILLED' | 'REJECTED' | 'SIMULATED' | 'NEW' | 'CANCELED';
+export type ConnectionStateType = 'CONNECTED' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED';
+
+export interface MarketItem {
+  market_id: string;
+  symbol: string;
+  question: string;
+  odds_yes: number;
+  odds_no: number;
+  spread: number;
+  volume_24h: number;
+  time_left_seconds: number;
+  underlying_price: number;
+  target_price: number;
+  momentum_pct: number;
+  timestamp?: number;
+}
+
+export interface JevDecision {
+  action: ActionType;
+  confidence: number;
+  reasoning: string;
+  model: string;
+  latency_ms: number;
+  is_mock?: boolean;
+  timestamp: number;
+}
+
+export interface RiskValidation {
+  approved: boolean;
+  reason: string;
+  adjusted_contracts: number;
+  confidence: number;
+  market_id: string;
+  action: ActionType;
+  target_price?: number;
+  timestamp: number;
+}
+
+export interface OrderItem {
+  order_id: string;
+  client_order_id: string;
+  market_id: string;
+  symbol: string;
+  side: ActionType;
+  contracts: number;
+  price: number;
+  status: OrderStatus;
+  latency_ms: number;
+  error_message?: string;
+  timestamp: number;
+}
+
+export interface SystemStatus {
+  is_paused: boolean;
+  uptime_seconds: number;
+  uptime_formatted: string;
+  trading_mode: 'PAPER_TRADING' | 'LIVE_TRADING';
+  ws_stream: {
+    state: ConnectionStateType;
+    stream_url: string;
+    mock_mode: boolean;
+    messages_received: number;
+    events_dispatched: number;
+    active_markets_count: number;
+    reconnect_attempts: number;
+  };
+  jev_ai: {
+    total_evaluations: number;
+    average_latency_ms: number;
+    endpoint: string;
+    model: string;
+    has_api_key: boolean;
+  };
+  risk_guard: {
+    confidence_threshold: number;
+    max_position_size_usdt: number;
+    cooldown_seconds: number;
+    max_daily_loss_usdt: number;
+    daily_realized_loss: number;
+    circuit_breaker_active: boolean;
+    total_evaluated: number;
+    total_approved: number;
+    total_rejected: number;
+    approval_rate_pct: number;
+    rejections_breakdown: Record<string, number>;
+  };
+  account: {
+    mode: string;
+    balance_usdt: number;
+    open_positions_count: number;
+    total_orders: number;
+    total_fills: number;
+  };
+}
+
+export interface TelemetryRecord {
+  timestamp: number;
+  market_id: string;
+  symbol: string;
+  question: string;
+  odds_yes: number;
+  odds_no: number;
+  decision: JevDecision;
+  risk_validation: RiskValidation;
+  order?: OrderItem | null;
+}
