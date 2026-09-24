@@ -19,6 +19,8 @@ interface RiskControlsModalProps {
   currentPositionSize: number;
   currentCooldown: number;
   currentPaperTrading: boolean;
+  serverUrl: string;
+  onSaveServerUrl: (url: string) => void;
   onSaveConfig: (newConfig: {
     confidence_threshold: number;
     max_position_size_usdt: number;
@@ -34,12 +36,15 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentPositionSize,
   currentCooldown,
   currentPaperTrading,
+  serverUrl,
+  onSaveServerUrl,
   onSaveConfig,
 }) => {
   const [threshold, setThreshold] = useState<number>(currentThreshold * 100);
   const [positionSize, setPositionSize] = useState<number>(currentPositionSize);
   const [cooldown, setCooldown] = useState<number>(currentCooldown);
   const [paperTrading, setPaperTrading] = useState<boolean>(currentPaperTrading);
+  const [customServerUrl, setCustomServerUrl] = useState<string>(serverUrl);
   const [saving, setSaving] = useState<boolean>(false);
   const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
 
@@ -48,6 +53,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   const handleSave = async () => {
     setSaving(true);
     try {
+      if (customServerUrl.trim()) {
+        onSaveServerUrl(customServerUrl.trim());
+      }
       await onSaveConfig({
         confidence_threshold: threshold / 100,
         max_position_size_usdt: positionSize,
@@ -202,6 +210,23 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                 }`}
               />
             </button>
+          </div>
+
+          {/* 5. Trading Core Endpoint URL */}
+          <div className="space-y-1.5 p-3 rounded-xl bg-slate-950/60 border border-slate-800">
+            <span className="text-xs font-mono font-semibold text-slate-300 block">
+              TRADING CORE API URL (LOCAL / TUNNEL / VPS)
+            </span>
+            <input
+              type="text"
+              value={customServerUrl}
+              onChange={(e) => setCustomServerUrl(e.target.value)}
+              placeholder="http://localhost:8899"
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs font-mono text-cyan-300 focus:outline-none focus:border-cyan-500"
+            />
+            <span className="text-[10px] font-mono text-slate-500 block">
+              Default: http://localhost:8899 (Used by dashboard to connect to Python bot)
+            </span>
           </div>
 
         </div>

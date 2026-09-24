@@ -67,12 +67,18 @@ export default function DashboardPage() {
   const [orders, setOrders] = useState<OrderItem[]>([]);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isConfigOpen, setIsConfigOpen] = useState<boolean>(false);
+  const [serverUrl, setServerUrl] = useState<string>('http://localhost:8899');
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Initialize demo decision so UI looks rich instantly
+  // Load custom server URL from localStorage on client mount & set initial demo state
   useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('bot_server_url');
+      if (saved) setServerUrl(saved);
+    }
+
     const demoRecord: TelemetryRecord = {
       timestamp: Date.now() / 1000,
       market_id: 'BTCUSDT-15M-R3120',
@@ -120,10 +126,14 @@ export default function DashboardPage() {
   const connectWebSocket = useCallback(() => {
     if (typeof window === 'undefined') return;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.hostname || 'localhost';
-    const botPort = process.env.NEXT_PUBLIC_BOT_PORT || '8899';
-    const wsUrl = `${protocol}//${host}:${botPort}/ws/stream`;
+    let wsUrl = 'ws://localhost:8899/ws/stream';
+    try {
+      const parsed = new URL(serverUrl);
+      const wsProtocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsUrl = `${wsProtocol}//${parsed.host}/ws/stream`;
+    } catch {
+      wsUrl = 'ws://localhost:8899/ws/stream';
+    }
 
     try {
       const socket = new WebSocket(wsUrl);
@@ -221,8 +231,14 @@ export default function DashboardPage() {
   }, [isConnected]);
 
   const getApiUrl = (endpoint: string) => {
-    const port = process.env.NEXT_PUBLIC_BOT_PORT || '8899';
-    return `http://localhost:${port}${endpoint}`;
+    return `${serverUrl.replace(/\/$/, '')}${endpoint}`;
+  };
+
+  const handleSaveServerUrl = (newUrl: string) => {
+    setServerUrl(newUrl);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('bot_server_url', newUrl);
+    }
   };
 
   // Actions
@@ -355,6 +371,8 @@ export default function DashboardPage() {
         currentPositionSize={status?.risk_guard?.max_position_size_usdt ?? 50.0}
         currentCooldown={status?.risk_guard?.cooldown_seconds ?? 45}
         currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
+        serverUrl={serverUrl}
+        onSaveServerUrl={handleSaveServerUrl}
         onSaveConfig={handleSaveConfig}
       />
 
