@@ -30,10 +30,18 @@ venv/
 env/
 ENV/
 
-# Environment Variables & Secrets
+# Environment Variables & Secrets (CRITICAL PROTECTION)
 .env
-.env.local
-.env.production
+.env*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+*secret*
+credentials*.json
+id_rsa*
+*.p12
 
 # Logs
 *.log

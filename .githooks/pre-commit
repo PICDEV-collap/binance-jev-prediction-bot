@@ -1,0 +1,36 @@
+#!/bin/sh
+# Pre-commit hook to prevent accidental secret and API key leaks
+
+# 1. Check if any .env file is staged (except .env.example)
+STAGED_ENV_FILES=$(git diff --cached --name-only | grep -E '^\.env(\..+)?$' | grep -v '\.env\.example$')
+if [ -n "$STAGED_ENV_FILES" ]; then
+    echo ""
+    echo "======================================================================"
+    echo " [!] CRITICAL SECURITY ALERT: COMMIT ABORTED!"
+    echo "======================================================================"
+    echo " You are attempting to commit an active environment secret file:"
+    echo " $STAGED_ENV_FILES"
+    echo ""
+    echo " To remove it from staging, run:"
+    echo "   git reset HEAD $STAGED_ENV_FILES"
+    echo "======================================================================"
+    echo ""
+    exit 1
+fi
+
+# 2. Check for potential hardcoded API Keys or Secrets in staged code
+SUSPICIOUS=$(git diff --cached | grep -E '^\+.*(BINANCE_API_SECRET|BINANCE_API_KEY|JEV_AI_API_KEY)=[a-zA-Z0-9]{20,}' | grep -v 'your_binance' | grep -v 'your_jev')
+if [ -n "$SUSPICIOUS" ]; then
+    echo ""
+    echo "======================================================================"
+    echo " [!] CRITICAL SECURITY ALERT: HARDCODED SECRET DETECTED!"
+    echo "======================================================================"
+    echo " Detected actual API Key or Secret in your staged changes."
+    echo " Secrets must NEVER be committed to Git."
+    echo " Store them ONLY in your local .env file (which is gitignored)."
+    echo "======================================================================"
+    echo ""
+    exit 1
+fi
+
+exit 0
