@@ -196,6 +196,70 @@ export default function DashboardPage() {
 
     setRecords([demoRecord]);
     setOrders([]);
+    setStatus({
+      is_paused: false,
+      uptime_seconds: 120,
+      uptime_formatted: '0h 2m 0s',
+      trading_mode: 'PAPER_TRADING',
+      ws_stream: {
+        state: 'CONNECTING',
+        stream_url: 'ws://localhost:8899/ws/stream',
+        mock_mode: true,
+        messages_received: 12,
+        events_dispatched: 1,
+        active_markets_count: 4,
+        reconnect_attempts: 0,
+      },
+      jev_ai: {
+        total_evaluations: 1,
+        average_latency_ms: 228.4,
+        endpoint: 'https://api.typesafe.ai/v1/systemone',
+        model: 'jev-1.13.0',
+        has_api_key: true,
+      },
+      risk_guard: {
+        confidence_threshold: 0.80,
+        max_position_size_usdt: 50.0,
+        cooldown_seconds: 45,
+        max_daily_loss_usdt: 200.0,
+        daily_realized_loss: 0.0,
+        circuit_breaker_active: false,
+        total_evaluated: 1,
+        total_approved: 1,
+        total_rejected: 0,
+        approval_rate_pct: 100.0,
+        rejections_breakdown: {},
+        martingale: {
+          enabled: true,
+          current_step: 0,
+          max_steps: 4,
+          multiplier: 2.0,
+          current_multiplier: 1.0,
+          confidence_step: 0.04,
+          max_confidence: 0.95,
+          effective_threshold: 0.80,
+          stage_label: 'ไม้ 1 (Base)',
+          consecutive_losses: 0,
+          consecutive_wins: 0,
+          last_settled_result: 'NONE',
+          recovery_cycles_completed: 0,
+        },
+      },
+      account: {
+        mode: 'PAPER_TRADING',
+        balance_usdt: 1000.0,
+        available_balance: 1000.0,
+        total_equity: 1000.0,
+        committed_margin: 0.0,
+        unrealized_pnl: 0.0,
+        realized_pnl: 0.0,
+        total_profit: 0.0,
+        total_profit_pct: 0.0,
+        open_positions_count: 0,
+        total_orders: 1,
+        total_fills: 1,
+      },
+    });
   }, []);
 
   // Connect to live backend WebSocket or fallback gracefully
@@ -406,6 +470,17 @@ export default function DashboardPage() {
             odds_yes: newYes,
             odds_no: newNo,
             time_left_seconds: newTime,
+          };
+        })
+      );
+
+      // Simulate live unrealized PnL movement for any open positions
+      setOpenPositions((prev) =>
+        prev.map((pos) => {
+          const pnlShift = (Math.random() - 0.48) * 0.20;
+          return {
+            ...pos,
+            unrealized_pnl: Number((pos.unrealized_pnl + pnlShift).toFixed(2)),
           };
         })
       );
@@ -630,7 +705,7 @@ export default function DashboardPage() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 lg:px-8 py-6 space-y-6">
         
         {/* Top Executive Metrics Ribbon */}
-        <MetricsBar status={status} />
+        <MetricsBar status={status} openPositions={openPositions} />
 
         {/* AI Target Market & Token Saving Ribbon */}
         <AiTargetRibbon

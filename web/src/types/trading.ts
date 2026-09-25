@@ -149,6 +149,13 @@ export interface SystemStatus {
   account: {
     mode: string;
     balance_usdt: number;
+    available_balance?: number;
+    total_equity?: number;
+    committed_margin?: number;
+    unrealized_pnl?: number;
+    realized_pnl?: number;
+    total_profit?: number;
+    total_profit_pct?: number;
     open_positions_count: number;
     total_orders: number;
     total_fills: number;

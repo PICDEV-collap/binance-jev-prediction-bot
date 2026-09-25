@@ -108,6 +108,11 @@ class BinanceClient:
         self._closed_positions: List[ClosedPositionInfo] = []
         self._order_history: List[OrderResult] = []
 
+        # Live Binance Account Cache
+        self._live_balance_usdt: float = 0.0
+        self._live_available_usdt: float = 0.0
+        self._live_unrealized_usdt: float = 0.0
+
     async def start(self) -> None:
         """Initialize session with persistent connection pooling and sync time."""
         if self._session is None or self._session.closed:
@@ -411,22 +416,28 @@ class BinanceClient:
         """
         Settle prediction contracts whose round has ended.
         Picks up final settlement: $1.00 USDT payout per winning contract.
+        Settles based on both active market ID rotation AND elapsed round duration.
         Returns tuple of (total_net_pnl, settled_events).
         """
         if not self.paper_trading:
             return 0.0, []
 
-        expired_pos_ids = [
-            pid for pid, pos in self._paper_positions.items()
-            if pos.market_id not in active_market_ids
-        ]
+        now = time.time()
+        tf_durations = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+
+        expired_pos_ids = []
+        for pid, pos in self._paper_positions.items():
+            max_duration = tf_durations.get(pos.timeframe.lower(), 900)
+            is_time_expired = (now - pos.entry_time) >= (max_duration + 5)
+            if pos.market_id not in active_market_ids or is_time_expired:
+                expired_pos_ids.append(pid)
 
         total_net_pnl = 0.0
         settled_events: List[Dict[str, Any]] = []
 
         for pid in expired_pos_ids:
             pos = self._paper_positions.pop(pid)
-            spot = current_prices.get(pos.symbol, pos.entry_price)
+            spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
             cost = pos.contracts * pos.entry_price
 
             # Binary outcome settlement: $1.00 per contract
@@ -571,13 +582,75 @@ class BinanceClient:
             "summary": summary,
         }
 
+    async def fetch_live_balance(self) -> Optional[Dict[str, float]]:
+        """Fetch real-time futures wallet balance from Binance FAPI."""
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            return None
+        if self._session is None or self._session.closed:
+            await self.start()
+        try:
+            params = {
+                "recvWindow": self.recv_window,
+                "timestamp": self._get_timestamp(),
+            }
+            signed_query = self._sign_payload(params)
+            url = f"{self.base_url}/fapi/v2/balance?{signed_query}"
+            assert self._session is not None
+            async with self._session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get("asset") == "USDT":
+                                balance = float(item.get("balance", 0.0))
+                                available = float(item.get("availableBalance", 0.0))
+                                unrealized = float(item.get("crossUnPnl", 0.0))
+                                self._live_balance_usdt = balance
+                                self._live_available_usdt = available
+                                self._live_unrealized_usdt = unrealized
+                                return {
+                                    "balance": balance,
+                                    "available": available,
+                                    "unrealized": unrealized,
+                                }
+        except Exception as e:
+            logger.warning(f"Could not fetch Binance live balance: {e}")
+        return None
+
     def get_account_summary(self) -> Dict[str, Any]:
-        """Return wallet balances and execution statistics."""
+        """Return comprehensive wallet balances, total equity, and execution statistics."""
+        if not self.paper_trading and self._live_balance_usdt > 0:
+            total_equity = round(self._live_balance_usdt + self._live_unrealized_usdt, 2)
+            available_balance = round(self._live_available_usdt, 2)
+            unrealized_pnl = round(self._live_unrealized_usdt, 2)
+            committed_margin = round(total_equity - available_balance, 2)
+            realized_pnl = 0.0
+            total_profit = round(total_equity - 1000.0, 2)
+            total_profit_pct = round((total_profit / 1000.0) * 100.0, 2)
+            open_count = len(self._paper_positions)
+        else:
+            committed_margin = round(sum(p.contracts * p.entry_price for p in self._paper_positions.values()), 2)
+            unrealized_pnl = round(sum(p.unrealized_pnl for p in self._paper_positions.values()), 2)
+            available_balance = round(self._paper_balance_usdt, 2)
+            total_equity = round(available_balance + committed_margin + unrealized_pnl, 2)
+            realized_pnl = round(sum(p.realized_pnl for p in self._closed_positions), 2)
+            initial_capital = 1000.0
+            total_profit = round(total_equity - initial_capital, 2)
+            total_profit_pct = round((total_profit / initial_capital) * 100.0, 2)
+            open_count = len(self._paper_positions)
+
         return {
             "mode": "PAPER_TRADING" if self.paper_trading else "LIVE_TRADING",
-            "balance_usdt": round(self._paper_balance_usdt, 2),
-            "open_positions_count": len(self._paper_positions),
+            "balance_usdt": available_balance,
+            "available_balance": available_balance,
+            "total_equity": total_equity,
+            "committed_margin": committed_margin,
+            "unrealized_pnl": unrealized_pnl,
+            "realized_pnl": realized_pnl,
+            "total_profit": total_profit,
+            "total_profit_pct": total_profit_pct,
+            "open_positions_count": open_count,
             "total_orders": self._total_orders_dispatched,
             "total_fills": self._total_fills,
-            "time_offset_ms": self._time_offset_ms
+            "time_offset_ms": self._time_offset_ms,
         }

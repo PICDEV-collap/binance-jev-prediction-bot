@@ -167,10 +167,16 @@ class TradingBotCoordinator:
 
     async def _dashboard_heartbeat_loop(self) -> None:
         """Periodic 1s heartbeat ensuring dashboard clock, status, and markets update continuously."""
+        heartbeat_ticks = 0
         while True:
             try:
                 await asyncio.sleep(1.0)
+                heartbeat_ticks += 1
                 markets = self.ws_listener.get_active_markets()
+
+                # If live trading with API keys, poll Binance live balance every 5s
+                if not self.binance_client.paper_trading and heartbeat_ticks % 5 == 0:
+                    asyncio.create_task(self.binance_client.fetch_live_balance())
 
                 # Settle paper trading positions when a round expires
                 if markets:
