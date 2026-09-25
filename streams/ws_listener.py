@@ -24,6 +24,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from engine.jev_client import MarketContext
+from engine.indicators import RollingCandleAggregator
 
 logger = logging.getLogger("ws_listener")
 
@@ -100,6 +101,8 @@ class BinanceWSListener:
         self._active_markets: Dict[str, MarketContext] = {}
         self._price_history: Dict[str, List[tuple[float, float]]] = {}
         self._round_base_prices: Dict[str, float] = {}
+        self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
+        self._btc_momentum: float = 0.0
 
     async def start(self) -> None:
         """Start the WebSocket listener and background watchdog loop."""
@@ -346,6 +349,24 @@ class BinanceWSListener:
         else:
             base_spread = 0.020
 
+        # Extract best bid / ask quantities for Order Book Imbalance (OBI)
+        try:
+            bid_qty = float(payload.get("B", payload.get("bidQty", 10.0)))
+            ask_qty = float(payload.get("A", payload.get("askQty", 10.0)))
+        except (ValueError, TypeError):
+            bid_qty, ask_qty = 10.0, 10.0
+
+        # Update in-memory candle aggregator
+        self.candle_aggregator.update_tick(
+            symbol=symbol,
+            price=mark_price,
+            volume=float(payload.get("v", 0.0)),
+            timestamp=now
+        )
+
+        if symbol == "BTCUSDT":
+            self._btc_momentum = momentum_pct
+
         clean_symbol = symbol.replace("USDT", "")
         results: List[MarketContext] = []
 
@@ -383,6 +404,17 @@ class BinanceWSListener:
 
             question = f"{clean_symbol} Up or Down {tf}"
 
+            # Calculate ultra-low latency quantitative metrics (< 0.5ms)
+            metrics = self.candle_aggregator.compute_all_metrics(
+                symbol=symbol,
+                spot_price=mark_price,
+                strike_price=strike,
+                time_left_seconds=time_left,
+                bid_qty=bid_qty,
+                ask_qty=ask_qty,
+                btc_momentum_pct=self._btc_momentum,
+            )
+
             results.append(
                 MarketContext(
                     market_id=round_id,
@@ -397,7 +429,16 @@ class BinanceWSListener:
                     underlying_price=mark_price,
                     target_price=strike,
                     price_diff=price_diff,
-                    momentum_pct=momentum_pct
+                    momentum_pct=momentum_pct,
+                    atr_1m=metrics["atr_1m"],
+                    dvr_ratio=metrics["dvr_ratio"],
+                    rsi_1m=metrics["rsi_1m"],
+                    rsi_5m=metrics["rsi_5m"],
+                    ema_trend=metrics["ema_trend"],
+                    order_book_imbalance=metrics["order_book_imbalance"],
+                    market_regime=metrics["market_regime"],
+                    expiry_danger_flag=metrics["expiry_danger_flag"],
+                    btc_correlation_dir=metrics["btc_correlation_dir"],
                 )
             )
 
@@ -457,6 +498,17 @@ class BinanceWSListener:
                 odds_yes = round(max(0.08, min(0.92, 0.50 + (diff * 35.0) + random.uniform(-0.02, 0.02))), 3)
                 odds_no = round(1.0 - odds_yes, 3)
 
+                self.candle_aggregator.update_tick(symbol, current_price, volume=random.uniform(50, 500))
+                metrics = self.candle_aggregator.compute_all_metrics(
+                    symbol=symbol,
+                    spot_price=current_price,
+                    strike_price=target,
+                    time_left_seconds=time_left,
+                    bid_qty=random.uniform(10, 50),
+                    ask_qty=random.uniform(10, 50),
+                    btc_momentum_pct=0.05,
+                )
+
                 market = MarketContext(
                     market_id=f"{symbol}-15M-R{int(time.time() // 900)}",
                     symbol=symbol,
@@ -468,7 +520,17 @@ class BinanceWSListener:
                     time_left_seconds=time_left,
                     underlying_price=current_price,
                     target_price=target,
-                    momentum_pct=round(pct_change * 100.0, 2)
+                    price_diff=round(current_price - target, 4),
+                    momentum_pct=round(pct_change * 100.0, 2),
+                    atr_1m=metrics["atr_1m"],
+                    dvr_ratio=metrics["dvr_ratio"],
+                    rsi_1m=metrics["rsi_1m"],
+                    rsi_5m=metrics["rsi_5m"],
+                    ema_trend=metrics["ema_trend"],
+                    order_book_imbalance=metrics["order_book_imbalance"],
+                    market_regime=metrics["market_regime"],
+                    expiry_danger_flag=metrics["expiry_danger_flag"],
+                    btc_correlation_dir=metrics["btc_correlation_dir"],
                 )
 
                 self._messages_received += 1

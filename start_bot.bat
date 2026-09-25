@@ -11,8 +11,8 @@ echo  [+] Web Dashboard Port: 3888 (Run `npm run dev` in /web)
 echo  [+] Safe Isolated Ports: No collision with 3000, 5173, 8000, 8080
 echo.
 echo Starting Trading Bot Core...
-echo Press CTRL+C to terminate cleanly.
-echo.
+set PYTHONIOENCODING=utf-8
+chcp 65001 > nul
 
 python main.py
 if %ERRORLEVEL% NEQ 0 (

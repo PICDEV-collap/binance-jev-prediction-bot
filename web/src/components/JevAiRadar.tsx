@@ -8,7 +8,12 @@ import {
   MinusCircle, 
   Zap, 
   ShieldCheck, 
-  HelpCircle 
+  HelpCircle,
+  Activity,
+  Gauge,
+  TrendingUp,
+  AlertTriangle,
+  Scale
 } from 'lucide-react';
 import { TelemetryRecord } from '../types/trading';
 
@@ -235,6 +240,99 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
           </div>
         </div>
       )}
+
+      {/* Real-Time Quantitative & Volatility Indicators Ribbon */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3.5 text-xs font-mono">
+        {/* DVR */}
+        <div className="bg-slate-950/70 p-2 rounded-lg border border-slate-800/80 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-400 text-[10px]">
+            <span className="flex items-center gap-1">
+              <Gauge className="w-3 h-3 text-cyan-400" />
+              <span>DVR (Distance/Vol)</span>
+            </span>
+            <span className="text-[9px] text-slate-500">σ</span>
+          </div>
+          <div className="mt-1 flex items-baseline justify-between">
+            <span className={`text-xs font-bold ${
+              (latestRecord?.dvr_ratio ?? 0) > 0 ? 'text-emerald-400' : (latestRecord?.dvr_ratio ?? 0) < 0 ? 'text-rose-400' : 'text-slate-400'
+            }`}>
+              {latestRecord?.dvr_ratio !== undefined ? `${latestRecord.dvr_ratio > 0 ? '+' : ''}${latestRecord.dvr_ratio.toFixed(2)}σ` : '0.00σ'}
+            </span>
+            <span className="text-[9px] text-slate-500">
+              ATR: ${latestRecord?.atr_1m?.toFixed(1) ?? '0.0'}
+            </span>
+          </div>
+        </div>
+
+        {/* OBI */}
+        <div className="bg-slate-950/70 p-2 rounded-lg border border-slate-800/80 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-400 text-[10px]">
+            <span className="flex items-center gap-1">
+              <Scale className="w-3 h-3 text-amber-400" />
+              <span>Order Imbalance</span>
+            </span>
+            <span className="text-[9px] text-slate-500">OBI</span>
+          </div>
+          <div className="mt-1 flex items-baseline justify-between">
+            <span className={`text-xs font-bold ${
+              (latestRecord?.order_book_imbalance ?? 0) > 0.1 ? 'text-emerald-400' : (latestRecord?.order_book_imbalance ?? 0) < -0.1 ? 'text-rose-400' : 'text-slate-300'
+            }`}>
+              {latestRecord?.order_book_imbalance !== undefined ? `${latestRecord.order_book_imbalance > 0 ? '+' : ''}${(latestRecord.order_book_imbalance * 100).toFixed(0)}%` : '0%'}
+            </span>
+            <span className="text-[9px] text-slate-500">
+              {(latestRecord?.order_book_imbalance ?? 0) > 0.1 ? 'Bid Wall' : (latestRecord?.order_book_imbalance ?? 0) < -0.1 ? 'Ask Wall' : 'Balanced'}
+            </span>
+          </div>
+        </div>
+
+        {/* Trend & RSI */}
+        <div className="bg-slate-950/70 p-2 rounded-lg border border-slate-800/80 flex flex-col justify-between">
+          <div className="flex items-center justify-between text-slate-400 text-[10px]">
+            <span className="flex items-center gap-1">
+              <TrendingUp className="w-3 h-3 text-indigo-400" />
+              <span>Trend & RSI(5m)</span>
+            </span>
+          </div>
+          <div className="mt-1 flex items-baseline justify-between">
+            <span className={`text-[11px] font-bold ${
+              latestRecord?.ema_trend?.includes('UP') ? 'text-emerald-400' : latestRecord?.ema_trend?.includes('DOWN') ? 'text-rose-400' : 'text-slate-400'
+            }`}>
+              {latestRecord?.ema_trend ? latestRecord.ema_trend.replace('STRONG_', '').replace('_CHOP', '') : 'NEUTRAL'}
+            </span>
+            <span className={`text-[10px] font-semibold ${
+              (latestRecord?.rsi_5m ?? 50) > 70 ? 'text-rose-400' : (latestRecord?.rsi_5m ?? 50) < 30 ? 'text-emerald-400' : 'text-slate-300'
+            }`}>
+              RSI: {latestRecord?.rsi_5m?.toFixed(0) ?? '50'}
+            </span>
+          </div>
+        </div>
+
+        {/* Regime & Expiry Danger */}
+        <div className={`p-2 rounded-lg border flex flex-col justify-between ${
+          latestRecord?.expiry_danger_flag
+            ? 'bg-rose-950/30 border-rose-500/50 text-rose-300 animate-pulse'
+            : 'bg-slate-950/70 border-slate-800/80 text-slate-400'
+        }`}>
+          <div className="flex items-center justify-between text-[10px]">
+            <span className="flex items-center gap-1">
+              {latestRecord?.expiry_danger_flag ? (
+                <AlertTriangle className="w-3 h-3 text-rose-400" />
+              ) : (
+                <Activity className="w-3 h-3 text-emerald-400" />
+              )}
+              <span>Regime State</span>
+            </span>
+          </div>
+          <div className="mt-1 flex items-baseline justify-between">
+            <span className="text-[11px] font-bold truncate">
+              {latestRecord?.expiry_danger_flag ? 'EXPIRY DANGER' : (latestRecord?.market_regime ?? 'NORMAL')}
+            </span>
+            <span className="text-[9px] text-slate-500">
+              {latestRecord?.btc_correlation_dir ? `BTC: ${latestRecord.btc_correlation_dir}` : ''}
+            </span>
+          </div>
+        </div>
+      </div>
 
       {/* Structured Reasoning Card */}
       <div className="bg-slate-950/80 rounded-xl p-3.5 border border-slate-800/80">

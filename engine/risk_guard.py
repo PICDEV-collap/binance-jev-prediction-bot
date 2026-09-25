@@ -100,6 +100,8 @@ class RiskGuard:
             "EXTREME_ODDS_RISK": 0,
             "WIDE_SPREAD": 0,
             "INVALID_PRICING": 0,
+            "EXPIRY_DANGER": 0,
+            "CONTRADICTION_RISK": 0,
         }
 
     def get_symbol_martingale_step(self, symbol: Optional[str] = None) -> int:
@@ -257,6 +259,57 @@ class RiskGuard:
             return RiskEvaluationResult(
                 approved=False,
                 reason=filter_reason,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
+            )
+
+        # Gate 2.5: Expiry Danger Zone (Near-Strike Gamma Risk)
+        if getattr(market, "expiry_danger_flag", False):
+            self._record_rejection("EXPIRY_DANGER")
+            danger_reason = (
+                f"Expiry Danger Zone Filter: {market.time_left_seconds}s remaining with spot (${market.underlying_price:,.2f}) "
+                f"dangerously close to strike (${market.target_price:,.2f}). Volatility noise buffer active."
+            )
+            logger.info(f"[RISK FILTER] {danger_reason} for {market.market_id}. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=danger_reason,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
+            )
+
+        # Gate 2.6: Microstructure / Trend Contradiction Filter
+        is_up = decision.action in ("UP", "BUY_YES")
+        is_down = decision.action in ("DOWN", "BUY_NO")
+        ema_trend = getattr(market, "ema_trend", "NEUTRAL_CHOP")
+        obi = getattr(market, "order_book_imbalance", 0.0)
+
+        severe_contradiction = (
+            (is_up and ema_trend == "STRONG_DOWNTREND" and obi < -0.35) or
+            (is_down and ema_trend == "STRONG_UPTREND" and obi > 0.35)
+        )
+        if severe_contradiction:
+            self._record_rejection("CONTRADICTION_RISK")
+            contra_reason = (
+                f"Microstructure Contradiction Filter: {decision.action} signal directly opposes {ema_trend} "
+                f"with heavy Order Book Imbalance (OBI: {obi:+.2f})."
+            )
+            logger.info(f"[RISK FILTER] {contra_reason} for {market.market_id}. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=contra_reason,
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,

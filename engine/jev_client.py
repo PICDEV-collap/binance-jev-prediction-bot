@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass, asdict
@@ -41,6 +42,17 @@ class MarketContext(BaseModel):
     martingale_stage: str = "ไม้ 1 (Base)"
     effective_hurdle: float = 0.80
     timestamp: float = Field(default_factory=time.time)
+
+    # --- Enriched Quantitative & Volatility Features ---
+    atr_1m: float = 0.0
+    dvr_ratio: float = 0.0             # Distance-to-Volatility Ratio in sigma
+    rsi_1m: float = 50.0               # 1m Fast RSI
+    rsi_5m: float = 50.0               # 5m Trend RSI
+    ema_trend: str = "NEUTRAL_CHOP"    # STRONG_UPTREND, STRONG_DOWNTREND, etc.
+    order_book_imbalance: float = 0.0  # -1.0 to +1.0 (Bid vs Ask pressure)
+    market_regime: str = "RANGING"     # TREND_EXPANSION, RANGING, HIGH_VOLATILITY_CHOP
+    expiry_danger_flag: bool = False   # True if < 60s and dangerously close to strike
+    btc_correlation_dir: str = "FLAT"  # BULLISH, BEARISH, FLAT
 
     @property
     def odds_up(self) -> float:
@@ -146,6 +158,11 @@ class JevClient:
         if "systemone" in self.endpoint:
             clean_sym = context.symbol.replace("USDT", "")
             diff_str = f"{context.price_diff:+,.2f}" if context.price_diff else f"{context.underlying_price - context.target_price:+,.2f}"
+            dvr_line = f"Volatility / Distance: ATR(1m) = ${context.atr_1m:.2f} | DVR (Distance-to-Volatility): {context.dvr_ratio:+.2f}sigma\n" if context.atr_1m > 0 else ""
+            micro_line = f"Order Flow / Microstructure: Order Book Imbalance (OBI) = {context.order_book_imbalance:+.2f} | BTC Trend: {context.btc_correlation_dir}\n"
+            tech_line = f"Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f} | Regime = {context.market_regime}\n"
+            danger_line = "⚠️ EXPIRY DANGER ZONE ACTIVE: Under 60s remaining and price is inside volatility noise buffer. Exercise extreme caution.\n" if context.expiry_danger_flag else ""
+            
             market_state = (
                 f"Binance Up or Down Prediction Market Analysis:\n"
                 f"Market: {clean_sym} Up or Down {context.timeframe} (ID: {context.market_id})\n"
@@ -155,6 +172,10 @@ class JevClient:
                 f"DOWN {context.odds_no:.3f} ({context.odds_no*100:.1f}%)\n"
                 f"Spread: {context.spread:.3f} | 24h Volume: ${context.volume_24h:,.0f}\n"
                 f"Momentum: {context.momentum_pct:+.3f}%\n"
+                f"{dvr_line}"
+                f"{micro_line}"
+                f"{tech_line}"
+                f"{danger_line}"
                 f"{recent_track_record_line}"
                 f"{martingale_directive}\n"
                 f"Time Remaining to Expiration: {context.time_left_seconds} seconds."
@@ -225,12 +246,17 @@ class JevClient:
                         "content": (
                             f"Evaluate prediction market opportunity:\n"
                             f"Market: {context.question} (ID: {context.market_id})\n"
-                            f"Symbol: {context.symbol}\n"
-                            f"Current Odds - Yes: {context.odds_yes:.3f} | No: {context.odds_no:.3f}\n"
+                            f"Symbol: {context.symbol} | Timeframe: {context.timeframe}\n"
+                            f"Current Odds - UP: {context.odds_yes:.3f} | DOWN: {context.odds_no:.3f}\n"
                             f"Spread: {context.spread:.4f} | 24h Volume: ${context.volume_24h:,.0f}\n"
                             f"Time Remaining: {context.time_left_seconds}s\n"
-                            f"Underlying Spot: ${context.underlying_price:,.2f} | Target: ${context.target_price:,.2f}\n"
-                            f"5m Momentum: {context.momentum_pct:+.2f}%\n"
+                            f"Underlying Spot: ${context.underlying_price:,.2f} | Target (Strike): ${context.target_price:,.2f}\n"
+                            f"Quantitative Signals:\n"
+                            f"- Volatility & Distance: ATR(1m) = ${context.atr_1m:.2f} | DVR = {context.dvr_ratio:+.2f}sigma\n"
+                            f"- Microstructure: OBI (Order Book Imbalance) = {context.order_book_imbalance:+.2f} | BTC Trend = {context.btc_correlation_dir}\n"
+                            f"- Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f}\n"
+                            f"- 5m Momentum: {context.momentum_pct:+.2f}%\n"
+                            f"- Danger Warning: {'EXPIRY DANGER ZONE (<60s and within noise)' if context.expiry_danger_flag else 'None'}\n"
                             f"{recent_track_record_line}"
                             f"{martingale_directive}\n"
                             f"Determine whether to predict UP or DOWN."
@@ -374,16 +400,37 @@ class JevClient:
         momentum = context.momentum_pct
         time_left = max(10, context.time_left_seconds)
 
-        # Baseline theoretical Yes probability calculation
-        if target > 0 and spot > 0:
+        # Multi-Factor Quantitative Probability Modeling:
+        # Factor 1: DVR (Distance-to-Volatility Ratio) via Sigmoid Probability Mapping
+        if context.dvr_ratio != 0.0:
+            # Sigmoid maps +/- 2.0 sigma to ~ 95% / 5%
+            prob_dvr = 1.0 / (1.0 + math.exp(-max(-6.0, min(6.0, 1.45 * context.dvr_ratio))))
+        elif target > 0 and spot > 0:
             price_ratio = (spot - target) / target
-            momentum_effect = momentum * 0.08
-            distance_effect = price_ratio * 15.0
-            theoretical_prob = 0.5 + distance_effect + momentum_effect
+            prob_dvr = 0.5 + (price_ratio * 15.0)
         else:
-            theoretical_prob = context.odds_yes + (momentum * 0.05)
+            prob_dvr = context.odds_yes
 
-        # Clip theoretical probability between 0.05 and 0.95
+        # Factor 2: Microstructure / Order Book Imbalance (OBI)
+        obi_effect = context.order_book_imbalance * 0.05
+
+        # Factor 3: Momentum & Trend Alignment
+        momentum_effect = momentum * 0.04
+        trend_effect = 0.0
+        if context.ema_trend == "STRONG_UPTREND":
+            trend_effect = +0.03
+        elif context.ema_trend == "STRONG_DOWNTREND":
+            trend_effect = -0.03
+
+        # Factor 4: Technical RSI Overbought / Oversold Mean-Reversion Dampener
+        rsi_effect = 0.0
+        if context.rsi_5m >= 75:
+            rsi_effect = -0.03  # Pullback risk from extreme overbought
+        elif context.rsi_5m <= 25:
+            rsi_effect = +0.03  # Bounce potential from extreme oversold
+
+        # Aggregate theoretical probability
+        theoretical_prob = prob_dvr + obi_effect + momentum_effect + trend_effect + rsi_effect
         theoretical_prob = max(0.05, min(0.95, theoretical_prob))
 
         # Edge calculation: discrepancy between theoretical probability and market odds
@@ -404,18 +451,24 @@ class JevClient:
                 streak_modifier = min(1.05, 1.0 + (0.02 * consecutive_wins))
                 feedback_note = f" [Momentum Feedback: {consecutive_wins} win streak on {context.symbol}]"
 
+        # Expiry Danger Filter (Near-strike Gamma Risk)
+        danger_modifier = 1.0
+        if context.expiry_danger_flag:
+            danger_modifier = 0.60
+            feedback_note += " [⚠️ GAMMA RISK: Expiry Danger Zone near Strike]"
+
         if theoretical_prob >= 0.50 or edge_yes >= edge_no:
             action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"] = "UP"
             raw_conf = max(0.50, min(0.98, theoretical_prob + (max(0.0, edge_yes) * 0.5)))
-            confidence = max(0.50, min(0.98, raw_conf * streak_modifier))
+            confidence = max(0.50, min(0.98, raw_conf * streak_modifier * danger_modifier))
         else:
             action = "DOWN"
             prob_down = 1.0 - theoretical_prob
             raw_conf = max(0.50, min(0.98, prob_down + (max(0.0, edge_no) * 0.5)))
-            confidence = max(0.50, min(0.98, raw_conf * streak_modifier))
+            confidence = max(0.50, min(0.98, raw_conf * streak_modifier * danger_modifier))
 
         # Martingale Recovery Conviction Hurdle Alignment
-        if context.martingale_step > 0:
+        if context.martingale_step > 0 and not context.expiry_danger_flag:
             chosen_edge = edge_yes if action == "UP" else edge_no
             momentum_aligned = (momentum > 0.03 and action == "UP") or (momentum < -0.03 and action == "DOWN")
             if chosen_edge > 0.03 and momentum_aligned:
@@ -425,15 +478,16 @@ class JevClient:
             else:
                 feedback_note += f" [⚠️ {context.martingale_stage} Recovery: Edge {chosen_edge*100:+.1f}% below recovery hurdle]"
 
+        dvr_info = f"DVR: {context.dvr_ratio:+.2f}sigma, OBI: {context.order_book_imbalance:+.2f}, Trend: {context.ema_trend}"
         if action == "UP":
             reasoning = (
                 f"Binary UP conviction: Theoretical P(UP) {theoretical_prob:.1%} (Market Odds: {context.odds_yes:.1%}, "
-                f"Edge: {edge_yes*100:+.1f}%). Momentum: {momentum:+.2f}% with {time_left}s remaining.{feedback_note}"
+                f"Edge: {edge_yes*100:+.1f}%). {dvr_info} with {time_left}s remaining.{feedback_note}"
             )
         else:
             reasoning = (
                 f"Binary DOWN conviction: Theoretical P(DOWN) {prob_down:.1%} (Market Odds: {context.odds_no:.1%}, "
-                f"Edge: {edge_no*100:+.1f}%). Momentum: {momentum:+.2f}% with {time_left}s remaining.{feedback_note}"
+                f"Edge: {edge_no*100:+.1f}%). {dvr_info} with {time_left}s remaining.{feedback_note}"
             )
 
         self._update_stats(elapsed_ms)

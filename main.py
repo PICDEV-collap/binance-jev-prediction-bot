@@ -277,7 +277,8 @@ class TradingBotCoordinator:
 
         logger.info(
             f"[AI EVALUATION TRIGGERED: 1x/Round] Symbol: {market.symbol} | TF: {market.timeframe} | "
-            f"Round: {market.market_id} | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f}"
+            f"Round: {market.market_id} | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f} | "
+            f"DVR: {market.dvr_ratio:+.2f}sigma | OBI: {market.order_book_imbalance:+.2f} | Trend: {market.ema_trend} | RSI: {market.rsi_5m:.1f}"
         )
 
         # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
@@ -318,6 +319,15 @@ class TradingBotCoordinator:
             "target_price": market.target_price,
             "price_diff": market.price_diff,
             "momentum_pct": market.momentum_pct,
+            "atr_1m": getattr(market, "atr_1m", 0.0),
+            "dvr_ratio": getattr(market, "dvr_ratio", 0.0),
+            "rsi_1m": getattr(market, "rsi_1m", 50.0),
+            "rsi_5m": getattr(market, "rsi_5m", 50.0),
+            "ema_trend": getattr(market, "ema_trend", "NEUTRAL_CHOP"),
+            "order_book_imbalance": getattr(market, "order_book_imbalance", 0.0),
+            "market_regime": getattr(market, "market_regime", "RANGING"),
+            "expiry_danger_flag": getattr(market, "expiry_danger_flag", False),
+            "btc_correlation_dir": getattr(market, "btc_correlation_dir", "FLAT"),
             "spread": market.spread,
             "volume_24h": market.volume_24h,
             "time_left_seconds": market.time_left_seconds,

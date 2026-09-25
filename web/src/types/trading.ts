@@ -17,6 +17,15 @@ export interface MarketItem {
   target_price: number;     // Price to Beat
   price_diff?: number;      // Difference (Current - Price to Beat)
   momentum_pct: number;
+  atr_1m?: number;
+  dvr_ratio?: number;
+  rsi_1m?: number;
+  rsi_5m?: number;
+  ema_trend?: string;
+  order_book_imbalance?: number;
+  market_regime?: string;
+  expiry_danger_flag?: boolean;
+  btc_correlation_dir?: string;
   timestamp?: number;
 }
 
@@ -183,6 +192,15 @@ export interface TelemetryRecord {
   spread?: number;
   volume_24h?: number;
   time_left_seconds?: number;
+  atr_1m?: number;
+  dvr_ratio?: number;
+  rsi_1m?: number;
+  rsi_5m?: number;
+  ema_trend?: string;
+  order_book_imbalance?: number;
+  market_regime?: string;
+  expiry_danger_flag?: boolean;
+  btc_correlation_dir?: string;
   decision: JevDecision;
   risk_validation: RiskValidation;
   recent_performance?: {
