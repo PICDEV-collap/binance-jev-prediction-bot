@@ -38,6 +38,10 @@ export interface RiskValidation {
   market_id: string;
   action: ActionType;
   target_price?: number;
+  martingale_step?: number;
+  stage_label?: string;
+  multiplier?: number;
+  effective_threshold?: number;
   timestamp: number;
 }
 
@@ -53,6 +57,8 @@ export interface OrderItem {
   latency_ms: number;
   timeframe?: string;
   price_to_beat?: number;
+  martingale_step?: number;
+  stage?: string;
   error_message?: string;
   timestamp: number;
 }
@@ -68,6 +74,8 @@ export interface PositionItem {
   target_price: number;
   timeframe?: string;
   unrealized_pnl: number;
+  martingale_step?: number;
+  stage?: string;
   entry_time: number;
 }
 
@@ -83,6 +91,8 @@ export interface ClosedPositionItem {
   timeframe?: string;
   result: 'WIN' | 'LOSS';
   realized_pnl: number;
+  martingale_step?: number;
+  stage?: string;
   entry_time: number;
   settled_at: number;
 }
@@ -120,6 +130,21 @@ export interface SystemStatus {
     total_rejected: number;
     approval_rate_pct: number;
     rejections_breakdown: Record<string, number>;
+    martingale?: {
+      enabled: boolean;
+      current_step: number;
+      max_steps: number;
+      multiplier: number;
+      current_multiplier: number;
+      confidence_step: number;
+      max_confidence: number;
+      effective_threshold: number;
+      stage_label: string;
+      consecutive_losses: number;
+      consecutive_wins: number;
+      last_settled_result: string;
+      recovery_cycles_completed: number;
+    };
   };
   account: {
     mode: string;

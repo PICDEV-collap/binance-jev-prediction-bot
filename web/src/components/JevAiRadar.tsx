@@ -37,7 +37,12 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
   const strokeDashoffset = circumference - (confidence * circumference);
 
   // Determine color accent based on directional decision and confidence threshold
-  const isHighConfidence = confidence >= confidenceThreshold;
+  const effectiveThreshold = risk?.effective_threshold ?? confidenceThreshold;
+  const isHighConfidence = confidence >= effectiveThreshold;
+  const isRecovery = (risk?.martingale_step ?? 0) > 0;
+  const stageLabel = risk?.stage_label ?? 'ไม้ 1 (Base)';
+
+  // Determine color accent based on directional decision and confidence threshold
   const gaugeColor = action === 'UP' 
     ? (isHighConfidence ? '#10b981' : '#059669') 
     : (isHighConfidence ? '#f43f5e' : '#e11d48');
@@ -52,8 +57,13 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
             <BrainCircuit className="w-4 h-4 text-cyan-400" />
           </div>
           <div>
-            <h2 className="text-sm font-bold font-mono tracking-tight text-white uppercase">
-              Jev AI Decision Engine
+            <h2 className="text-sm font-bold font-mono tracking-tight text-white uppercase flex items-center gap-2">
+              <span>Jev AI Decision Engine</span>
+              {isRecovery && (
+                <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 normal-case">
+                  {stageLabel}
+                </span>
+              )}
             </h2>
             <p className="text-xs text-slate-400 font-mono">
               Binary Prediction Core ({decision?.model ?? 'jev-binary-v1'})
@@ -112,7 +122,14 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
 
           <div className="mt-2 text-center">
             <span className="text-[11px] font-mono text-slate-400">
-              Conviction Gate: <strong className="text-white">{(confidenceThreshold * 100).toFixed(0)}%</strong>
+              Conviction Gate: <strong className={isRecovery ? 'text-amber-400' : 'text-white'}>
+                {(effectiveThreshold * 100).toFixed(0)}%
+              </strong>
+              {isRecovery && (
+                <span className="text-[10px] text-amber-400 block font-semibold">
+                  (Escalated {stageLabel})
+                </span>
+              )}
             </span>
           </div>
         </div>
@@ -157,7 +174,7 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
               <ShieldCheck className={`w-4 h-4 mt-0.5 shrink-0 ${isApproved ? 'text-emerald-400' : 'text-slate-500'}`} />
               <div>
                 <span className="font-semibold block">
-                  {isApproved ? 'EXECUTION APPROVED (ORDER DISPATCHED)' : 'ORDER FILTERED (HOLDING CAPITAL)'}
+                  {isApproved ? `EXECUTION APPROVED (${stageLabel})` : 'ORDER FILTERED (HOLDING CAPITAL)'}
                 </span>
                 <span className="text-[11px] text-slate-400">
                   {risk?.reason ?? 'No active execution required'}
@@ -169,7 +186,7 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
         </div>
       </div>
 
-      {/* Historical Feedback Loop & Regime Calibration (Approach 3: Hybrid) */}
+      {/* Historical Feedback Loop & Regime Calibration */}
       {latestRecord?.recent_performance && latestRecord.recent_performance.total_rounds > 0 && (
         <div className="bg-slate-950/60 rounded-xl p-2.5 border border-slate-800/80 mb-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs font-mono">
           <div className="flex items-center gap-2 flex-wrap">
@@ -194,9 +211,9 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
-            {latestRecord.recent_performance.consecutive_losses >= 2 ? (
-              <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[10px] font-semibold flex items-center gap-1">
-                <span>⚠️ Defensive Hurdle Active ({latestRecord.recent_performance.consecutive_losses} Losses)</span>
+            {isRecovery ? (
+              <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[10px] font-semibold flex items-center gap-1 animate-pulse">
+                <span>⚡ {stageLabel} Active: AI Hurdle raised to ≥ {(effectiveThreshold * 100).toFixed(0)}%</span>
               </span>
             ) : latestRecord.recent_performance.consecutive_wins >= 2 ? (
               <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[10px] font-semibold flex items-center gap-1">
@@ -204,7 +221,7 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
               </span>
             ) : (
               <span className="text-[10px] text-slate-400">
-                Regime: Normal Sizing
+                Regime: Base Sizing (ไม้ 1)
               </span>
             )}
           </div>

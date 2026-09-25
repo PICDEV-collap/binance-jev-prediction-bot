@@ -40,6 +40,11 @@ class ConfigUpdateRequest(BaseModel):
     max_position_size_usdt: float | None = None
     cooldown_seconds: int | None = None
     paper_trading: bool | None = None
+    martingale_enabled: bool | None = None
+    martingale_multiplier: float | None = None
+    martingale_max_steps: int | None = None
+    martingale_confidence_step: float | None = None
+    martingale_max_confidence: float | None = None
 
 
 class TargetMarketRequest(BaseModel):
@@ -102,6 +107,11 @@ class TradingBotCoordinator:
             cooldown_seconds=settings.cooldown_seconds,
             max_daily_loss_usdt=settings.max_daily_loss_usdt,
             max_concurrent_positions=settings.max_concurrent_positions,
+            martingale_enabled=getattr(settings, "martingale_enabled", True),
+            martingale_multiplier=getattr(settings, "martingale_multiplier", 2.0),
+            martingale_max_steps=getattr(settings, "martingale_max_steps", 4),
+            martingale_confidence_step=getattr(settings, "martingale_confidence_step", 0.04),
+            martingale_max_confidence=getattr(settings, "martingale_max_confidence", 0.95),
         )
 
         # Decide whether to use mock stream if no API keys or explicitly enabled
@@ -129,6 +139,12 @@ class TradingBotCoordinator:
         logger.info(f"Confidence Threshold: {self.risk_guard.confidence_threshold * 100:.0f}%")
         logger.info(f"Max Position Size: ${self.risk_guard.max_position_size_usdt:.2f} USDT")
         logger.info(f"Cooldown Period: {self.risk_guard.cooldown_seconds}s")
+        logger.info(
+            f"Martingale Recovery: {'ENABLED' if self.risk_guard.martingale_enabled else 'DISABLED'} "
+            f"(Multiplier: {self.risk_guard.martingale_multiplier}x, Max Steps: {self.risk_guard.martingale_max_steps}, "
+            f"Confidence Step: +{self.risk_guard.martingale_confidence_step*100:.0f}%, "
+            f"Max Conviction: {self.risk_guard.martingale_max_confidence*100:.0f}%)"
+        )
         logger.info("=" * 70)
 
         await self.jev_client.start()
@@ -162,9 +178,13 @@ class TradingBotCoordinator:
                     current_prices = {m["symbol"]: m["underlying_price"] for m in markets}
                     # Update live price and unrealized PnL on active open positions
                     self.binance_client.update_positions_market_data(current_prices)
-                    pnl = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
-                    if pnl != 0.0:
-                        self.risk_guard.record_pnl(pnl)
+                    pnl, settled_records = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
+                    for rec in settled_records:
+                        self.risk_guard.record_settlement_result(
+                            won=rec["won"],
+                            pnl=rec["pnl"],
+                            symbol=rec["symbol"]
+                        )
                     # Prune expired rounds from memory set
                     self.evaluated_rounds = {rid for rid in self.evaluated_rounds if rid in active_market_ids}
 
@@ -239,7 +259,13 @@ class TradingBotCoordinator:
         # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
         recent_perf = self.binance_client.get_recent_performance(symbol=market.symbol, limit=5)
         market.recent_performance = recent_perf
-        logger.info(f"[FEEDBACK LOOP] {recent_perf['summary']}")
+        market.martingale_step = self.risk_guard.current_martingale_step
+        market.martingale_stage = self.risk_guard.get_stage_label()
+        market.effective_hurdle = self.risk_guard.get_effective_confidence_threshold()
+        logger.info(
+            f"[FEEDBACK LOOP] {recent_perf['summary']} | "
+            f"Stage: {market.martingale_stage} (Hurdle: {market.effective_hurdle*100:.0f}%)"
+        )
 
         # Step 1: AI Evaluation via Jev AI Decision Engine
         decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
@@ -282,7 +308,7 @@ class TradingBotCoordinator:
             clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
             logger.info(
                 f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
-                f"on {market.market_id} ({market.timeframe}) @ {risk_result.target_price:.3f}"
+                f"on {market.market_id} ({market.timeframe}) [{risk_result.stage_label}] @ {risk_result.target_price:.3f}"
             )
             order_result: OrderResult = await self.binance_client.place_prediction_order(
                 market_id=market.market_id,
@@ -292,6 +318,8 @@ class TradingBotCoordinator:
                 target_price=risk_result.target_price,
                 strike_price=market.target_price,
                 spot_price=market.underlying_price,
+                martingale_step=risk_result.martingale_step,
+                stage=risk_result.stage_label,
             )
             record["order"] = order_result.model_dump()
 
@@ -426,6 +454,11 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         confidence_threshold=req.confidence_threshold,
         max_position_size_usdt=req.max_position_size_usdt,
         cooldown_seconds=req.cooldown_seconds,
+        martingale_enabled=req.martingale_enabled,
+        martingale_multiplier=req.martingale_multiplier,
+        martingale_max_steps=req.martingale_max_steps,
+        martingale_confidence_step=req.martingale_confidence_step,
+        martingale_max_confidence=req.martingale_max_confidence,
     )
     if req.paper_trading is not None:
         bot.binance_client.paper_trading = req.paper_trading

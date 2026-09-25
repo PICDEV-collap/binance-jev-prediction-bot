@@ -276,9 +276,14 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                           </span>
                         </td>
 
-                        {/* Contracts Size */}
+                        {/* Contracts Size & Martingale Stage */}
                         <td className="py-3 px-3 text-right text-slate-200 font-bold whitespace-nowrap">
-                          {pos.contracts}x
+                          <div>{pos.contracts}x</div>
+                          <span className={`text-[10px] font-semibold block ${
+                            pos.stage?.includes('แก้') ? 'text-amber-400 font-bold' : 'text-slate-400'
+                          }`}>
+                            {pos.stage || 'ไม้ 1 (Base)'}
+                          </span>
                         </td>
 
                         {/* Entry Odds */}
@@ -443,9 +448,14 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                           </span>
                         </td>
 
-                        {/* Size */}
+                        {/* Size & Martingale Stage */}
                         <td className="py-3 px-3 text-right text-slate-200 font-semibold whitespace-nowrap">
-                          {pos.contracts}x
+                          <div>{pos.contracts}x</div>
+                          <span className={`text-[10px] font-semibold block ${
+                            pos.stage?.includes('แก้') ? 'text-amber-400 font-bold' : 'text-slate-400'
+                          }`}>
+                            {pos.stage || 'ไม้ 1 (Base)'}
+                          </span>
                         </td>
 
                         {/* Entry Odds */}
@@ -589,9 +599,14 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                           </span>
                         </td>
 
-                        {/* Size */}
+                        {/* Size & Martingale Stage */}
                         <td className="py-2.5 px-3 text-right text-slate-200 font-semibold whitespace-nowrap">
-                          {order.contracts}x
+                          <div>{order.contracts}x</div>
+                          <span className={`text-[10px] font-semibold block ${
+                            order.stage?.includes('แก้') ? 'text-amber-400 font-bold' : 'text-slate-400'
+                          }`}>
+                            {order.stage || 'ไม้ 1 (Base)'}
+                          </span>
                         </td>
 
                         {/* Price / Odds */}

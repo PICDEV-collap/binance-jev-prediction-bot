@@ -501,6 +501,10 @@ export default function DashboardPage() {
     max_position_size_usdt: number;
     cooldown_seconds: number;
     paper_trading: boolean;
+    martingale_enabled?: boolean;
+    martingale_multiplier?: number;
+    martingale_max_steps?: number;
+    martingale_confidence_step?: number;
   }) => {
     try {
       await fetch(getApiUrl('/api/config'), {
@@ -522,6 +526,13 @@ export default function DashboardPage() {
           confidence_threshold: newConfig.confidence_threshold,
           max_position_size_usdt: newConfig.max_position_size_usdt,
           cooldown_seconds: newConfig.cooldown_seconds,
+          martingale: prev.risk_guard.martingale ? {
+            ...prev.risk_guard.martingale,
+            enabled: newConfig.martingale_enabled ?? prev.risk_guard.martingale.enabled,
+            multiplier: newConfig.martingale_multiplier ?? prev.risk_guard.martingale.multiplier,
+            max_steps: newConfig.martingale_max_steps ?? prev.risk_guard.martingale.max_steps,
+            confidence_step: newConfig.martingale_confidence_step ?? prev.risk_guard.martingale.confidence_step,
+          } : undefined,
         },
       };
     });
@@ -674,6 +685,10 @@ export default function DashboardPage() {
         currentPositionSize={status?.risk_guard?.max_position_size_usdt ?? 50.0}
         currentCooldown={status?.risk_guard?.cooldown_seconds ?? 45}
         currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
+        currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}
+        currentMartingaleMultiplier={status?.risk_guard?.martingale?.multiplier ?? 2.0}
+        currentMartingaleMaxSteps={status?.risk_guard?.martingale?.max_steps ?? 4}
+        currentMartingaleConfidenceStep={status?.risk_guard?.martingale?.confidence_step ?? 0.04}
         serverUrl={serverUrl}
         onSaveServerUrl={handleSaveServerUrl}
         onSaveConfig={handleSaveConfig}

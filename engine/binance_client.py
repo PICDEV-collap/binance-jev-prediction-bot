@@ -11,7 +11,7 @@ import hmac
 import logging
 import time
 import uuid
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
@@ -33,6 +33,8 @@ class OrderResult(BaseModel):
     latency_ms: float
     timeframe: str = "15m"
     price_to_beat: float = 0.0
+    martingale_step: int = 0
+    stage: str = "ไม้ 1 (Base)"
     error_message: Optional[str] = None
     timestamp: float = Field(default_factory=time.time)
 
@@ -49,6 +51,8 @@ class PositionInfo(BaseModel):
     target_price: float = 0.0  # Price to Beat
     timeframe: str = "15m"
     unrealized_pnl: float
+    martingale_step: int = 0
+    stage: str = "ไม้ 1 (Base)"
     entry_time: float = Field(default_factory=time.time)
 
 
@@ -65,6 +69,8 @@ class ClosedPositionInfo(BaseModel):
     timeframe: str = "15m"
     result: str  # "WIN" or "LOSS"
     realized_pnl: float
+    martingale_step: int = 0
+    stage: str = "ไม้ 1 (Base)"
     entry_time: float
     settled_at: float = Field(default_factory=time.time)
 
@@ -176,6 +182,8 @@ class BinanceClient:
         target_price: float,
         strike_price: float = 0.0,
         spot_price: float = 0.0,
+        martingale_step: int = 0,
+        stage: str = "ไม้ 1 (Base)",
     ) -> OrderResult:
         """
         Execute an order on Binance Prediction Markets.
@@ -195,7 +203,9 @@ class BinanceClient:
                 strike_price=strike_price,
                 spot_price=spot_price,
                 client_order_id=client_order_id,
-                start_time=start_time
+                start_time=start_time,
+                martingale_step=martingale_step,
+                stage=stage,
             )
 
         # --- Live Execution Mode ---
@@ -238,13 +248,15 @@ class BinanceClient:
                         contracts=contracts,
                         price=target_price,
                         status="FILLED",
-                        latency_ms=round(elapsed_ms, 2)
+                        latency_ms=round(elapsed_ms, 2),
+                        martingale_step=martingale_step,
+                        stage=stage,
                     )
                     self._total_orders_dispatched += 1
                     self._total_fills += 1
                     self._order_history.append(result)
                     logger.info(
-                        f"LIVE ORDER EXECUTED: {side} {contracts}x on {market_id} "
+                        f"LIVE ORDER EXECUTED: {side} {contracts}x on {market_id} [{stage}] "
                         f"@ {target_price:.3f} (Latency: {elapsed_ms:.1f}ms)"
                     )
                     return result
@@ -261,6 +273,8 @@ class BinanceClient:
                         price=target_price,
                         status="REJECTED",
                         latency_ms=round(elapsed_ms, 2),
+                        martingale_step=martingale_step,
+                        stage=stage,
                         error_message=err_msg
                     )
                     self._total_orders_dispatched += 1
@@ -280,6 +294,8 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round(elapsed_ms, 2),
+                martingale_step=martingale_step,
+                stage=stage,
                 error_message=str(e)
             )
             self._order_history.append(result)
@@ -295,7 +311,9 @@ class BinanceClient:
         strike_price: float,
         spot_price: float,
         client_order_id: str,
-        start_time: float
+        start_time: float,
+        martingale_step: int = 0,
+        stage: str = "ไม้ 1 (Base)",
     ) -> OrderResult:
         """Ultra-fast simulated execution engine for paper trading."""
         # Realistic network round-trip simulation (15ms - 40ms)
@@ -333,6 +351,8 @@ class BinanceClient:
                 latency_ms=round(elapsed_ms, 2),
                 timeframe=tf,
                 price_to_beat=beat_price,
+                martingale_step=martingale_step,
+                stage=stage,
                 error_message="Insufficient paper balance"
             )
             self._order_history.append(result)
@@ -352,7 +372,9 @@ class BinanceClient:
             current_price=current_spot,
             target_price=beat_price,
             timeframe=tf,
-            unrealized_pnl=0.0
+            unrealized_pnl=0.0,
+            martingale_step=martingale_step,
+            stage=stage,
         )
 
         result = OrderResult(
@@ -366,7 +388,9 @@ class BinanceClient:
             status="SIMULATED",
             latency_ms=round(elapsed_ms, 2),
             timeframe=tf,
-            price_to_beat=beat_price
+            price_to_beat=beat_price,
+            martingale_step=martingale_step,
+            stage=stage,
         )
 
         self._total_orders_dispatched += 1
@@ -374,7 +398,7 @@ class BinanceClient:
         self._order_history.append(result)
 
         logger.info(
-            f"[PAPER] Order Filled: {clean_side} {contracts} contracts on {market_id} ({tf}) "
+            f"[PAPER] Order Filled: {clean_side} {contracts} contracts on {market_id} ({tf} | {stage}) "
             f"@ {executed_price:.3f} | Latency: {elapsed_ms:.1f}ms | Rem. Balance: ${self._paper_balance_usdt:.2f}"
         )
         return result
@@ -383,14 +407,14 @@ class BinanceClient:
         self,
         active_market_ids: Set[str],
         current_prices: Dict[str, float]
-    ) -> float:
+    ) -> Tuple[float, List[Dict[str, Any]]]:
         """
         Settle prediction contracts whose round has ended.
         Picks up final settlement: $1.00 USDT payout per winning contract.
-        Returns total net realized PnL.
+        Returns tuple of (total_net_pnl, settled_events).
         """
         if not self.paper_trading:
-            return 0.0
+            return 0.0, []
 
         expired_pos_ids = [
             pid for pid, pos in self._paper_positions.items()
@@ -398,6 +422,7 @@ class BinanceClient:
         ]
 
         total_net_pnl = 0.0
+        settled_events: List[Dict[str, Any]] = []
 
         for pid in expired_pos_ids:
             pos = self._paper_positions.pop(pid)
@@ -433,6 +458,8 @@ class BinanceClient:
                 timeframe=pos.timeframe,
                 result="WIN" if won else "LOSS",
                 realized_pnl=round(realized_pnl, 2),
+                martingale_step=pos.martingale_step,
+                stage=pos.stage,
                 entry_time=pos.entry_time,
                 settled_at=time.time(),
             )
@@ -440,13 +467,24 @@ class BinanceClient:
             if len(self._closed_positions) > 100:
                 self._closed_positions.pop(0)
 
+            settled_events.append({
+                "position_id": pos.position_id,
+                "symbol": pos.symbol,
+                "market_id": pos.market_id,
+                "side": pos.side,
+                "won": won,
+                "pnl": round(realized_pnl, 2),
+                "martingale_step": pos.martingale_step,
+                "stage": pos.stage,
+            })
+
             logger.info(
-                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe}) SETTLED! "
+                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
                 f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
                 f"(Current Spot: ${spot:.2f}, Price to Beat: ${pos.target_price:.2f}) | Rem. Balance: ${self._paper_balance_usdt:.2f}"
             )
 
-        return round(total_net_pnl, 2)
+        return round(total_net_pnl, 2), settled_events
 
     def update_positions_market_data(self, current_prices: Dict[str, float]) -> None:
         """Update live mark price and calculate real-time unrealized PnL for open positions."""

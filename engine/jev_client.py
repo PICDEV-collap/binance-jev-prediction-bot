@@ -37,6 +37,9 @@ class MarketContext(BaseModel):
     bid: float = 0.49
     ask: float = 0.51
     recent_performance: Optional[Dict[str, Any]] = None
+    martingale_step: int = 0
+    martingale_stage: str = "ไม้ 1 (Base)"
+    effective_hurdle: float = 0.80
     timestamp: float = Field(default_factory=time.time)
 
     @property
@@ -131,6 +134,14 @@ class JevClient:
 
         perf_summary = context.recent_performance.get("summary", "") if context.recent_performance else ""
         recent_track_record_line = f"Recent Track Record: {perf_summary}\n" if perf_summary else ""
+        martingale_directive = ""
+        if context.martingale_step > 0:
+            martingale_directive = (
+                f"\n🚨 MARTINGALE RECOVERY ACTIVE: {context.martingale_stage} (Step {context.martingale_step}). "
+                f"Elevated conviction hurdle is {context.effective_hurdle*100:.0f}%. "
+                f"Only assign confidence >= {context.effective_hurdle*100:.0f}% if trend alignment, odds discrepancy, and momentum offer exceptional edge. "
+                f"Do not guess — protect recovery capital."
+            )
 
         if "systemone" in self.endpoint:
             clean_sym = context.symbol.replace("USDT", "")
@@ -145,6 +156,7 @@ class JevClient:
                 f"Spread: {context.spread:.3f} | 24h Volume: ${context.volume_24h:,.0f}\n"
                 f"Momentum: {context.momentum_pct:+.3f}%\n"
                 f"{recent_track_record_line}"
+                f"{martingale_directive}\n"
                 f"Time Remaining to Expiration: {context.time_left_seconds} seconds."
             )
             payload = {
@@ -202,7 +214,8 @@ class JevClient:
                             "specialized in binary prediction markets. Binary decision mode is strictly active: "
                             "you MUST predict either UP or DOWN. "
                             "FEEDBACK DIRECTIVE: If a recent track record is provided, use it to gauge current market regime consistency. "
-                            "If on a losing streak, require higher analytical momentum conviction before assigning high confidence. "
+                            "MARTINGALE RECOVERY RULES: When Martingale Recovery is active, an escalating conviction hurdle is enforced. "
+                            "Demand higher analytical momentum and price distance conviction before outputting high confidence. "
                             "AVOID GAMBLER'S FALLACY: Past outcomes do NOT guarantee an alternation of UP or DOWN. "
                             "Output ONLY a valid JSON object matching the schema with action, confidence, and reasoning."
                         )
@@ -219,6 +232,7 @@ class JevClient:
                             f"Underlying Spot: ${context.underlying_price:,.2f} | Target: ${context.target_price:,.2f}\n"
                             f"5m Momentum: {context.momentum_pct:+.2f}%\n"
                             f"{recent_track_record_line}"
+                            f"{martingale_directive}\n"
                             f"Determine whether to predict UP or DOWN."
                         )
                     }
@@ -394,15 +408,29 @@ class JevClient:
             action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"] = "UP"
             raw_conf = max(0.50, min(0.98, theoretical_prob + (max(0.0, edge_yes) * 0.5)))
             confidence = max(0.50, min(0.98, raw_conf * streak_modifier))
-            reasoning = (
-                f"Binary UP conviction: Theoretical P(UP) {theoretical_prob:.1%} (Market Odds: {context.odds_yes:.1%}, "
-                f"Edge: {edge_yes*100:+.1f}%). Momentum: {momentum:+.2f}% with {time_left}s remaining.{feedback_note}"
-            )
         else:
             action = "DOWN"
             prob_down = 1.0 - theoretical_prob
             raw_conf = max(0.50, min(0.98, prob_down + (max(0.0, edge_no) * 0.5)))
             confidence = max(0.50, min(0.98, raw_conf * streak_modifier))
+
+        # Martingale Recovery Conviction Hurdle Alignment
+        if context.martingale_step > 0:
+            chosen_edge = edge_yes if action == "UP" else edge_no
+            momentum_aligned = (momentum > 0.03 and action == "UP") or (momentum < -0.03 and action == "DOWN")
+            if chosen_edge > 0.03 and momentum_aligned:
+                boost = min(0.12, 0.03 * context.martingale_step + chosen_edge * 0.5)
+                confidence = min(0.96, max(context.effective_hurdle + 0.01, confidence + boost))
+                feedback_note += f" [🎯 {context.martingale_stage} Recovery High Conviction: Edge {chosen_edge*100:+.1f}%, Hurdle {context.effective_hurdle*100:.0f}% Achieved]"
+            else:
+                feedback_note += f" [⚠️ {context.martingale_stage} Recovery: Edge {chosen_edge*100:+.1f}% below recovery hurdle]"
+
+        if action == "UP":
+            reasoning = (
+                f"Binary UP conviction: Theoretical P(UP) {theoretical_prob:.1%} (Market Odds: {context.odds_yes:.1%}, "
+                f"Edge: {edge_yes*100:+.1f}%). Momentum: {momentum:+.2f}% with {time_left}s remaining.{feedback_note}"
+            )
+        else:
             reasoning = (
                 f"Binary DOWN conviction: Theoretical P(DOWN) {prob_down:.1%} (Market Odds: {context.odds_no:.1%}, "
                 f"Edge: {edge_no*100:+.1f}%). Momentum: {momentum:+.2f}% with {time_left}s remaining.{feedback_note}"

@@ -28,12 +28,17 @@ class RiskEvaluationResult(BaseModel):
     market_id: str
     action: str
     target_price: float = 0.0
+    martingale_step: int = 0
+    stage_label: str = "ไม้ 1 (Base)"
+    multiplier: float = 1.0
+    effective_threshold: float = 0.80
     timestamp: float = Field(default_factory=time.time)
 
 
 class RiskGuard:
     """
     Quantitative pre-trade risk engine ensuring no orders breach risk tolerances.
+    Features smart Martingale recovery sizing and dynamic escalating AI conviction hurdles.
     """
 
     def __init__(
@@ -45,6 +50,11 @@ class RiskGuard:
         max_daily_loss_usdt: float = 200.0,
         max_concurrent_positions: int = 5,
         max_odds_cap: float = 0.90,
+        martingale_enabled: bool = True,
+        martingale_multiplier: float = 2.0,
+        martingale_max_steps: int = 4,
+        martingale_confidence_step: float = 0.04,
+        martingale_max_confidence: float = 0.95,
     ) -> None:
         self.confidence_threshold = confidence_threshold
         self.max_position_size_usdt = max_position_size_usdt
@@ -53,6 +63,19 @@ class RiskGuard:
         self.max_daily_loss_usdt = max_daily_loss_usdt
         self.max_concurrent_positions = max_concurrent_positions
         self.max_odds_cap = max_odds_cap
+
+        # Martingale Recovery State
+        self.martingale_enabled: bool = martingale_enabled
+        self.martingale_multiplier: float = martingale_multiplier
+        self.martingale_max_steps: int = martingale_max_steps
+        self.martingale_confidence_step: float = martingale_confidence_step
+        self.martingale_max_confidence: float = martingale_max_confidence
+
+        self.current_martingale_step: int = 0  # 0 = Base (ไม้ 1), 1 = ไม้แก้ 1, 2 = ไม้แก้ 2...
+        self.consecutive_losses: int = 0
+        self.consecutive_wins: int = 0
+        self.last_settled_result: str = "NONE"
+        self.recovery_cycles_completed: int = 0
 
         # State tracking
         self._market_last_traded: Dict[str, float] = {}
@@ -72,6 +95,65 @@ class RiskGuard:
             "INVALID_PRICING": 0,
         }
 
+    def get_effective_confidence_threshold(self) -> float:
+        """
+        Calculate required AI conviction hurdle.
+        Escalates with each Martingale recovery step to protect capital.
+        Base: 80% -> Step 1: 84% -> Step 2: 88% -> Step 3: 92% -> Step 4: 95%
+        """
+        if not self.martingale_enabled or self.current_martingale_step == 0:
+            return self.confidence_threshold
+        step_boost = self.current_martingale_step * self.martingale_confidence_step
+        return min(self.martingale_max_confidence, self.confidence_threshold + step_boost)
+
+    def get_stage_label(self) -> str:
+        """Human-readable Martingale stage label."""
+        if not self.martingale_enabled or self.current_martingale_step == 0:
+            return "ไม้ 1 (Base)"
+        mult = self.martingale_multiplier ** self.current_martingale_step
+        return f"ไม้แก้ {self.current_martingale_step} ({mult:.0f}x)"
+
+    def record_settlement_result(self, won: bool, pnl: float, symbol: str = "") -> None:
+        """
+        Feedback from settled round.
+        When LOSS: Advance Martingale recovery step, increase multiplier & raise AI conviction hurdle.
+        When WIN: Reset Martingale step to 0 (Base Round) and restore base AI hurdle!
+        """
+        if won:
+            was_recovery = self.current_martingale_step > 0
+            if was_recovery:
+                self.recovery_cycles_completed += 1
+                logger.info(
+                    f"🎉 [MARTINGALE RECOVERY SUCCESS!] Won at Step {self.current_martingale_step} "
+                    f"(PnL: +${pnl:.2f}). Total recoveries completed: {self.recovery_cycles_completed}. "
+                    f"RESETTING TO BASE ROUND (ไม้ 1)!"
+                )
+            else:
+                logger.info(f"✅ [WIN] Base round won (+${pnl:.2f}). Starting fresh base round.")
+
+            self.current_martingale_step = 0
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            self.last_settled_result = "WIN"
+        else:
+            self.record_pnl(pnl)  # Updates daily drawdown breaker
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+            self.last_settled_result = "LOSS"
+
+            if self.martingale_enabled:
+                old_step = self.current_martingale_step
+                self.current_martingale_step = min(self.martingale_max_steps, self.current_martingale_step + 1)
+                new_hurdle = self.get_effective_confidence_threshold()
+                mult = self.martingale_multiplier ** self.current_martingale_step
+                logger.warning(
+                    f"⚠️ [MARTINGALE LOSS ESCALATION] Round lost (-${abs(pnl):.2f}). "
+                    f"Advancing from Step {old_step} -> Step {self.current_martingale_step} (ไม้แก้ {self.current_martingale_step}). "
+                    f"Next trade size: {mult:.0f}x | Next AI Conviction Hurdle raised to: {new_hurdle*100:.0f}%"
+                )
+            else:
+                logger.info(f"Round lost (-${abs(pnl):.2f}). Martingale disabled, maintaining base sizing.")
+
     def validate_and_size_order(
         self,
         decision: JevEvaluationResult,
@@ -81,10 +163,13 @@ class RiskGuard:
     ) -> RiskEvaluationResult:
         """
         Evaluate proposed trade against all risk controls and determine safe sizing.
-        Includes Approach 3 Hybrid feedback: dynamic defensive hurdles and anti-martingale sizing.
+        Includes Martingale recovery sizing and dynamic escalating AI conviction hurdle.
         """
         self._total_evaluated += 1
         now = time.time()
+        effective_threshold = self.get_effective_confidence_threshold()
+        stage_label = self.get_stage_label()
+        multiplier = self.martingale_multiplier ** self.current_martingale_step if (self.martingale_enabled and self.current_martingale_step > 0) else 1.0
 
         # Gate 0: Signal is PASS
         if decision.action == "PASS":
@@ -95,7 +180,11 @@ class RiskGuard:
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
-                action="PASS"
+                action="PASS",
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
             )
 
         # Gate 1: Circuit breaker check (Daily Loss Limit)
@@ -112,27 +201,22 @@ class RiskGuard:
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
-                action=decision.action
+                action=decision.action,
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
             )
 
-        # Gate 2: Confidence Threshold Check (Required >= threshold)
-        # Dynamic Defensive Hurdle: if on consecutive losses, demand higher conviction
-        effective_threshold = self.confidence_threshold
-        consecutive_losses = 0
-        if recent_performance:
-            consecutive_losses = recent_performance.get("consecutive_losses", 0)
-            if consecutive_losses >= 2:
-                # Dynamic defensive hurdle: raise required threshold by 3% per loss past 1 (capped at 92%)
-                effective_threshold = min(0.92, self.confidence_threshold + (0.03 * (consecutive_losses - 1)))
-
+        # Gate 2: Escalating Martingale AI Conviction Hurdle
         if decision.confidence < effective_threshold:
             self._record_rejection("LOW_CONFIDENCE")
             filter_reason = (
                 f"AI Signal: {decision.action} ({decision.confidence*100:.1f}%) "
                 f"— Filtered: Below {effective_threshold*100:.0f}% conviction gate"
             )
-            if consecutive_losses >= 2:
-                filter_reason += f" (Defensive gate active: {consecutive_losses} consecutive losses on {market.symbol})"
+            if self.current_martingale_step > 0:
+                filter_reason += f" [{stage_label} Recovery Hurdle Active: Conviction must be >={effective_threshold*100:.0f}%]"
             logger.info(f"[RISK FILTER] {filter_reason} for {market.market_id}. Capital preserved.")
             return RiskEvaluationResult(
                 approved=False,
@@ -140,7 +224,11 @@ class RiskGuard:
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
-                action=decision.action
+                action=decision.action,
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
             )
 
         # Gate 3: Cooldown Throttle per Market
@@ -158,7 +246,11 @@ class RiskGuard:
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
-                action=decision.action
+                action=decision.action,
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
             )
 
         # Gate 4: Maximum Concurrent Positions Limit
@@ -170,7 +262,11 @@ class RiskGuard:
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
-                action=decision.action
+                action=decision.action,
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
             )
 
         # Gate 5: Odds Pricing and Skew Sanity Check
@@ -187,7 +283,11 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                target_price=target_price
+                target_price=target_price,
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
             )
 
         # Gate 6: Spread Sanity Check
@@ -200,40 +300,43 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                target_price=target_price
+                target_price=target_price,
+                martingale_step=self.current_martingale_step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
             )
 
         # --- Position Sizing Calculation ---
         # Formula: Cap position exposure by max_position_size_usdt
-        # Scaled dynamically with confidence excess over threshold
-        confidence_scaler = 1.0 + (decision.confidence - self.confidence_threshold) * 2.0
-        budget = min(self.max_position_size_usdt, self.max_position_size_usdt * confidence_scaler)
-        max_possible_contracts = int(budget / target_price) if target_price > 0 else 0
+        max_possible_contracts = int(self.max_position_size_usdt / target_price) if target_price > 0 else 0
 
-        contracts = max(1, min(self.default_order_contracts, max_possible_contracts))
-
-        # Anti-Martingale / Defensive sizing if on losing streak
-        if consecutive_losses >= 2:
-            contracts = max(1, contracts // 2)
+        if self.martingale_enabled and self.current_martingale_step > 0:
+            raw_contracts = int(self.default_order_contracts * multiplier)
+            contracts = max(1, min(raw_contracts, max_possible_contracts))
+            approval_reason = f"Martingale Recovery Order ({stage_label}) approved"
             logger.info(
-                f"[RISK DEFENSE] Sizing reduced to {contracts}x on {market.symbol} "
-                f"due to {consecutive_losses} consecutive losses."
+                f"[MARTINGALE ORDER SIZING] {stage_label}: {contracts} contracts "
+                f"({multiplier:.0f}x base {self.default_order_contracts}) | Exposure: ${contracts * target_price:.2f}"
             )
-        elif recent_performance and recent_performance.get("consecutive_wins", 0) >= 3:
-            contracts = min(max_possible_contracts, int(contracts * 1.2))
+        else:
+            # Base sizing: Scaled dynamically with confidence excess over threshold
+            confidence_scaler = 1.0 + max(0.0, (decision.confidence - self.confidence_threshold) * 2.0)
+            budget = min(self.max_position_size_usdt, self.max_position_size_usdt * confidence_scaler)
+            base_limit = int(budget / target_price) if target_price > 0 else 0
+            contracts = max(1, min(self.default_order_contracts, base_limit))
+            approval_reason = "Base round order approved"
+            if recent_performance and recent_performance.get("consecutive_wins", 0) >= 3:
+                contracts = min(max_possible_contracts, int(contracts * 1.2))
+                approval_reason += f" (Win streak boost: {recent_performance.get('consecutive_wins')} wins)"
 
         # Successfully Approved!
         self._total_approved += 1
         self._market_last_traded[market.market_id] = now
-        approval_reason = "All risk & execution gates passed successfully"
-        if consecutive_losses >= 2:
-            approval_reason += f" (Defensive sizing: {consecutive_losses} losses on {market.symbol})"
-        elif recent_performance and recent_performance.get("consecutive_wins", 0) >= 2:
-            approval_reason += f" (Momentum streak: {recent_performance.get('consecutive_wins')} wins on {market.symbol})"
 
         logger.info(
-            f"[RISK APPROVED] {decision.action} on {market.market_id} | "
-            f"Size: {contracts} contracts @ {target_price:.3f} | Conf: {decision.confidence:.2f}"
+            f"[RISK APPROVED] {decision.action} on {market.market_id} | {stage_label} | "
+            f"Size: {contracts} contracts @ {target_price:.3f} | Conf: {decision.confidence:.2f} (Required: {effective_threshold:.2f})"
         )
 
         return RiskEvaluationResult(
@@ -243,7 +346,11 @@ class RiskGuard:
             confidence=decision.confidence,
             market_id=market.market_id,
             action=decision.action,
-            target_price=target_price
+            target_price=target_price,
+            martingale_step=self.current_martingale_step,
+            stage_label=stage_label,
+            multiplier=multiplier,
+            effective_threshold=effective_threshold,
         )
 
     def record_pnl(self, realized_pnl: float) -> None:
@@ -268,17 +375,35 @@ class RiskGuard:
         confidence_threshold: Optional[float] = None,
         max_position_size_usdt: Optional[float] = None,
         cooldown_seconds: Optional[int] = None,
+        martingale_enabled: Optional[bool] = None,
+        martingale_multiplier: Optional[float] = None,
+        martingale_max_steps: Optional[int] = None,
+        martingale_confidence_step: Optional[float] = None,
+        martingale_max_confidence: Optional[float] = None,
     ) -> None:
-        """Dynamically update risk parameters at runtime from web dashboard."""
+        """Dynamically update risk parameters and Martingale settings at runtime from web dashboard."""
         if confidence_threshold is not None:
             self.confidence_threshold = max(0.5, min(0.99, confidence_threshold))
         if max_position_size_usdt is not None:
             self.max_position_size_usdt = max(5.0, max_position_size_usdt)
         if cooldown_seconds is not None:
             self.cooldown_seconds = max(5, cooldown_seconds)
+        if martingale_enabled is not None:
+            self.martingale_enabled = bool(martingale_enabled)
+        if martingale_multiplier is not None:
+            self.martingale_multiplier = max(1.1, min(5.0, martingale_multiplier))
+        if martingale_max_steps is not None:
+            self.martingale_max_steps = max(1, min(10, martingale_max_steps))
+        if martingale_confidence_step is not None:
+            self.martingale_confidence_step = max(0.01, min(0.10, martingale_confidence_step))
+        if martingale_max_confidence is not None:
+            self.martingale_max_confidence = max(0.80, min(0.99, martingale_max_confidence))
+
         logger.info(
             f"Risk parameters updated: Conf={self.confidence_threshold:.2f}, "
-            f"Size=${self.max_position_size_usdt:.1f}, Cooldown={self.cooldown_seconds}s"
+            f"Size=${self.max_position_size_usdt:.1f}, Cooldown={self.cooldown_seconds}s, "
+            f"Martingale={self.martingale_enabled} (Mult={self.martingale_multiplier}x, "
+            f"MaxSteps={self.martingale_max_steps}, ConfStep={self.martingale_confidence_step*100:.1f}%)"
         )
 
     def _record_rejection(self, reason_code: str) -> None:
@@ -288,10 +413,15 @@ class RiskGuard:
 
     @property
     def metrics(self) -> Dict[str, Any]:
-        """Telemetry metrics for web dashboard."""
+        """Telemetry metrics for web dashboard including full Martingale recovery state."""
         approval_rate = (
             (self._total_approved / self._total_evaluated * 100.0)
             if self._total_evaluated > 0 else 0.0
+        )
+        current_mult = (
+            self.martingale_multiplier ** self.current_martingale_step
+            if (self.martingale_enabled and self.current_martingale_step > 0)
+            else 1.0
         )
         return {
             "confidence_threshold": self.confidence_threshold,
@@ -305,4 +435,19 @@ class RiskGuard:
             "total_rejected": self._total_rejected,
             "approval_rate_pct": round(approval_rate, 1),
             "rejections_breakdown": self._rejection_counts,
+            "martingale": {
+                "enabled": self.martingale_enabled,
+                "current_step": self.current_martingale_step,
+                "max_steps": self.martingale_max_steps,
+                "multiplier": self.martingale_multiplier,
+                "current_multiplier": current_mult,
+                "confidence_step": self.martingale_confidence_step,
+                "max_confidence": self.martingale_max_confidence,
+                "effective_threshold": round(self.get_effective_confidence_threshold(), 3),
+                "stage_label": self.get_stage_label(),
+                "consecutive_losses": self.consecutive_losses,
+                "consecutive_wins": self.consecutive_wins,
+                "last_settled_result": self.last_settled_result,
+                "recovery_cycles_completed": self.recovery_cycles_completed,
+            }
         }

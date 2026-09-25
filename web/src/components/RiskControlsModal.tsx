@@ -9,7 +9,8 @@ import {
   AlertTriangle, 
   DollarSign, 
   Clock, 
-  Lock 
+  Lock,
+  RotateCcw
 } from 'lucide-react';
 
 interface RiskControlsModalProps {
@@ -19,6 +20,10 @@ interface RiskControlsModalProps {
   currentPositionSize: number;
   currentCooldown: number;
   currentPaperTrading: boolean;
+  currentMartingaleEnabled?: boolean;
+  currentMartingaleMultiplier?: number;
+  currentMartingaleMaxSteps?: number;
+  currentMartingaleConfidenceStep?: number;
   serverUrl: string;
   onSaveServerUrl: (url: string) => void;
   onSaveConfig: (newConfig: {
@@ -26,6 +31,10 @@ interface RiskControlsModalProps {
     max_position_size_usdt: number;
     cooldown_seconds: number;
     paper_trading: boolean;
+    martingale_enabled?: boolean;
+    martingale_multiplier?: number;
+    martingale_max_steps?: number;
+    martingale_confidence_step?: number;
   }) => Promise<void>;
 }
 
@@ -36,6 +45,10 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentPositionSize,
   currentCooldown,
   currentPaperTrading,
+  currentMartingaleEnabled = true,
+  currentMartingaleMultiplier = 2.0,
+  currentMartingaleMaxSteps = 4,
+  currentMartingaleConfidenceStep = 0.04,
   serverUrl,
   onSaveServerUrl,
   onSaveConfig,
@@ -44,6 +57,10 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   const [positionSize, setPositionSize] = useState<number>(currentPositionSize);
   const [cooldown, setCooldown] = useState<number>(currentCooldown);
   const [paperTrading, setPaperTrading] = useState<boolean>(currentPaperTrading);
+  const [martingaleEnabled, setMartingaleEnabled] = useState<boolean>(currentMartingaleEnabled);
+  const [martingaleMultiplier, setMartingaleMultiplier] = useState<number>(currentMartingaleMultiplier);
+  const [martingaleMaxSteps, setMartingaleMaxSteps] = useState<number>(currentMartingaleMaxSteps);
+  const [martingaleConfidenceStep, setMartingaleConfidenceStep] = useState<number>(currentMartingaleConfidenceStep * 100);
   const [customServerUrl, setCustomServerUrl] = useState<string>(serverUrl);
   const [saving, setSaving] = useState<boolean>(false);
   const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
@@ -61,6 +78,10 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         max_position_size_usdt: positionSize,
         cooldown_seconds: cooldown,
         paper_trading: paperTrading,
+        martingale_enabled: martingaleEnabled,
+        martingale_multiplier: martingaleMultiplier,
+        martingale_max_steps: martingaleMaxSteps,
+        martingale_confidence_step: martingaleConfidenceStep / 100,
       });
       setSavedSuccess(true);
       setTimeout(() => {
@@ -186,7 +207,126 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
             </div>
           </div>
 
-          {/* 4. Operating Mode Switch */}
+          {/* 4. Martingale Recovery & Dynamic AI Accuracy Escalation */}
+          <div className="p-4 rounded-xl bg-slate-950/90 border border-amber-500/30 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <div className="flex items-center gap-2">
+                <RotateCcw className="w-4 h-4 text-amber-400" />
+                <div>
+                  <span className="text-xs font-mono font-bold text-white uppercase block">
+                    MARTINGALE RECOVERY (ระบบแก้ไม้ + เพิ่มความแม่นยำ AI)
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-400">
+                    แก้ไม้เมื่อแพ้รอบก่อนหน้า และรีเซ็ตกลับเป็นไม้ 1 เมื่อชนะ
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMartingaleEnabled(!martingaleEnabled)}
+                className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  martingaleEnabled ? 'bg-amber-500' : 'bg-slate-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                    martingaleEnabled ? 'translate-x-4' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {martingaleEnabled && (
+              <div className="space-y-3.5 pt-1">
+                {/* Multiplier Slider */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs font-mono">
+                    <span className="text-slate-300 font-medium">ตัวคูณขนาดไม้แก้ (Position Multiplier)</span>
+                    <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40">
+                      {martingaleMultiplier.toFixed(1)}x
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1.5"
+                    max="3.0"
+                    step="0.1"
+                    value={martingaleMultiplier}
+                    onChange={(e) => setMartingaleMultiplier(parseFloat(e.target.value))}
+                    className="w-full accent-amber-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] font-mono text-slate-500">
+                    <span>1.5x (Safe)</span>
+                    <span className="text-amber-400 font-semibold">2.0x (Standard)</span>
+                    <span>3.0x (Aggressive)</span>
+                  </div>
+                </div>
+
+                {/* Max Steps Slider */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs font-mono">
+                    <span className="text-slate-300 font-medium">จำนวนไม้แก้สูงสุด (Max Recovery Steps)</span>
+                    <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/40">
+                      {martingaleMaxSteps} ไม้
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="6"
+                    step="1"
+                    value={martingaleMaxSteps}
+                    onChange={(e) => setMartingaleMaxSteps(parseInt(e.target.value))}
+                    className="w-full accent-amber-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] font-mono text-slate-500">
+                    <span>1 ไม้</span>
+                    <span className="text-amber-400 font-semibold">4 ไม้ (Standard)</span>
+                    <span>6 ไม้ (Max)</span>
+                  </div>
+                </div>
+
+                {/* AI Hurdle Escalation Step */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs font-mono">
+                    <span className="text-slate-300 font-medium">AI เพิ่มเกณฑ์ความแม่นยำต่อไม้แก้ (+AI Hurdle)</span>
+                    <span className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40">
+                      +{martingaleConfidenceStep.toFixed(0)}% ต่อไม้
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="8"
+                    step="1"
+                    value={martingaleConfidenceStep}
+                    onChange={(e) => setMartingaleConfidenceStep(parseFloat(e.target.value))}
+                    className="w-full accent-cyan-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] font-mono text-slate-500">
+                    <span>+1% (Mild)</span>
+                    <span className="text-cyan-400 font-semibold">+4% (Optimal)</span>
+                    <span>+8% (Strict)</span>
+                  </div>
+                </div>
+
+                {/* Informational Progression Preview */}
+                <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] font-mono text-slate-400 space-y-1">
+                  <div className="text-amber-300 font-semibold flex items-center gap-1">
+                    <span>📌 ตัวอย่างลำดับไม้และเกณฑ์ AI:</span>
+                  </div>
+                  <div className="text-[10.5px] leading-relaxed text-slate-300">
+                    ไม้ 1: {threshold.toFixed(0)}% (1x) ➔ ไม้แก้ 1: {Math.min(95, threshold + martingaleConfidenceStep).toFixed(0)}% ({martingaleMultiplier.toFixed(0)}x) ➔ ไม้แก้ 2: {Math.min(95, threshold + martingaleConfidenceStep * 2).toFixed(0)}% ({(martingaleMultiplier ** 2).toFixed(0)}x)...
+                  </div>
+                  <div className="text-[10px] text-emerald-400 pt-0.5">
+                    ✨ เมื่อชนะไม้แก้ใดก็ตาม ระบบจะเริ่มรอบใหม่ที่ไม้ 1 (1x @ {threshold.toFixed(0)}%) ทันที
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* 5. Operating Mode Switch */}
           <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between">
             <div>
               <span className="text-xs font-mono font-bold text-white block">

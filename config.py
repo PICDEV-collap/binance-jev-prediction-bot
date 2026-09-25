@@ -92,6 +92,33 @@ class Settings(BaseSettings):
         alias="SLIPPAGE_TOLERANCE"
     )
 
+    # --- Martingale Recovery Engine Configuration ---
+    martingale_enabled: bool = Field(default=True, alias="MARTINGALE_ENABLED")
+    martingale_multiplier: float = Field(
+        default=2.0,
+        ge=1.0,
+        le=4.0,
+        alias="MARTINGALE_MULTIPLIER"
+    )
+    martingale_max_steps: int = Field(
+        default=4,
+        ge=1,
+        le=6,
+        alias="MARTINGALE_MAX_STEPS"
+    )
+    martingale_confidence_step: float = Field(
+        default=0.04,
+        ge=0.01,
+        le=0.10,
+        alias="MARTINGALE_CONFIDENCE_STEP"
+    )
+    martingale_max_confidence: float = Field(
+        default=0.95,
+        ge=0.85,
+        le=0.99,
+        alias="MARTINGALE_MAX_CONFIDENCE"
+    )
+
     # --- Operating Modes ---
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
     enable_mock_stream: bool = Field(default=False, alias="ENABLE_MOCK_STREAM")
