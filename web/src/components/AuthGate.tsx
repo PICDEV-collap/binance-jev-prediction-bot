@@ -70,13 +70,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
     }
   };
 
-  const handleQuickDemoAccess = () => {
-    onLoginSuccess({
-      username: 'admin',
-      token: 'preview-session-token',
-    });
-  };
-
   return (
     <div className="min-h-screen bg-[#05070d] flex items-center justify-center p-4 relative overflow-hidden">
       
@@ -176,15 +169,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
                 <ArrowRight className="w-4 h-4" />
               </>
             )}
-          </button>
-
-          {/* Quick 1-Click Access for Instant Preview */}
-          <button
-            type="button"
-            onClick={handleQuickDemoAccess}
-            className="w-full py-2.5 px-4 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700/80 hover:border-emerald-500/50 text-emerald-400 font-mono font-semibold text-xs transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
-          >
-            <span>⚡ เข้าใช้งานแดชบอร์ดทันที (1-Click Instant Access)</span>
           </button>
         </form>
 
