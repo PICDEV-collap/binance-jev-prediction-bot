@@ -122,6 +122,7 @@ class BinanceClient:
         self._live_available_usdt: float = 0.0
         self._live_unrealized_usdt: float = 0.0
         self._live_initial_capital: float = 0.0
+        self._live_positions: Dict[str, PositionInfo] = {}
 
     async def start(self) -> None:
         """Initialize session with persistent connection pooling and sync time."""
@@ -304,6 +305,23 @@ class BinanceClient:
                     self._total_fills += 1
                     self._order_history.append(result)
                     self._in_flight_orders.pop(client_order_id, None)
+
+                    pos_id = f"POS_LIVE_{market_id}_{clean_side}_{uuid.uuid4().hex[:4]}"
+                    self._live_positions[pos_id] = PositionInfo(
+                        position_id=pos_id,
+                        market_id=market_id,
+                        symbol=symbol,
+                        side=clean_side,
+                        contracts=contracts,
+                        entry_price=target_price,
+                        current_price=spot_price if spot_price > 0 else target_price,
+                        target_price=strike_price if strike_price > 0 else target_price,
+                        timeframe=timeframe,
+                        unrealized_pnl=0.0,
+                        martingale_step=martingale_step,
+                        stage=stage,
+                    )
+
                     logger.info(
                         f"LIVE PREDICTION ORDER EXECUTED: {side} {contracts}x on {market_id} [{stage}] "
                         f"@ {target_price:.3f} (Latency: {elapsed_ms:.1f}ms)"
@@ -497,92 +515,101 @@ class BinanceClient:
 
         now = time.time()
         tf_durations = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
-
-        expired_pos_ids = []
-        for pid, pos in self._paper_positions.items():
-            max_duration = tf_durations.get(pos.timeframe.lower(), 900)
-            is_time_expired = (now - pos.entry_time) >= (max_duration + 5)
-            if pos.market_id not in active_market_ids or is_time_expired:
-                expired_pos_ids.append(pid)
-
         total_net_pnl = 0.0
         settled_events: List[Dict[str, Any]] = []
 
-        for pid in expired_pos_ids:
-            pos = self._paper_positions.pop(pid)
-            spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
-            cost = pos.contracts * pos.entry_price
+        # Target both paper positions and live positions
+        containers = [
+            ("PAPER", self._paper_positions),
+            ("LIVE", self._live_positions),
+        ]
 
-            # Binary outcome settlement according to official Binance Prediction Rules:
-            # Rule: If final price > strike -> UP wins ($1.00); if < strike -> DOWN wins ($1.00); if equal -> 50-50 ($0.50 payout)
-            is_tie = abs(spot - pos.target_price) < 1e-4
-            if is_tie:
-                payout = pos.contracts * 0.50
-                realized_pnl = payout - cost
-                self._paper_balance_usdt += payout
-                won = (realized_pnl >= 0)
-                outcome_label = "TIE (50-50)"
-            elif pos.side in ("UP", "BUY_YES"):
-                won = spot > pos.target_price
-                payout = pos.contracts * 1.00 if won else 0.0
-                realized_pnl = payout - cost
-                if won:
-                    self._paper_balance_usdt += payout
-                outcome_label = "WIN" if won else "LOSS"
-            else:  # DOWN
-                won = spot < pos.target_price
-                payout = pos.contracts * 1.00 if won else 0.0
-                realized_pnl = payout - cost
-                if won:
-                    self._paper_balance_usdt += payout
-                outcome_label = "WIN" if won else "LOSS"
+        for mode_label, pos_dict in containers:
+            expired_pos_ids = []
+            for pid, pos in list(pos_dict.items()):
+                max_duration = tf_durations.get(pos.timeframe.lower(), 900)
+                is_time_expired = (now - pos.entry_time) >= (max_duration + 5)
+                if pos.market_id not in active_market_ids or is_time_expired:
+                    expired_pos_ids.append(pid)
 
-            total_net_pnl += realized_pnl
+            for pid in expired_pos_ids:
+                pos = pos_dict.pop(pid)
+                spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
+                cost = pos.contracts * pos.entry_price
 
-            # Record into settled positions history
-            closed_item = ClosedPositionInfo(
-                position_id=pos.position_id,
-                market_id=pos.market_id,
-                symbol=pos.symbol,
-                side=pos.side,
-                contracts=pos.contracts,
-                entry_price=pos.entry_price,
-                target_price=pos.target_price,
-                settlement_price=spot,
-                timeframe=pos.timeframe,
-                result=outcome_label,
-                realized_pnl=round(realized_pnl, 2),
-                martingale_step=pos.martingale_step,
-                stage=pos.stage,
-                entry_time=pos.entry_time,
-                settled_at=time.time(),
-            )
-            self._closed_positions.append(closed_item)
-            if len(self._closed_positions) > 100:
-                self._closed_positions.pop(0)
+                # Binary outcome settlement according to official Binance Prediction Rules:
+                # Rule: If final price > strike -> UP wins ($1.00); if < strike -> DOWN wins ($1.00); if equal -> 50-50 ($0.50 payout)
+                is_tie = abs(spot - pos.target_price) < 1e-4
+                if is_tie:
+                    payout = pos.contracts * 0.50
+                    realized_pnl = payout - cost
+                    if mode_label == "PAPER":
+                        self._paper_balance_usdt += payout
+                    won = (realized_pnl >= 0)
+                    outcome_label = "TIE (50-50)"
+                elif pos.side in ("UP", "BUY_YES"):
+                    won = spot > pos.target_price
+                    payout = pos.contracts * 1.00 if won else 0.0
+                    realized_pnl = payout - cost
+                    if won and mode_label == "PAPER":
+                        self._paper_balance_usdt += payout
+                    outcome_label = "WIN" if won else "LOSS"
+                else:  # DOWN
+                    won = spot < pos.target_price
+                    payout = pos.contracts * 1.00 if won else 0.0
+                    realized_pnl = payout - cost
+                    if won and mode_label == "PAPER":
+                        self._paper_balance_usdt += payout
+                    outcome_label = "WIN" if won else "LOSS"
 
-            settled_events.append({
-                "position_id": pos.position_id,
-                "symbol": pos.symbol,
-                "market_id": pos.market_id,
-                "side": pos.side,
-                "won": won,
-                "pnl": round(realized_pnl, 2),
-                "martingale_step": pos.martingale_step,
-                "stage": pos.stage,
-            })
+                total_net_pnl += realized_pnl
 
-            logger.info(
-                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
-                f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
-                f"(Current Spot: ${spot:.2f}, Price to Beat: ${pos.target_price:.2f}) | Rem. Balance: ${self._paper_balance_usdt:.2f}"
-            )
+                # Record into settled positions history
+                closed_item = ClosedPositionInfo(
+                    position_id=pos.position_id,
+                    market_id=pos.market_id,
+                    symbol=pos.symbol,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    entry_price=pos.entry_price,
+                    target_price=pos.target_price,
+                    settlement_price=spot,
+                    timeframe=pos.timeframe,
+                    result=outcome_label,
+                    realized_pnl=round(realized_pnl, 2),
+                    martingale_step=pos.martingale_step,
+                    stage=pos.stage,
+                    entry_time=pos.entry_time,
+                    settled_at=time.time(),
+                )
+                self._closed_positions.append(closed_item)
+                if len(self._closed_positions) > 100:
+                    self._closed_positions.pop(0)
+
+                settled_events.append({
+                    "position_id": pos.position_id,
+                    "symbol": pos.symbol,
+                    "market_id": pos.market_id,
+                    "side": pos.side,
+                    "won": won,
+                    "pnl": round(realized_pnl, 2),
+                    "martingale_step": pos.martingale_step,
+                    "stage": pos.stage,
+                    "mode": mode_label,
+                })
+
+                logger.info(
+                    f"[{mode_label} SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
+                    f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
+                    f"(Current Spot: ${spot:.2f}, Price to Beat: ${pos.target_price:.2f})"
+                )
 
         return round(total_net_pnl, 2), settled_events
 
     def update_positions_market_data(self, current_prices: Dict[str, float]) -> None:
         """Update live mark price and calculate real-time unrealized PnL for open positions."""
-        for pos in self._paper_positions.values():
+        active_list = list(self._live_positions.values()) if not self.paper_trading else list(self._paper_positions.values())
+        for pos in active_list:
             if pos.symbol in current_prices:
                 spot = current_prices[pos.symbol]
                 pos.current_price = spot
@@ -595,12 +622,21 @@ class BinanceClient:
                 live_contract_val = 0.95 if is_itm else 0.05
                 pos.unrealized_pnl = round((pos.contracts * live_contract_val) - (pos.contracts * pos.entry_price), 2)
 
+    def clear_paper_positions(self) -> int:
+        """Clear lingering simulated paper positions from the active desk."""
+        cleared_count = len(self._paper_positions)
+        self._paper_positions.clear()
+        logger.info(f"Cleared {cleared_count} simulated paper positions from active desk.")
+        return cleared_count
+
     def get_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the most recent order execution log."""
         return [o.model_dump() for o in reversed(self._order_history[-limit:])]
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        """Return currently held active open positions."""
+        """Return currently held active open positions based on current trading mode."""
+        if not self.paper_trading:
+            return [p.model_dump() for p in self._live_positions.values()]
         return [p.model_dump() for p in self._paper_positions.values()]
 
     def get_closed_positions(self, limit: int = 50) -> List[Dict[str, Any]]:

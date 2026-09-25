@@ -490,6 +490,13 @@ async def get_positions_endpoint() -> Dict[str, Any]:
     }
 
 
+@app.post("/api/positions/clear")
+async def clear_positions_endpoint() -> Dict[str, Any]:
+    """Clear simulated paper positions from the active desk."""
+    cleared = bot.binance_client.clear_paper_positions()
+    return {"status": "success", "cleared_count": cleared}
+
+
 def _persist_config_to_env(req: ConfigUpdateRequest) -> None:
     """Helper to update local .env file with non-empty configuration entries."""
     env_path = Path(".env")
@@ -630,7 +637,10 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         logger.info(f"Target timeframe updated to: {bot.target_timeframe}")
 
     if req.paper_trading is not None:
+        prev_mode = bot.binance_client.paper_trading
         bot.binance_client.paper_trading = req.paper_trading
+        if prev_mode and not req.paper_trading:
+            bot.binance_client.clear_paper_positions()
         logger.info(f"Updated Paper Trading mode to: {req.paper_trading}")
 
     if req.binance_api_key is not None and req.binance_api_key.strip():
