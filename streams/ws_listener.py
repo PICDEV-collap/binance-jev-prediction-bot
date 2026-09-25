@@ -87,6 +87,12 @@ class BinanceWSListener:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._http_session: Optional[aiohttp.ClientSession] = None
 
+        # Network Health & Liveness Prober
+        self._latency_ms: float = 0.0
+        self._network_healthy: bool = True
+        self._max_stale_seconds: float = 5.0
+        self._network_liveness_task: Optional[asyncio.Task] = None
+
         # Reconnect parameters
         self._base_backoff: float = 1.0
         self._backoff_factor: float = 1.8
@@ -105,7 +111,7 @@ class BinanceWSListener:
         self._btc_momentum: float = 0.0
 
     async def start(self) -> None:
-        """Start the WebSocket listener and background watchdog loop."""
+        """Start the WebSocket listener, watchdog, and network health prober."""
         if self._running:
             logger.warning("WebSocket listener already running.")
             return
@@ -121,6 +127,7 @@ class BinanceWSListener:
             )
             self._listener_task = asyncio.create_task(self._connection_supervisor())
             self._watchdog_task = asyncio.create_task(self._watchdog_rest_poller())
+            self._network_liveness_task = asyncio.create_task(self._network_liveness_prober())
 
     async def stop(self) -> None:
         """Gracefully stop the listener, watchdog, and close sockets."""
@@ -142,6 +149,13 @@ class BinanceWSListener:
             self._watchdog_task.cancel()
             try:
                 await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._network_liveness_task and not self._network_liveness_task.done():
+            self._network_liveness_task.cancel()
+            try:
+                await self._network_liveness_task
             except asyncio.CancelledError:
                 pass
 
@@ -293,6 +307,7 @@ class BinanceWSListener:
     async def _safe_dispatch_event(self, context: MarketContext) -> None:
         """Execute callback inside a protected non-blocking task."""
         try:
+            context.is_stale = (self.network_state == "OFFLINE")
             if self.on_market_event:
                 await self.on_market_event(context)
         except Exception as e:
@@ -544,6 +559,56 @@ class BinanceWSListener:
 
                 await asyncio.sleep(2.0)
 
+    async def _network_liveness_prober(self) -> None:
+        """
+        Active Network Liveness & Latency Prober.
+        Periodically pings Binance REST API endpoint every 3 seconds to measure
+        real round-trip network latency and actively detect disconnection/packet drop.
+        """
+        logger.info("Active Network Liveness & Latency Prober started.")
+        ping_url = "https://api.binance.com/api/v3/ping"
+        await asyncio.sleep(1.0)
+
+        while self._running:
+            try:
+                if self._http_session and not self._http_session.closed:
+                    t0 = time.perf_counter()
+                    async with self._http_session.get(ping_url, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
+                        if resp.status == 200:
+                            t1 = time.perf_counter()
+                            self._latency_ms = round((t1 - t0) * 1000.0, 1)
+                            self._network_healthy = True
+                        else:
+                            self._network_healthy = False
+            except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+                self._network_healthy = False
+                logger.warning(f"[NETWORK PROBER] Network probe failed or timed out: {net_err}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._network_healthy = False
+                logger.debug(f"[NETWORK PROBER] Liveness probe error: {e}")
+
+            await asyncio.sleep(3.0)
+
+    @property
+    def network_state(self) -> str:
+        """
+        Tri-state network liveness for fail-safe trading protection:
+        - ONLINE: Low-latency connection, WebSocket active, fresh market data.
+        - DEGRADED: WebSocket reconnecting, but REST watchdog poller is maintaining data.
+        - OFFLINE: Connection timed out (>5s silence) or internet probe failed.
+        """
+        if self.enable_mock_stream:
+            return "ONLINE"
+        now = time.time()
+        age = (now - self._last_event_time) if self._last_event_time > 0 else 0.0
+        if not self._network_healthy or (self._last_event_time > 0 and age > self._max_stale_seconds):
+            return "OFFLINE"
+        if self.state == ConnectionState.CONNECTED:
+            return "ONLINE"
+        return "DEGRADED"
+
     def get_active_markets(self) -> List[Dict[str, Any]]:
         """
         Return snapshot of currently active prediction markets across all assets and timeframes.
@@ -552,6 +617,7 @@ class BinanceWSListener:
         now = time.time()
         tf_dict = dict(TIMEFRAMES)
         active_list: List[MarketContext] = []
+        is_net_stale = (self.network_state == "OFFLINE")
 
         # Prune older round base prices to avoid memory growth
         if len(self._round_base_prices) > 300:
@@ -572,6 +638,7 @@ class BinanceWSListener:
                     m.target_price = self._round_base_prices[expected_round_id]
 
             m.time_left_seconds = time_left
+            m.is_stale = is_net_stale
             active_list.append(m)
 
         sym_order = {s: i for i, s in enumerate(SUPPORTED_SYMBOLS)}
@@ -585,9 +652,16 @@ class BinanceWSListener:
 
     @property
     def metrics(self) -> Dict[str, Any]:
-        """WebSocket connection telemetry."""
+        """WebSocket & Network connection telemetry."""
+        age = round(time.time() - self._last_event_time, 2) if self._last_event_time > 0 else 0.0
+        net_state = self.network_state
         return {
             "state": self.state.value,
+            "network_state": net_state,
+            "latency_ms": self._latency_ms,
+            "network_healthy": self._network_healthy,
+            "last_packet_age_seconds": age,
+            "is_stale": (net_state == "OFFLINE"),
             "stream_url": self.stream_url,
             "mock_mode": self.enable_mock_stream,
             "messages_received": self._messages_received,

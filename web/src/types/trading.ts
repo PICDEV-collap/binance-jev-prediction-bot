@@ -177,6 +177,13 @@ export interface SystemStatus {
     evaluated_rounds_count: number;
     evaluation_policy: string;
   };
+  network_health?: {
+    state: 'ONLINE' | 'DEGRADED' | 'OFFLINE';
+    latency_ms: number;
+    network_healthy: boolean;
+    last_packet_age_seconds: number;
+    is_stale: boolean;
+  };
 }
 
 export interface TelemetryRecord {

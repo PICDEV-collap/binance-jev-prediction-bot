@@ -10,7 +10,9 @@ import {
   Cpu, 
   Radio, 
   User, 
-  LogOut 
+  LogOut,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
 import { SystemStatus } from '../types/trading';
 
@@ -40,6 +42,7 @@ export const Header: React.FC<HeaderProps> = ({
   const isPaper = status?.trading_mode !== 'LIVE_TRADING';
   const circuitTripped = status?.risk_guard?.circuit_breaker_active ?? false;
   const wsState = status?.ws_stream?.state ?? (isConnected ? 'CONNECTED' : 'CONNECTING');
+  const netHealth = status?.network_health;
 
   return (
     <header className="border-b border-slate-800/80 bg-[#080d1a]/90 backdrop-blur-md sticky top-0 z-50 px-4 lg:px-8 py-3.5">
@@ -99,6 +102,37 @@ export const Header: React.FC<HeaderProps> = ({
           }`}>
             <span className={`w-2 h-2 rounded-full ${isPaper ? 'bg-amber-400' : 'bg-emerald-400'}`} />
             <span>{isPaper ? 'PAPER' : 'LIVE'}</span>
+          </div>
+
+          {/* Network Liveness & Health Indicator */}
+          <div 
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono font-medium transition-colors ${
+              netHealth?.state === 'OFFLINE'
+                ? 'bg-rose-500/15 border-rose-500 text-rose-300 animate-pulse'
+                : netHealth?.state === 'DEGRADED'
+                ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
+                : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+            }`}
+            title={
+              netHealth?.state === 'OFFLINE'
+                ? 'Network disconnected or stale data >5s. Trading frozen for capital safety.'
+                : netHealth?.state === 'DEGRADED'
+                ? `WebSocket reconnecting. REST Watchdog poller active (${netHealth.latency_ms}ms).`
+                : `Binance stream and REST connection healthy (${netHealth?.latency_ms ?? 25}ms).`
+            }
+          >
+            {netHealth?.state === 'OFFLINE' ? (
+              <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+            ) : (
+              <Wifi className={`w-3.5 h-3.5 ${netHealth?.state === 'DEGRADED' ? 'text-amber-400 animate-pulse' : 'text-emerald-400'}`} />
+            )}
+            <span>
+              {netHealth?.state === 'OFFLINE'
+                ? 'NET OFFLINE (FROZEN)'
+                : netHealth?.state === 'DEGRADED'
+                ? `REST BACKUP ${netHealth.latency_ms > 0 ? `(${netHealth.latency_ms}ms)` : ''}`
+                : `NET ${netHealth?.latency_ms ? `${netHealth.latency_ms}ms` : 'ONLINE'}`}
+            </span>
           </div>
 
           {/* Circuit Breaker Warning (if tripped) */}

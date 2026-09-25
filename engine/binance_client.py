@@ -85,10 +85,12 @@ class BinanceClient:
         self,
         api_key: str = "",
         api_secret: str = "",
-        base_url: str = "https://fapi.binance.com",
+        base_url: str = "https://api.binance.com",
         recv_window: int = 5000,
         paper_trading: bool = True,
         slippage_tolerance: float = 0.03,
+        funding_source: str = "CEX",
+        slippage_bps: int = 1000,
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -96,11 +98,14 @@ class BinanceClient:
         self.recv_window = recv_window
         self.paper_trading = paper_trading
         self.slippage_tolerance = slippage_tolerance
+        self.funding_source = funding_source
+        self.slippage_bps = slippage_bps
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._time_offset_ms: int = 0
         self._total_orders_dispatched: int = 0
         self._total_fills: int = 0
+        self._in_flight_orders: Dict[str, Dict[str, Any]] = {}
 
         # Simulated Paper Trading State
         self._paper_balance_usdt: float = 1000.0  # Starting mock wallet
@@ -149,17 +154,30 @@ class BinanceClient:
         """Synchronize client with Binance server time to prevent timestamp drift."""
         try:
             assert self._session is not None
-            url = f"{self.base_url}/fapi/v1/time"
+            # Try core spot/general time endpoint first, fall back to fapi if needed
+            url = f"{self.base_url}/api/v3/time"
             t0 = int(time.time() * 1000)
             async with self._session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     t1 = int(time.time() * 1000)
                     server_time = data.get("serverTime", t1)
-                    # Round-trip latency estimation
                     one_way_latency = (t1 - t0) // 2
                     self._time_offset_ms = server_time - (t1 - one_way_latency)
-                    logger.info(f"Binance server time synced. Offset: {self._time_offset_ms}ms")
+                    logger.info(f"Binance server time synced via /api/v3/time. Offset: {self._time_offset_ms}ms")
+                    return
+                elif resp.status == 404:
+                    # Fallback to fapi time
+                    fallback_url = f"{self.base_url}/fapi/v1/time"
+                    async with self._session.get(fallback_url) as fresp:
+                        if fresp.status == 200:
+                            fdata = await fresp.json()
+                            t1 = int(time.time() * 1000)
+                            server_time = fdata.get("serverTime", t1)
+                            one_way_latency = (t1 - t0) // 2
+                            self._time_offset_ms = server_time - (t1 - one_way_latency)
+                            logger.info(f"Binance server time synced via /fapi/v1/time. Offset: {self._time_offset_ms}ms")
+                            return
         except Exception as e:
             logger.warning(f"Could not sync Binance server time ({e}). Using local clock.")
             self._time_offset_ms = 0
@@ -217,28 +235,42 @@ class BinanceClient:
         if self._session is None or self._session.closed:
             await self.start()
 
-        # Map side to Binance prediction contract side
-        order_side = "BUY"
+        # Map side to Binance prediction contract outcome
         prediction_choice = "UP" if ("UP" in side.upper() or "YES" in side.upper()) else "DOWN"
 
-        params = {
-            "symbol": symbol,
-            "side": order_side,
-            "predictionSide": prediction_choice,
+        # Parameters for official Binance Prediction Trading API (place-order-bundle)
+        order_payload = {
+            "orderType": "MARKET",
+            "slippageBps": self.slippage_bps,
+            "fundingSource": self.funding_source,
             "marketId": market_id,
-            "quantity": contracts,
-            "price": f"{target_price:.4f}",
-            "newClientOrderId": client_order_id,
+            "outcome": prediction_choice,
+            "amount": f"{contracts * target_price:.4f}",
+            "clientOrderId": client_order_id,
+        }
+
+        query_params = {
             "recvWindow": self.recv_window,
             "timestamp": self._get_timestamp(),
         }
 
-        signed_query = self._sign_payload(params)
-        endpoint_url = f"{self.base_url}/sapi/v1/prediction/order?{signed_query}"
+        signed_query = self._sign_payload(query_params)
+        endpoint_url = f"{self.base_url}/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle?{signed_query}"
+
+        # Register in-flight order for idempotency and network reconciliation
+        self._in_flight_orders[client_order_id] = {
+            "market_id": market_id,
+            "symbol": symbol,
+            "side": side,
+            "contracts": contracts,
+            "price": target_price,
+            "dispatched_at": time.time(),
+            "status": "DISPATCHING",
+        }
 
         try:
             assert self._session is not None
-            async with self._session.post(endpoint_url) as resp:
+            async with self._session.post(endpoint_url, json=order_payload) as resp:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                 response_data = await resp.json()
 
@@ -260,14 +292,15 @@ class BinanceClient:
                     self._total_orders_dispatched += 1
                     self._total_fills += 1
                     self._order_history.append(result)
+                    self._in_flight_orders.pop(client_order_id, None)
                     logger.info(
-                        f"LIVE ORDER EXECUTED: {side} {contracts}x on {market_id} [{stage}] "
+                        f"LIVE PREDICTION ORDER EXECUTED: {side} {contracts}x on {market_id} [{stage}] "
                         f"@ {target_price:.3f} (Latency: {elapsed_ms:.1f}ms)"
                     )
                     return result
                 else:
                     err_msg = response_data.get("msg", f"HTTP {resp.status}")
-                    logger.error(f"Binance Order Rejected: {err_msg}")
+                    logger.error(f"Binance Prediction Order Rejected: {err_msg}")
                     result = OrderResult(
                         order_id="FAILED",
                         client_order_id=client_order_id,
@@ -284,11 +317,38 @@ class BinanceClient:
                     )
                     self._total_orders_dispatched += 1
                     self._order_history.append(result)
+                    self._in_flight_orders.pop(client_order_id, None)
                     return result
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            logger.error(
+                f"[NETWORK DISCONNECT/TIMEOUT] Order {client_order_id} failed during network dispatch: {net_err}. "
+                f"Tagging order as TIMED_OUT_UNVERIFIED to avoid duplicate placement."
+            )
+            if client_order_id in self._in_flight_orders:
+                self._in_flight_orders[client_order_id]["status"] = "TIMED_OUT"
+            result = OrderResult(
+                order_id="TIMEOUT",
+                client_order_id=client_order_id,
+                market_id=market_id,
+                symbol=symbol,
+                side=side,
+                contracts=contracts,
+                price=target_price,
+                status="REJECTED",
+                latency_ms=round(elapsed_ms, 2),
+                martingale_step=martingale_step,
+                stage=stage,
+                error_message=f"Network Disconnection/Timeout: {net_err}"
+            )
+            self._order_history.append(result)
+            return result
 
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             logger.error(f"Binance order dispatch exception: {e}")
+            self._in_flight_orders.pop(client_order_id, None)
             result = OrderResult(
                 order_id="ERROR",
                 client_order_id=client_order_id,
@@ -583,7 +643,7 @@ class BinanceClient:
         }
 
     async def fetch_live_balance(self) -> Optional[Dict[str, float]]:
-        """Fetch real-time futures wallet balance from Binance FAPI."""
+        """Fetch real-time USDT wallet balance for Prediction trading."""
         if self.paper_trading or not (self.api_key and self.api_secret):
             return None
         if self._session is None or self._session.closed:
@@ -594,25 +654,47 @@ class BinanceClient:
                 "timestamp": self._get_timestamp(),
             }
             signed_query = self._sign_payload(params)
-            url = f"{self.base_url}/fapi/v2/balance?{signed_query}"
+
+            # Try Binance Spot Account API first (for CEX USDT funding)
+            spot_url = f"{self.base_url}/api/v3/account?{signed_query}"
             assert self._session is not None
-            async with self._session.get(url) as resp:
+            async with self._session.get(spot_url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if isinstance(data, list):
-                        for item in data:
-                            if item.get("asset") == "USDT":
-                                balance = float(item.get("balance", 0.0))
-                                available = float(item.get("availableBalance", 0.0))
-                                unrealized = float(item.get("crossUnPnl", 0.0))
-                                self._live_balance_usdt = balance
-                                self._live_available_usdt = available
-                                self._live_unrealized_usdt = unrealized
-                                return {
-                                    "balance": balance,
-                                    "available": available,
-                                    "unrealized": unrealized,
-                                }
+                    balances = data.get("balances", [])
+                    for item in balances:
+                        if item.get("asset") == "USDT":
+                            free = float(item.get("free", 0.0))
+                            locked = float(item.get("locked", 0.0))
+                            total = free + locked
+                            self._live_balance_usdt = total
+                            self._live_available_usdt = free
+                            self._live_unrealized_usdt = 0.0
+                            return {
+                                "balance": total,
+                                "available": free,
+                                "unrealized": 0.0,
+                            }
+                elif resp.status == 404:
+                    # Fallback to Futures FAPI balance
+                    fapi_url = f"{self.base_url}/fapi/v2/balance?{signed_query}"
+                    async with self._session.get(fapi_url) as fresp:
+                        if fresp.status == 200:
+                            fdata = await fresp.json()
+                            if isinstance(fdata, list):
+                                for item in fdata:
+                                    if item.get("asset") == "USDT":
+                                        balance = float(item.get("balance", 0.0))
+                                        available = float(item.get("availableBalance", 0.0))
+                                        unrealized = float(item.get("crossUnPnl", 0.0))
+                                        self._live_balance_usdt = balance
+                                        self._live_available_usdt = available
+                                        self._live_unrealized_usdt = unrealized
+                                        return {
+                                            "balance": balance,
+                                            "available": available,
+                                            "unrealized": unrealized,
+                                        }
         except Exception as e:
             logger.warning(f"Could not fetch Binance live balance: {e}")
         return None

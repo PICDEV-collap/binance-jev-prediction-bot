@@ -116,6 +116,8 @@ class TradingBotCoordinator:
             recv_window=settings.binance_recv_window,
             paper_trading=settings.paper_trading,
             slippage_tolerance=settings.slippage_tolerance,
+            funding_source=getattr(settings, "funding_source", "CEX"),
+            slippage_bps=getattr(settings, "slippage_bps", 1000),
         )
 
         self.risk_guard = RiskGuard(
@@ -406,6 +408,13 @@ class TradingBotCoordinator:
                 "target_timeframe": self.target_timeframe,
                 "evaluated_rounds_count": len(self.evaluated_rounds),
                 "evaluation_policy": "1x_per_round",
+            },
+            "network_health": {
+                "state": self.ws_listener.metrics.get("network_state", "ONLINE"),
+                "latency_ms": self.ws_listener.metrics.get("latency_ms", 0.0),
+                "network_healthy": self.ws_listener.metrics.get("network_healthy", True),
+                "last_packet_age_seconds": self.ws_listener.metrics.get("last_packet_age_seconds", 0.0),
+                "is_stale": self.ws_listener.metrics.get("is_stale", False),
             },
             "ws_stream": self.ws_listener.metrics,
             "jev_ai": self.jev_client.stats,

@@ -104,6 +104,7 @@ class RiskGuard:
             "INVALID_PRICING": 0,
             "EXPIRY_DANGER": 0,
             "CONTRADICTION_RISK": 0,
+            "NETWORK_OFFLINE": 0,
         }
 
     def get_symbol_martingale_step(self, symbol: Optional[str] = None) -> int:
@@ -210,6 +211,26 @@ class RiskGuard:
         effective_threshold = self.get_effective_confidence_threshold(sym)
         stage_label = self.get_stage_label(sym)
         multiplier = self.martingale_multiplier ** step if (self.martingale_enabled and step > 0) else 1.0
+
+        # Gate 0A: Network Liveness & Data Freshness (Network Disconnection Protection)
+        if getattr(market, "is_stale", False) or getattr(market, "network_offline", False):
+            self._record_rejection("NETWORK_OFFLINE")
+            logger.warning(
+                f"[RISK REJECT] Network Disconnection / Stale Data Protection active for {market.symbol}! "
+                f"Market tick is stale or network connection degraded. Capital preserved."
+            )
+            return RiskEvaluationResult(
+                approved=False,
+                reason="NETWORK_OFFLINE: Market data is stale or network disconnected. Freezing trading to protect capital.",
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
+            )
 
         # Gate 0: Signal is PASS
         if decision.action == "PASS":

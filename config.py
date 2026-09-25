@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     binance_api_key: str = Field(default="", alias="BINANCE_API_KEY")
     binance_api_secret: str = Field(default="", alias="BINANCE_API_SECRET")
     binance_prediction_base_url: str = Field(
-        default="https://fapi.binance.com",
+        default="https://api.binance.com",
         alias="BINANCE_PREDICTION_BASE_URL"
     )
     binance_prediction_ws_url: str = Field(
@@ -40,6 +40,18 @@ class Settings(BaseSettings):
     target_symbol: str = Field(default="BTCUSDT", alias="TARGET_SYMBOL")
     target_timeframe: str = Field(default="15m", alias="TARGET_TIMEFRAME")
     evaluations_per_round: int = Field(default=1, alias="EVALUATIONS_PER_ROUND")
+
+    # --- Binance Prediction Trading & Network Resilience ---
+    funding_source: str = Field(default="CEX", alias="FUNDING_SOURCE")  # "CEX" or "MPC"
+    slippage_bps: int = Field(default=1000, alias="SLIPPAGE_BPS")        # 10% auto-slippage
+    network_heartbeat_interval_seconds: float = Field(
+        default=3.0,
+        alias="NETWORK_HEARTBEAT_INTERVAL_SECONDS"
+    )
+    max_stale_data_seconds: float = Field(
+        default=5.0,
+        alias="MAX_STALE_DATA_SECONDS"
+    )
 
     # --- Jev AI Decision Engine Configuration ---
     jev_ai_api_key: str = Field(default="", alias="JEV_AI_API_KEY")
