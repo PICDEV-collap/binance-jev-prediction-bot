@@ -183,18 +183,56 @@ def check_expiry_danger(
     price_diff: float,
     atr_1m: float,
     danger_threshold_seconds: int = 60,
-    proximity_ratio: float = 0.35,
+    proximity_ratio: float = 0.40,
+    min_oracle_noise_buffer: float = 2.0,
 ) -> bool:
     """
-    Detect Gamma Risk / Expiry Danger Zone:
-    When expiration is imminent (< 60s) and price is dangerously close to strike (< 35% of 1m ATR).
-    Entering during this window is highly probabilistic noise (coin-flip).
+    Detect Gamma Risk / Expiry Danger Zone & Chainlink Oracle Jitter:
+    When expiration is imminent (< 60s) and price is dangerously close to strike (< 40% of 1m ATR or < min_oracle_noise_buffer).
+    Entering during this window is highly probabilistic noise and prone to Oracle resolution jitter.
     """
     if time_left_seconds > danger_threshold_seconds:
         return False
     
-    threshold_dist = max(0.01, atr_1m * proximity_ratio)
+    threshold_dist = max(min_oracle_noise_buffer, atr_1m * proximity_ratio)
     return abs(price_diff) <= threshold_dist
+
+
+def check_unrealistic_velocity(
+    action: str,
+    spot_price: float,
+    strike_price: float,
+    time_left_seconds: int,
+    atr_1m: float,
+    max_velocity_multiplier: float = 1.8,
+) -> tuple[bool, float, float]:
+    """
+    Check if the trade is betting on an underdog that requires an unrealistic price velocity
+    to reach and cross the strike before time runs out.
+    Returns (is_unrealistic, required_velocity_per_min, max_allowed_velocity_per_min).
+    """
+    if time_left_seconds <= 0 or time_left_seconds > 180:
+        return False, 0.0, 0.0
+
+    is_up = action in ("UP", "BUY_YES")
+    is_down = action in ("DOWN", "BUY_NO")
+
+    # Target distance needed to flip ITM
+    if is_up and spot_price < strike_price:
+        distance = strike_price - spot_price
+    elif is_down and spot_price > strike_price:
+        distance = spot_price - strike_price
+    else:
+        # Already ITM (in-the-money), doesn't need to chase
+        return False, 0.0, 0.0
+
+    required_speed_per_sec = distance / float(time_left_seconds)
+    required_speed_per_min = required_speed_per_sec * 60.0
+    effective_atr = max(0.5, atr_1m)
+    max_allowed_speed = effective_atr * max_velocity_multiplier
+
+    is_unrealistic = required_speed_per_min > max_allowed_speed
+    return is_unrealistic, round(required_speed_per_min, 2), round(max_allowed_speed, 2)
 
 
 def classify_market_regime(

@@ -500,19 +500,29 @@ class BinanceClient:
             spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
             cost = pos.contracts * pos.entry_price
 
-            # Binary outcome settlement: $1.00 per contract
-            if pos.side in ("UP", "BUY_YES"):
-                won = spot >= pos.target_price
-            else:
-                won = spot < pos.target_price
-
-            if won:
-                payout = pos.contracts * 1.00
+            # Binary outcome settlement according to official Binance Prediction Rules:
+            # Rule: If final price > strike -> UP wins ($1.00); if < strike -> DOWN wins ($1.00); if equal -> 50-50 ($0.50 payout)
+            is_tie = abs(spot - pos.target_price) < 1e-4
+            if is_tie:
+                payout = pos.contracts * 0.50
                 realized_pnl = payout - cost
                 self._paper_balance_usdt += payout
-            else:
-                payout = 0.0
-                realized_pnl = -cost
+                won = (realized_pnl >= 0)
+                outcome_label = "TIE (50-50)"
+            elif pos.side in ("UP", "BUY_YES"):
+                won = spot > pos.target_price
+                payout = pos.contracts * 1.00 if won else 0.0
+                realized_pnl = payout - cost
+                if won:
+                    self._paper_balance_usdt += payout
+                outcome_label = "WIN" if won else "LOSS"
+            else:  # DOWN
+                won = spot < pos.target_price
+                payout = pos.contracts * 1.00 if won else 0.0
+                realized_pnl = payout - cost
+                if won:
+                    self._paper_balance_usdt += payout
+                outcome_label = "WIN" if won else "LOSS"
 
             total_net_pnl += realized_pnl
 
@@ -527,7 +537,7 @@ class BinanceClient:
                 target_price=pos.target_price,
                 settlement_price=spot,
                 timeframe=pos.timeframe,
-                result="WIN" if won else "LOSS",
+                result=outcome_label,
                 realized_pnl=round(realized_pnl, 2),
                 martingale_step=pos.martingale_step,
                 stage=pos.stage,

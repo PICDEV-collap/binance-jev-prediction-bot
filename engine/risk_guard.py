@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple, Any
 from pydantic import BaseModel, Field
 
 from .jev_client import JevEvaluationResult, MarketContext
+from engine.indicators import check_unrealistic_velocity
 
 logger = logging.getLogger("risk_guard")
 
@@ -105,6 +106,8 @@ class RiskGuard:
             "EXPIRY_DANGER": 0,
             "CONTRADICTION_RISK": 0,
             "NETWORK_OFFLINE": 0,
+            "NEGATIVE_EV_RISK": 0,
+            "UNREALISTIC_VELOCITY_RISK": 0,
         }
 
     def get_symbol_martingale_step(self, symbol: Optional[str] = None) -> int:
@@ -343,6 +346,37 @@ class RiskGuard:
                 effective_threshold=effective_threshold
             )
 
+        # Gate 2.7: Time-Decay & Required Price Velocity Gate
+        # Prevent hopeless underdog bets where price needs impossible speed to cross strike
+        atr_val = getattr(market, "atr_1m", 1.0)
+        is_unrealistic, req_speed, max_allowed = check_unrealistic_velocity(
+            action=decision.action,
+            spot_price=market.underlying_price,
+            strike_price=market.target_price,
+            time_left_seconds=market.time_left_seconds,
+            atr_1m=atr_val,
+            max_velocity_multiplier=1.8,
+        )
+        if is_unrealistic:
+            self._record_rejection("UNREALISTIC_VELOCITY_RISK")
+            velocity_reason = (
+                f"Unrealistic Velocity Risk: Trade requires price to move at ${req_speed:.1f}/min "
+                f"(max plausible: ${max_allowed:.1f}/min from ATR) with only {market.time_left_seconds}s remaining."
+            )
+            logger.info(f"[RISK FILTER] {velocity_reason} for {market.market_id}. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=velocity_reason,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
+            )
+
         # Gate 3: Cooldown Throttle per Market
         last_trade_time = self._market_last_traded.get(market.market_id, 0.0)
         elapsed_since_last_trade = now - last_trade_time
@@ -391,6 +425,33 @@ class RiskGuard:
                     f"Entry price {target_price:.3f} outside safe odds bounds "
                     f"(0.02 - {self.max_odds_cap:.2f})"
                 ),
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                target_price=target_price,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
+
+        # Gate 5.5: Expected Value (EV) Gate
+        # In Binary Prediction Markets, winning payout is $1.00 per contract.
+        # Cost = target_price. EV = (Confidence * $1.00) - target_price.
+        # Must have a positive edge (EV >= +0.02, or at least +2% edge over market odds).
+        expected_value = (decision.confidence * 1.00) - target_price
+        min_ev_edge = 0.02
+        if expected_value < min_ev_edge:
+            self._record_rejection("NEGATIVE_EV_RISK")
+            ev_reason = (
+                f"Negative/Low Expected Value Filter: EV is {expected_value:+.3f} (Edge: {expected_value*100:+.1f}%). "
+                f"Market price {target_price:.3f} is too expensive for conviction {decision.confidence*100:.0f}%."
+            )
+            logger.info(f"[RISK FILTER] {ev_reason} for {market.market_id}. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=ev_reason,
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,

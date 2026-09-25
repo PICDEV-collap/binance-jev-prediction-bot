@@ -139,6 +139,91 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
         self.assertEqual(result.contracts, 10)
         self.assertTrue(any(p.market_id == "BTCUSDT-5M-R1000" for p in client._paper_positions.values()))
 
+    def test_50_50_tie_resolution(self):
+        """Verify official Binance 50-50 tie resolution when settlement spot equals strike price."""
+        import asyncio
+        client = BinanceClient(paper_trading=True)
+
+        async def run_settle():
+            await client.place_prediction_order(
+                market_id="BTCUSDT-5M-TIE-ROUND",
+                symbol="BTCUSDT",
+                side="UP",
+                contracts=10,
+                target_price=0.50,
+                strike_price=84000.0,
+                spot_price=84000.0,
+            )
+            # Simulate round ending where spot is exactly equal to strike (84000.0)
+            pnl, events = client.settle_expired_positions(
+                active_market_ids={"NEW_ROUND"},
+                current_prices={"BTCUSDT": 84000.0}
+            )
+            return pnl, events
+
+        net_pnl, events = asyncio.run(run_settle())
+        self.assertEqual(len(events), 1)
+        # Cost was 10 * 0.50 = 5.0. Payout at 50-50 is 10 * 0.50 = 5.0 -> Net PnL = 0.0
+        self.assertEqual(net_pnl, 0.0)
+        self.assertEqual(events[0]["won"], True)
+        self.assertEqual(client._closed_positions[-1].result, "TIE (50-50)")
+
+    def test_negative_ev_rejection_and_positive_ev_approval(self):
+        """Verify Expected Value (EV) Gate rejects overpriced bets and approves positive edge bets."""
+        # Case 1: Overpriced bet (Market price 0.85, Confidence 0.82 -> EV = 0.82 - 0.85 = -0.03)
+        overpriced_market = self.fresh_market.model_copy(update={"odds_yes": 0.85})
+        decision = JevEvaluationResult(
+            action="UP",
+            confidence=0.82,
+            reasoning="Moderate edge, but price in market is very expensive.",
+            model="jev-latest",
+            latency_ms=100.0,
+        )
+        res_neg = self.risk_guard.validate_and_size_order(
+            decision=decision,
+            market=overpriced_market,
+            current_open_positions_count=0
+        )
+        self.assertFalse(res_neg.approved)
+        self.assertIn("Expected Value", res_neg.reason)
+        self.assertGreater(self.risk_guard._rejection_counts["NEGATIVE_EV_RISK"], 0)
+
+        # Case 2: Positive edge bet (Market price 0.55, Confidence 0.85 -> EV = 0.85 - 0.55 = +0.30 >= 0.02)
+        cheap_market = self.fresh_market.model_copy(update={"odds_yes": 0.55})
+        res_pos = self.risk_guard.validate_and_size_order(
+            decision=decision,
+            market=cheap_market,
+            current_open_positions_count=0
+        )
+        self.assertTrue(res_pos.approved)
+
+    def test_unrealistic_velocity_rejection(self):
+        """Verify that chasing an underdog with impossible speed needed is rejected."""
+        # Price is $166 below strike ($83,938 vs $84,104) with only 120s left and 1m ATR = $30
+        underdog_market = self.fresh_market.model_copy(update={
+            "underlying_price": 83938.0,
+            "target_price": 84104.0,
+            "time_left_seconds": 120,
+            "atr_1m": 30.0,
+            "odds_yes": 0.04,
+        })
+        chase_decision = JevEvaluationResult(
+            action="UP",
+            confidence=0.85,
+            reasoning="AI hallucinating reversal while remaining time is only 2 minutes.",
+            model="jev-latest",
+            latency_ms=100.0,
+        )
+        res = self.risk_guard.validate_and_size_order(
+            decision=chase_decision,
+            market=underdog_market,
+            current_open_positions_count=0
+        )
+        self.assertFalse(res.approved)
+        self.assertIn("Unrealistic Velocity", res.reason)
+        self.assertGreater(self.risk_guard._rejection_counts["UNREALISTIC_VELOCITY_RISK"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
