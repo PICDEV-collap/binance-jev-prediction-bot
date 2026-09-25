@@ -390,7 +390,8 @@ class BinanceClient:
 
         # 3. Parameters for official Binance Prediction Trading API (place-order-bundle)
         query_params = {
-            "accountType": "CeDeFi",
+            "accountType": "SPOT",
+            "fundingSource": "MPC",
             "orderType": "MARKET",
             "quoteId": quote_id,
             "slippageBps": self.slippage_bps,
