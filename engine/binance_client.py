@@ -654,11 +654,7 @@ class BinanceClient:
         Settle prediction contracts whose round has ended.
         Picks up final settlement: $1.00 USDT payout per winning contract.
         Settles based on both active market ID rotation AND elapsed round duration.
-        Returns tuple of (total_net_pnl, settled_events).
         """
-        if not self.paper_trading:
-            return 0.0, []
-
         now = time.time()
         tf_durations = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
         total_net_pnl = 0.0
@@ -743,6 +739,13 @@ class BinanceClient:
                     "stage": pos.stage,
                     "mode": mode_label,
                 })
+
+                if mode_label == "LIVE":
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self.fetch_live_balance())
+                    except RuntimeError:
+                        pass
 
                 logger.info(
                     f"[{mode_label} SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
