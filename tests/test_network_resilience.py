@@ -3,6 +3,12 @@ Unit tests for Binance Official Prediction Markets alignment
 and Network Disconnection & Fault Tolerance Protection System.
 """
 
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import unittest
 import time
 from unittest.mock import MagicMock, AsyncMock, patch

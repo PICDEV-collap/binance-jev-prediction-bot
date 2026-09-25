@@ -125,6 +125,8 @@ class BinanceClient:
         self._live_positions: Dict[str, PositionInfo] = {}
         self._wallet_address: str = "0x8bd02cfadc1065dba4db288997ea24d26a788936"
         self._wallet_id: str = "a34494abf3d7403796af191a0accdd86"
+        self._prediction_market_cache: Dict[str, Any] = {}
+        self._prediction_cache_timestamp: float = 0.0
 
     async def start(self) -> None:
         """Initialize session with persistent connection pooling and sync time."""
@@ -204,17 +206,92 @@ class BinanceClient:
         ).hexdigest()
         return f"{query_str}&signature={signature}"
 
+    async def fetch_prediction_market_topics(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Fetch active prediction market topics from Binance Web3 Prediction SAPI."""
+        now = time.time()
+        if not force_refresh and self._prediction_market_cache and (now - self._prediction_cache_timestamp < 15.0):
+            return self._prediction_market_cache.get("marketTopics", [])
+
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/market/list?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._prediction_market_cache = data
+                    self._prediction_cache_timestamp = now
+                    return data.get("marketTopics", [])
+                else:
+                    logger.warning(f"Failed to fetch prediction market list: HTTP {resp.status}")
+        except Exception as e:
+            logger.warning(f"Exception fetching prediction market list: {e}")
+        return self._prediction_market_cache.get("marketTopics", [])
+
+    async def get_prediction_quote(
+        self,
+        token_id: str,
+        amount_wei: str,
+        side: str = "BUY",
+        order_type: str = "MARKET",
+        slippage_bps: int = 100,
+    ) -> Optional[Dict[str, Any]]:
+        """Get execution quote from Binance Prediction Trading API."""
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "amountIn": amount_wei,
+            "orderType": order_type,
+            "side": side,
+            "slippageBps": slippage_bps,
+            "tokenId": token_id,
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        if self._wallet_address:
+            query_params["walletAddress"] = self._wallet_address
+        if self._wallet_id:
+            query_params["walletId"] = self._wallet_id
+
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/trade/get-quote?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.post(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    return data
+                else:
+                    logger.warning(f"Failed to get prediction quote: HTTP {resp.status} - {data}")
+                    return data
+        except Exception as e:
+            logger.error(f"Exception requesting prediction quote: {e}")
+            return None
+
     async def place_prediction_order(
         self,
         market_id: str,
         symbol: str,
-        side: str,  # "BUY_YES" or "BUY_NO"
+        side: str,  # "BUY_YES" or "BUY_NO" / "UP" or "DOWN"
         contracts: int,
         target_price: float,
         strike_price: float = 0.0,
         spot_price: float = 0.0,
         martingale_step: int = 0,
         stage: str = "ไม้ 1 (Base)",
+        timeframe: str = "5m",
     ) -> OrderResult:
         """
         Execute an order on Binance Prediction Markets.
@@ -245,19 +322,79 @@ class BinanceClient:
 
         # Map side to Binance prediction contract outcome
         prediction_choice = "UP" if ("UP" in side.upper() or "YES" in side.upper()) else "DOWN"
+        clean_side = "UP" if prediction_choice == "UP" else "DOWN"
 
-        # Parameters for official Binance Prediction Trading API (place-order-bundle)
-        order_payload = {
-            "orderType": "MARKET",
-            "slippageBps": self.slippage_bps,
-            "fundingSource": self.funding_source,
-            "marketId": market_id,
-            "outcome": prediction_choice,
-            "amount": f"{contracts * target_price:.4f}",
-            "clientOrderId": client_order_id,
-        }
+        # 1. Resolve active prediction market topic and outcome token ID
+        topics = await self.fetch_prediction_market_topics()
+        token_id: Optional[str] = None
+        for t in topics:
+            if t.get("symbol") == symbol or (symbol.startswith("BTC") and t.get("symbol") == "BTCUSDT"):
+                markets = t.get("markets", [])
+                if markets:
+                    for out in markets[0].get("outcomes", []):
+                        if out.get("name", "").lower() == ("Up" if prediction_choice == "UP" else "Down").lower():
+                            token_id = str(out.get("tokenId", ""))
+                            break
+            if token_id:
+                break
 
+        if not token_id:
+            topics = await self.fetch_prediction_market_topics(force_refresh=True)
+            for t in topics:
+                if t.get("symbol") == symbol or (symbol.startswith("BTC") and t.get("symbol") == "BTCUSDT"):
+                    markets = t.get("markets", [])
+                    if markets:
+                        for out in markets[0].get("outcomes", []):
+                            if out.get("name", "").lower() == ("Up" if prediction_choice == "UP" else "Down").lower():
+                                token_id = str(out.get("tokenId", ""))
+                                break
+                if token_id:
+                    break
+
+        # 2. Inquire Quote: Binance Market orders require >= ~1.5 USDT in wei (18 decimals)
+        order_cost_usdt = max(1.5, float(contracts * target_price))
+        amount_wei = str(int(order_cost_usdt * 10**18))
+
+        quote_data = None
+        if token_id:
+            quote_data = await self.get_prediction_quote(
+                token_id=token_id,
+                amount_wei=amount_wei,
+                side="BUY",
+                order_type="MARKET",
+                slippage_bps=self.slippage_bps,
+            )
+
+        quote_id = quote_data.get("quoteId") if quote_data else None
+
+        if not quote_id:
+            err_msg = quote_data.get("msg") if quote_data else f"Token not found for {symbol} {prediction_choice}"
+            logger.error(f"[BINANCE LIVE REJECTION] Order {client_order_id} on {market_id} failed quote inquiry: {err_msg}")
+            result = OrderResult(
+                order_id="FAILED",
+                client_order_id=client_order_id,
+                market_id=market_id,
+                symbol=symbol,
+                side=side,
+                contracts=contracts,
+                price=target_price,
+                status="REJECTED",
+                latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                martingale_step=martingale_step,
+                stage=stage,
+                error_message=f"Quote error: {err_msg}"
+            )
+            self._total_orders_dispatched += 1
+            self._order_history.append(result)
+            return result
+
+        # 3. Parameters for official Binance Prediction Trading API (place-order-bundle)
         query_params = {
+            "accountType": "CeDeFi",
+            "orderType": "MARKET",
+            "quoteId": quote_id,
+            "slippageBps": self.slippage_bps,
+            "timeInForce": "FOK",
             "recvWindow": self.recv_window,
             "timestamp": self._get_timestamp(),
         }
@@ -267,7 +404,6 @@ class BinanceClient:
             query_params["walletId"] = self._wallet_id
 
         signed_query = self._sign_payload(query_params)
-        # Official Binance Prediction SAPI lives on api.binance.com
         sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
         endpoint_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle?{signed_query}"
 
@@ -284,7 +420,7 @@ class BinanceClient:
 
         try:
             assert self._session is not None
-            async with self._session.post(endpoint_url, json=order_payload) as resp:
+            async with self._session.post(endpoint_url, json={}) as resp:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                 try:
                     response_data = await resp.json()
@@ -336,7 +472,10 @@ class BinanceClient:
                 else:
                     err_code = response_data.get("code")
                     err_msg = response_data.get("msg", f"HTTP {resp.status}")
-                    full_err = f"[Code {err_code}] {err_msg}" if err_code is not None else str(err_msg)
+                    if err_code == -31003:
+                        full_err = "[Code -31003] SAS authorization required: กรุณาเปิดใช้งาน Secure Auto Sign (SAS) ในแอป Binance เพื่ออนุญาตให้บอทส่งคำสั่งเทรดได้อัตโนมัติ"
+                    else:
+                        full_err = f"[Code {err_code}] {err_msg}" if err_code is not None else str(err_msg)
                     logger.error(f"[BINANCE LIVE REJECTION] Order {client_order_id} on {market_id} rejected: {full_err}")
                     result = OrderResult(
                         order_id="FAILED",
