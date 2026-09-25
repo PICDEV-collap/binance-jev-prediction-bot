@@ -123,6 +123,8 @@ class BinanceClient:
         self._live_unrealized_usdt: float = 0.0
         self._live_initial_capital: float = 0.0
         self._live_positions: Dict[str, PositionInfo] = {}
+        self._wallet_address: str = "0x8bd02cfadc1065dba4db288997ea24d26a788936"
+        self._wallet_id: str = "a34494abf3d7403796af191a0accdd86"
 
     async def start(self) -> None:
         """Initialize session with persistent connection pooling and sync time."""
@@ -259,6 +261,10 @@ class BinanceClient:
             "recvWindow": self.recv_window,
             "timestamp": self._get_timestamp(),
         }
+        if self._wallet_address:
+            query_params["walletAddress"] = self._wallet_address
+        if self._wallet_id:
+            query_params["walletId"] = self._wallet_id
 
         signed_query = self._sign_payload(query_params)
         # Official Binance Prediction SAPI lives on api.binance.com
@@ -713,11 +719,45 @@ class BinanceClient:
                 "timestamp": self._get_timestamp(),
             }
             signed_query = self._sign_payload(params)
-
-            # Spot account API strictly lives on api.binance.com
-            spot_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
-            spot_url = f"{spot_host}/api/v3/account?{signed_query}"
+            sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
             assert self._session is not None
+
+            # 1. Check Binance Prediction Markets payment option balances (CeDeFi, SPOT, FUNDING)
+            prediction_balance_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/balance/payment-options?{signed_query}"
+            try:
+                async with self._session.get(prediction_balance_url) as presp:
+                    if presp.status == 200:
+                        pdata = await presp.json()
+                        items = pdata.get("items", [])
+                        total_pred_bal = 0.0
+                        cedefi_bal = 0.0
+                        for item in items:
+                            if item.get("enabled", True):
+                                try:
+                                    val = float(item.get("availableBalanceDisplay", 0.0))
+                                    total_pred_bal += val
+                                    if item.get("accountType") == "CeDeFi":
+                                        cedefi_bal += val
+                                except (ValueError, TypeError):
+                                    pass
+                        if total_pred_bal > 0:
+                            if cedefi_bal > 0:
+                                self.funding_source = "MPC"
+                            self._live_balance_usdt = round(total_pred_bal, 2)
+                            self._live_available_usdt = round(total_pred_bal, 2)
+                            self._live_unrealized_usdt = 0.0
+                            if self._live_initial_capital <= 0.0:
+                                self._live_initial_capital = self._live_balance_usdt
+                            return {
+                                "balance": self._live_balance_usdt,
+                                "available": self._live_available_usdt,
+                                "unrealized": 0.0,
+                            }
+            except Exception as pe:
+                logger.debug(f"Prediction balance query error: {pe}")
+
+            # 2. Fallback to Spot Account API
+            spot_url = f"{sapi_host}/api/v3/account?{signed_query}"
             async with self._session.get(spot_url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -727,14 +767,14 @@ class BinanceClient:
                             free = float(item.get("free", 0.0))
                             locked = float(item.get("locked", 0.0))
                             total = free + locked
-                            self._live_balance_usdt = total
-                            self._live_available_usdt = free
+                            self._live_balance_usdt = round(total, 2)
+                            self._live_available_usdt = round(free, 2)
                             self._live_unrealized_usdt = 0.0
                             if self._live_initial_capital <= 0.0 and total > 0:
-                                self._live_initial_capital = total
+                                self._live_initial_capital = self._live_balance_usdt
                             return {
-                                "balance": total,
-                                "available": free,
+                                "balance": self._live_balance_usdt,
+                                "available": self._live_available_usdt,
                                 "unrealized": 0.0,
                             }
                 elif resp.status == 404:
@@ -749,15 +789,15 @@ class BinanceClient:
                                         balance = float(item.get("balance", 0.0))
                                         available = float(item.get("availableBalance", 0.0))
                                         unrealized = float(item.get("crossUnPnl", 0.0))
-                                        self._live_balance_usdt = balance
-                                        self._live_available_usdt = available
-                                        self._live_unrealized_usdt = unrealized
+                                        self._live_balance_usdt = round(balance, 2)
+                                        self._live_available_usdt = round(available, 2)
+                                        self._live_unrealized_usdt = round(unrealized, 2)
                                         if self._live_initial_capital <= 0.0 and balance > 0:
-                                            self._live_initial_capital = balance
+                                            self._live_initial_capital = self._live_balance_usdt
                                         return {
-                                            "balance": balance,
-                                            "available": available,
-                                            "unrealized": unrealized,
+                                            "balance": self._live_balance_usdt,
+                                            "available": self._live_available_usdt,
+                                            "unrealized": self._live_unrealized_usdt,
                                         }
         except Exception as e:
             logger.warning(f"Could not fetch Binance live balance: {e}")

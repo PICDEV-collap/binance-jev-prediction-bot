@@ -170,6 +170,8 @@ class TradingBotCoordinator:
         await self.jev_client.start()
         await self.binance_client.start()
         await self.ws_listener.start()
+        if not self.binance_client.paper_trading:
+            asyncio.create_task(self.binance_client.fetch_live_balance())
         self._heartbeat_task = asyncio.create_task(self._dashboard_heartbeat_loop())
 
     async def stop(self) -> None:
@@ -194,8 +196,8 @@ class TradingBotCoordinator:
                 heartbeat_ticks += 1
                 markets = self.ws_listener.get_active_markets()
 
-                # If live trading with API keys, poll Binance live balance every 5s
-                if not self.binance_client.paper_trading and heartbeat_ticks % 5 == 0:
+                # If live trading with API keys, poll Binance live balance every 5s or immediately if not loaded
+                if not self.binance_client.paper_trading and (heartbeat_ticks % 5 == 0 or self.binance_client._live_balance_usdt <= 0.05):
                     asyncio.create_task(self.binance_client.fetch_live_balance())
 
                 # Settle paper trading positions when a round expires
