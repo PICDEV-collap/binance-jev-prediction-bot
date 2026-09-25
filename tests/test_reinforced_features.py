@@ -176,7 +176,29 @@ def test_risk_guard_gates():
     assert res_contra.approved is False
     assert "Microstructure Contradiction Filter" in res_contra.reason
 
-    print("      -> RiskGuard gates verified successfully.")
+    # Test Circuit Breaker: Net Profit should NEVER trip the circuit breaker!
+    guard.max_daily_loss_usdt = 200.0
+    guard.reset_circuit_breaker()
+    # Simulate a profitable run with mixed wins and losses (+255 net profit)
+    for _ in range(5):
+        guard.record_settlement_result(won=True, pnl=70.0, symbol="BTCUSDT")   # +350 gross win
+        guard.record_settlement_result(won=False, pnl=-19.0, symbol="BTCUSDT") # -95 gross loss
+    # Net PnL = +255.0 USDT!
+    assert guard._daily_net_pnl == 255.0, f"Expected +255 net PnL, got {guard._daily_net_pnl}"
+    assert guard._daily_realized_loss == 0.0, f"Expected 0 daily loss on profit, got {guard._daily_realized_loss}"
+    assert guard._circuit_breaker_active is False, "Circuit breaker MUST NOT trip when account is in profit (+255 USDT)!"
+
+    # Simulate true drawdown exceeding 200 limit
+    guard.record_settlement_result(won=False, pnl=-500.0, symbol="BTCUSDT")
+    assert guard._daily_net_pnl < -200.0
+    assert guard._circuit_breaker_active is True, "Circuit breaker MUST trip when net daily loss exceeds limit!"
+    
+    # Test reset
+    guard.reset_circuit_breaker()
+    assert guard._circuit_breaker_active is False
+    assert guard._daily_realized_loss == 0.0
+
+    print("      -> RiskGuard gates & Net PnL Circuit Breaker verified successfully.")
 
 
 def test_app_import_sanity():

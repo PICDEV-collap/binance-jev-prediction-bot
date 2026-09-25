@@ -87,6 +87,8 @@ class RiskGuard:
         # State tracking
         self._market_last_traded: Dict[str, float] = {}
         self._daily_realized_loss: float = 0.0
+        self._daily_net_pnl: float = 0.0
+        self._daily_start_time: float = time.time()
         self._circuit_breaker_active: bool = False
         self._total_evaluated: int = 0
         self._total_approved: int = 0
@@ -138,6 +140,7 @@ class RiskGuard:
         When WIN: Reset Martingale step to 0 (Base Round) and restore base AI hurdle!
         """
         clean_sym = symbol.upper() if symbol else ""
+        self.record_pnl(pnl)
 
         if won:
             # Per-symbol state update
@@ -166,8 +169,6 @@ class RiskGuard:
             self.consecutive_losses = 0
             self.last_settled_result = "WIN"
         else:
-            self.record_pnl(pnl)  # Updates daily drawdown breaker
-
             # Per-symbol state update
             if clean_sym:
                 old_sym_step = self._symbol_martingale_step.get(clean_sym, 0)
@@ -442,21 +443,46 @@ class RiskGuard:
             effective_threshold=effective_threshold,
         )
 
+    def _check_and_reset_daily_window(self) -> None:
+        """Auto-reset daily risk budget every 24 hours."""
+        now = time.time()
+        if now - self._daily_start_time >= 86400:
+            logger.info(
+                f"[DAILY RISK RESET] 24-hour cycle elapsed. Resetting daily net PnL "
+                f"(${self._daily_net_pnl:+.2f}) and daily loss (${self._daily_realized_loss:.2f})."
+            )
+            self._daily_net_pnl = 0.0
+            self._daily_realized_loss = 0.0
+            self._daily_start_time = now
+            self._circuit_breaker_active = False
+
     def record_pnl(self, realized_pnl: float) -> None:
-        """Update realized daily PnL and check circuit breaker."""
-        if realized_pnl < 0:
-            self._daily_realized_loss += abs(realized_pnl)
+        """
+        Update realized daily Net PnL and check circuit breaker.
+        Net PnL offsets winning trades against losing trades.
+        Daily loss is only accumulated if the daily Net PnL is in the red.
+        """
+        self._check_and_reset_daily_window()
+        self._daily_net_pnl += realized_pnl
+
+        if self._daily_net_pnl < 0:
+            self._daily_realized_loss = round(abs(self._daily_net_pnl), 2)
             if self._daily_realized_loss >= self.max_daily_loss_usdt:
                 self._circuit_breaker_active = True
                 logger.error(
                     f"EMERGENCY: Daily drawdown limit reached! "
-                    f"Total loss: ${self._daily_realized_loss:.2f}"
+                    f"Net daily loss: -${self._daily_realized_loss:.2f} >= Limit ${self.max_daily_loss_usdt:.2f}"
                 )
+        else:
+            # Account is net profitable for the day!
+            self._daily_realized_loss = 0.0
 
     def reset_circuit_breaker(self) -> None:
-        """Manually reset the circuit breaker."""
+        """Manually reset the circuit breaker and daily risk window."""
         self._circuit_breaker_active = False
+        self._daily_net_pnl = 0.0
         self._daily_realized_loss = 0.0
+        self._daily_start_time = time.time()
         logger.info("Circuit breaker has been manually reset.")
 
     def update_thresholds(
@@ -529,6 +555,7 @@ class RiskGuard:
             "max_concurrent_positions": self.max_concurrent_positions,
             "cooldown_seconds": self.cooldown_seconds,
             "max_daily_loss_usdt": self.max_daily_loss_usdt,
+            "daily_net_pnl": round(self._daily_net_pnl, 2),
             "daily_realized_loss": round(self._daily_realized_loss, 2),
             "circuit_breaker_active": self._circuit_breaker_active,
             "total_evaluated": self._total_evaluated,
