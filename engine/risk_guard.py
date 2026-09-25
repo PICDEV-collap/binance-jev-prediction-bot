@@ -202,6 +202,7 @@ class RiskGuard:
         Evaluate proposed trade against all risk controls and determine safe sizing.
         Includes Martingale recovery sizing and dynamic escalating AI conviction hurdle.
         """
+        self._check_and_reset_daily_window()
         self._total_evaluated += 1
         now = time.time()
         sym = market.symbol.upper() if market.symbol else ""
