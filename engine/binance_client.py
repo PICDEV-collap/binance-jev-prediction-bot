@@ -94,7 +94,11 @@ class BinanceClient:
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
-        self.base_url = base_url.rstrip("/")
+        # Ensure SAPI/W3W endpoints always target api.binance.com rather than fapi.binance.com
+        if "fapi.binance.com" in base_url:
+            self.base_url = "https://api.binance.com"
+        else:
+            self.base_url = base_url.rstrip("/")
         self.recv_window = recv_window
         self.paper_trading = paper_trading
         self.slippage_tolerance = slippage_tolerance
@@ -117,6 +121,7 @@ class BinanceClient:
         self._live_balance_usdt: float = 0.0
         self._live_available_usdt: float = 0.0
         self._live_unrealized_usdt: float = 0.0
+        self._live_initial_capital: float = 0.0
 
     async def start(self) -> None:
         """Initialize session with persistent connection pooling and sync time."""
@@ -255,7 +260,9 @@ class BinanceClient:
         }
 
         signed_query = self._sign_payload(query_params)
-        endpoint_url = f"{self.base_url}/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle?{signed_query}"
+        # Official Binance Prediction SAPI lives on api.binance.com
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        endpoint_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle?{signed_query}"
 
         # Register in-flight order for idempotency and network reconciliation
         self._in_flight_orders[client_order_id] = {
@@ -272,7 +279,11 @@ class BinanceClient:
             assert self._session is not None
             async with self._session.post(endpoint_url, json=order_payload) as resp:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-                response_data = await resp.json()
+                try:
+                    response_data = await resp.json()
+                except Exception:
+                    raw_text = await resp.text()
+                    response_data = {"msg": f"HTTP {resp.status}: {raw_text[:200]}"}
 
                 if resp.status in (200, 201):
                     order_id = str(response_data.get("orderId", client_order_id))
@@ -299,8 +310,10 @@ class BinanceClient:
                     )
                     return result
                 else:
+                    err_code = response_data.get("code")
                     err_msg = response_data.get("msg", f"HTTP {resp.status}")
-                    logger.error(f"Binance Prediction Order Rejected: {err_msg}")
+                    full_err = f"[Code {err_code}] {err_msg}" if err_code is not None else str(err_msg)
+                    logger.error(f"[BINANCE LIVE REJECTION] Order {client_order_id} on {market_id} rejected: {full_err}")
                     result = OrderResult(
                         order_id="FAILED",
                         client_order_id=client_order_id,
@@ -313,7 +326,7 @@ class BinanceClient:
                         latency_ms=round(elapsed_ms, 2),
                         martingale_step=martingale_step,
                         stage=stage,
-                        error_message=err_msg
+                        error_message=full_err
                     )
                     self._total_orders_dispatched += 1
                     self._order_history.append(result)
@@ -665,8 +678,9 @@ class BinanceClient:
             }
             signed_query = self._sign_payload(params)
 
-            # Try Binance Spot Account API first (for CEX USDT funding)
-            spot_url = f"{self.base_url}/api/v3/account?{signed_query}"
+            # Spot account API strictly lives on api.binance.com
+            spot_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+            spot_url = f"{spot_host}/api/v3/account?{signed_query}"
             assert self._session is not None
             async with self._session.get(spot_url) as resp:
                 if resp.status == 200:
@@ -680,6 +694,8 @@ class BinanceClient:
                             self._live_balance_usdt = total
                             self._live_available_usdt = free
                             self._live_unrealized_usdt = 0.0
+                            if self._live_initial_capital <= 0.0 and total > 0:
+                                self._live_initial_capital = total
                             return {
                                 "balance": total,
                                 "available": free,
@@ -700,6 +716,8 @@ class BinanceClient:
                                         self._live_balance_usdt = balance
                                         self._live_available_usdt = available
                                         self._live_unrealized_usdt = unrealized
+                                        if self._live_initial_capital <= 0.0 and balance > 0:
+                                            self._live_initial_capital = balance
                                         return {
                                             "balance": balance,
                                             "available": available,
@@ -711,14 +729,18 @@ class BinanceClient:
 
     def get_account_summary(self) -> Dict[str, Any]:
         """Return comprehensive wallet balances, total equity, and execution statistics."""
-        if not self.paper_trading and self._live_balance_usdt > 0:
+        if not self.paper_trading:
             total_equity = round(self._live_balance_usdt + self._live_unrealized_usdt, 2)
             available_balance = round(self._live_available_usdt, 2)
             unrealized_pnl = round(self._live_unrealized_usdt, 2)
-            committed_margin = round(total_equity - available_balance, 2)
+            committed_margin = round(max(0.0, total_equity - available_balance), 2)
             realized_pnl = 0.0
-            total_profit = round(total_equity - 1000.0, 2)
-            total_profit_pct = round((total_profit / 1000.0) * 100.0, 2)
+            if self._live_initial_capital > 0:
+                total_profit = round(total_equity - self._live_initial_capital, 2)
+                total_profit_pct = round((total_profit / self._live_initial_capital) * 100.0, 2)
+            else:
+                total_profit = 0.0
+                total_profit_pct = 0.0
             open_count = len(self._paper_positions)
         else:
             committed_margin = round(sum(p.contracts * p.entry_price for p in self._paper_positions.values()), 2)

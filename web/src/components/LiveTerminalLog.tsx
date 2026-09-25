@@ -27,7 +27,12 @@ export const LiveTerminalLog: React.FC<LiveTerminalLogProps> = ({ records }) => 
 
     let newLine = '';
     if (latest.order) {
-      newLine = `[${time}] [ORDER_FILL] ${latest.order.status} ${latest.order.side} ${latest.order.contracts}x @ ${latest.order.price.toFixed(3)} on ${latest.symbol} (Latency: ${latest.order.latency_ms.toFixed(1)}ms)`;
+      if (latest.order.status === 'REJECTED') {
+        const reason = latest.order.error_message ? ` | Reason: ${latest.order.error_message}` : '';
+        newLine = `[${time}] [ORDER_REJECTED] ${latest.order.side} ${latest.order.contracts}x on ${latest.symbol}${reason}`;
+      } else {
+        newLine = `[${time}] [ORDER_FILL] ${latest.order.status} ${latest.order.side} ${latest.order.contracts}x @ ${latest.order.price.toFixed(3)} on ${latest.symbol} (Latency: ${latest.order.latency_ms.toFixed(1)}ms)`;
+      }
     } else if (isApproved) {
       newLine = `[${time}] [RISK_PASS] ${action} Approved for ${latest.symbol} (Confidence: ${conf}%)`;
     } else {
@@ -84,7 +89,8 @@ export const LiveTerminalLog: React.FC<LiveTerminalLogProps> = ({ records }) => 
         ) : (
           logs.map((log, index) => {
             let color = 'text-slate-400';
-            if (log.includes('[ORDER_FILL]')) color = 'text-emerald-400 font-semibold';
+            if (log.includes('[ORDER_REJECTED]')) color = 'text-rose-400 font-semibold';
+            else if (log.includes('[ORDER_FILL]')) color = 'text-emerald-400 font-semibold';
             else if (log.includes('[RISK_PASS]')) color = 'text-cyan-300 font-medium';
             else if (log.includes('Filtered')) color = 'text-slate-400';
 
