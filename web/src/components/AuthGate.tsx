@@ -20,7 +20,7 @@ interface AuthGateProps {
 }
 
 export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess }) => {
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -63,7 +63,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
         });
         return;
       } else {
-        setErrorMsg('Authentication failed: Invalid credentials. (Default: admin / trader2026)');
+        setErrorMsg('Authentication failed: Invalid Operator ID or Security PIN.');
       }
     } finally {
       setLoading(false);
@@ -128,7 +128,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
                 required
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin"
+                placeholder="Enter Operator ID..."
                 className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-4 py-3 text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-emerald-500/60 transition-colors"
               />
             </div>
@@ -188,16 +188,11 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
           </button>
         </form>
 
-        {/* Security Info & Default Hint */}
-        <div className="mt-6 pt-5 border-t border-slate-900 text-center space-y-2">
+        {/* Security Info */}
+        <div className="mt-6 pt-5 border-t border-slate-900 text-center">
           <div className="flex items-center justify-center gap-1.5 text-[11px] font-mono text-slate-500">
             <Lock className="w-3 h-3 text-slate-400" />
             <span>Encrypted Session • HMAC SHA-256 Protected</span>
-          </div>
-
-          <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-900 text-[10px] font-mono text-slate-400 text-left">
-            <span className="text-emerald-400 font-bold block mb-0.5">DEFAULT CREDENTIALS:</span>
-            <span>Username: <strong className="text-white">admin</strong> | Password: <strong className="text-white">trader2026</strong></span>
           </div>
         </div>
 
