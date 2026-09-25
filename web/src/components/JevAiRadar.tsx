@@ -190,20 +190,28 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
       {latestRecord?.recent_performance && latestRecord.recent_performance.total_rounds > 0 && (
         <div className="bg-slate-950/60 rounded-xl p-2.5 border border-slate-800/80 mb-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs font-mono">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-slate-400 font-semibold text-[11px]">FEEDBACK:</span>
+            <span className="text-slate-400 font-semibold text-[11px] flex items-center gap-1">
+              <span>{latestRecord.symbol ? `${latestRecord.symbol.replace('USDT', '')} FEEDBACK` : 'FEEDBACK'}:</span>
+              <span className="text-[9px] text-slate-500 font-normal">(อดีต → ล่าสุด)</span>
+            </span>
             <div className="flex items-center gap-1">
-              {latestRecord.recent_performance.recent_results.map((res, i) => (
-                <span
-                  key={i}
-                  className={`px-1.5 py-0.2 rounded text-[10px] font-bold ${
-                    res === 'WIN'
-                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                      : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                  }`}
-                >
-                  {res === 'WIN' ? 'W' : 'L'}
-                </span>
-              ))}
+              {latestRecord.recent_performance.recent_results.map((res, i) => {
+                const isLatest = i === latestRecord.recent_performance!.recent_results.length - 1;
+                return (
+                  <span
+                    key={i}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-0.5 ${
+                      res === 'WIN'
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                    } ${isLatest ? 'ring-1 ring-white/60 shadow-md font-extrabold' : 'opacity-65'}`}
+                    title={isLatest ? 'ไม้ล่าสุดที่จบไป (Previous Settled Round)' : 'รอบก่อนหน้า'}
+                  >
+                    <span>{res === 'WIN' ? 'W' : 'L'}</span>
+                    {isLatest && <span className="text-[8px] bg-white/20 px-1 rounded text-white ml-0.5 font-sans">ล่าสุด</span>}
+                  </span>
+                );
+              })}
             </div>
             <span className="text-[11px] text-slate-400">
               ({latestRecord.recent_performance.win_rate_pct.toFixed(0)}% Win Rate)

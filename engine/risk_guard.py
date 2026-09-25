@@ -71,11 +71,18 @@ class RiskGuard:
         self.martingale_confidence_step: float = martingale_confidence_step
         self.martingale_max_confidence: float = martingale_max_confidence
 
-        self.current_martingale_step: int = 0  # 0 = Base (ไม้ 1), 1 = ไม้แก้ 1, 2 = ไม้แก้ 2...
+        self.current_martingale_step: int = 0  # Global active recovery step
         self.consecutive_losses: int = 0
         self.consecutive_wins: int = 0
         self.last_settled_result: str = "NONE"
         self.recovery_cycles_completed: int = 0
+
+        # Per-Symbol Martingale State (Asset-Specific Isolation)
+        self._symbol_martingale_step: Dict[str, int] = {}
+        self._symbol_consecutive_losses: Dict[str, int] = {}
+        self._symbol_consecutive_wins: Dict[str, int] = {}
+        self._symbol_last_result: Dict[str, str] = {}
+        self._symbol_recovery_cycles: Dict[str, int] = {}
 
         # State tracking
         self._market_last_traded: Dict[str, float] = {}
@@ -95,64 +102,91 @@ class RiskGuard:
             "INVALID_PRICING": 0,
         }
 
-    def get_effective_confidence_threshold(self) -> float:
+    def get_symbol_martingale_step(self, symbol: Optional[str] = None) -> int:
+        """Get Martingale recovery step for a specific symbol or global fallback."""
+        if not symbol:
+            return self.current_martingale_step
+        return self._symbol_martingale_step.get(symbol.upper(), 0)
+
+    def get_effective_confidence_threshold(self, symbol: Optional[str] = None) -> float:
         """
         Calculate required AI conviction hurdle.
         Escalates with each Martingale recovery step to protect capital.
         Base: 80% -> Step 1: 84% -> Step 2: 88% -> Step 3: 92% -> Step 4: 95%
         """
-        if not self.martingale_enabled or self.current_martingale_step == 0:
+        step = self.get_symbol_martingale_step(symbol)
+        if not self.martingale_enabled or step == 0:
             return self.confidence_threshold
-        step_boost = self.current_martingale_step * self.martingale_confidence_step
+        step_boost = step * self.martingale_confidence_step
         return min(self.martingale_max_confidence, self.confidence_threshold + step_boost)
 
-    def get_stage_label(self) -> str:
+    def get_stage_label(self, symbol: Optional[str] = None) -> str:
         """Human-readable Martingale stage label."""
-        if not self.martingale_enabled or self.current_martingale_step == 0:
+        step = self.get_symbol_martingale_step(symbol)
+        if not self.martingale_enabled or step == 0:
             return "ไม้ 1 (Base)"
-        mult = self.martingale_multiplier ** self.current_martingale_step
-        return f"ไม้แก้ {self.current_martingale_step} ({mult:.0f}x)"
+        mult = self.martingale_multiplier ** step
+        return f"ไม้แก้ {step} ({mult:.0f}x)"
 
     def record_settlement_result(self, won: bool, pnl: float, symbol: str = "") -> None:
         """
         Feedback from settled round.
+        Tracks Martingale recovery step independently per symbol and updates global counters.
         When LOSS: Advance Martingale recovery step, increase multiplier & raise AI conviction hurdle.
         When WIN: Reset Martingale step to 0 (Base Round) and restore base AI hurdle!
         """
+        clean_sym = symbol.upper() if symbol else ""
+
         if won:
+            # Per-symbol state update
+            if clean_sym:
+                old_sym_step = self._symbol_martingale_step.get(clean_sym, 0)
+                if old_sym_step > 0:
+                    self._symbol_recovery_cycles[clean_sym] = self._symbol_recovery_cycles.get(clean_sym, 0) + 1
+                    logger.info(
+                        f"🎉 [{clean_sym} MARTINGALE RECOVERY SUCCESS!] Won at Step {old_sym_step} "
+                        f"(PnL: +${pnl:.2f}). Total recoveries completed for {clean_sym}: "
+                        f"{self._symbol_recovery_cycles[clean_sym]}. RESETTING TO BASE ROUND (ไม้ 1)!"
+                    )
+                else:
+                    logger.info(f"✅ [{clean_sym} WIN] Base round won (+${pnl:.2f}). Starting fresh base round.")
+                self._symbol_martingale_step[clean_sym] = 0
+                self._symbol_consecutive_wins[clean_sym] = self._symbol_consecutive_wins.get(clean_sym, 0) + 1
+                self._symbol_consecutive_losses[clean_sym] = 0
+                self._symbol_last_result[clean_sym] = "WIN"
+
             was_recovery = self.current_martingale_step > 0
             if was_recovery:
                 self.recovery_cycles_completed += 1
-                logger.info(
-                    f"🎉 [MARTINGALE RECOVERY SUCCESS!] Won at Step {self.current_martingale_step} "
-                    f"(PnL: +${pnl:.2f}). Total recoveries completed: {self.recovery_cycles_completed}. "
-                    f"RESETTING TO BASE ROUND (ไม้ 1)!"
-                )
-            else:
-                logger.info(f"✅ [WIN] Base round won (+${pnl:.2f}). Starting fresh base round.")
 
-            self.current_martingale_step = 0
+            self.current_martingale_step = max(self._symbol_martingale_step.values(), default=0)
             self.consecutive_wins += 1
             self.consecutive_losses = 0
             self.last_settled_result = "WIN"
         else:
             self.record_pnl(pnl)  # Updates daily drawdown breaker
+
+            # Per-symbol state update
+            if clean_sym:
+                old_sym_step = self._symbol_martingale_step.get(clean_sym, 0)
+                if self.martingale_enabled:
+                    new_sym_step = min(self.martingale_max_steps, old_sym_step + 1)
+                    self._symbol_martingale_step[clean_sym] = new_sym_step
+                    new_sym_hurdle = self.get_effective_confidence_threshold(clean_sym)
+                    mult = self.martingale_multiplier ** new_sym_step
+                    logger.warning(
+                        f"⚠️ [{clean_sym} MARTINGALE LOSS ESCALATION] Round lost (-${abs(pnl):.2f}). "
+                        f"Advancing from Step {old_sym_step} -> Step {new_sym_step} (ไม้แก้ {new_sym_step}). "
+                        f"Next trade size for {clean_sym}: {mult:.0f}x | Next AI Hurdle: {new_sym_hurdle*100:.0f}%"
+                    )
+                self._symbol_consecutive_losses[clean_sym] = self._symbol_consecutive_losses.get(clean_sym, 0) + 1
+                self._symbol_consecutive_wins[clean_sym] = 0
+                self._symbol_last_result[clean_sym] = "LOSS"
+
+            self.current_martingale_step = max(self._symbol_martingale_step.values(), default=0)
             self.consecutive_losses += 1
             self.consecutive_wins = 0
             self.last_settled_result = "LOSS"
-
-            if self.martingale_enabled:
-                old_step = self.current_martingale_step
-                self.current_martingale_step = min(self.martingale_max_steps, self.current_martingale_step + 1)
-                new_hurdle = self.get_effective_confidence_threshold()
-                mult = self.martingale_multiplier ** self.current_martingale_step
-                logger.warning(
-                    f"⚠️ [MARTINGALE LOSS ESCALATION] Round lost (-${abs(pnl):.2f}). "
-                    f"Advancing from Step {old_step} -> Step {self.current_martingale_step} (ไม้แก้ {self.current_martingale_step}). "
-                    f"Next trade size: {mult:.0f}x | Next AI Conviction Hurdle raised to: {new_hurdle*100:.0f}%"
-                )
-            else:
-                logger.info(f"Round lost (-${abs(pnl):.2f}). Martingale disabled, maintaining base sizing.")
 
     def validate_and_size_order(
         self,
@@ -167,9 +201,11 @@ class RiskGuard:
         """
         self._total_evaluated += 1
         now = time.time()
-        effective_threshold = self.get_effective_confidence_threshold()
-        stage_label = self.get_stage_label()
-        multiplier = self.martingale_multiplier ** self.current_martingale_step if (self.martingale_enabled and self.current_martingale_step > 0) else 1.0
+        sym = market.symbol.upper() if market.symbol else ""
+        step = self.get_symbol_martingale_step(sym)
+        effective_threshold = self.get_effective_confidence_threshold(sym)
+        stage_label = self.get_stage_label(sym)
+        multiplier = self.martingale_multiplier ** step if (self.martingale_enabled and step > 0) else 1.0
 
         # Gate 0: Signal is PASS
         if decision.action == "PASS":
@@ -181,7 +217,7 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action="PASS",
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold
@@ -202,7 +238,7 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold
@@ -215,7 +251,7 @@ class RiskGuard:
                 f"AI Signal: {decision.action} ({decision.confidence*100:.1f}%) "
                 f"— Filtered: Below {effective_threshold*100:.0f}% conviction gate"
             )
-            if self.current_martingale_step > 0:
+            if step > 0:
                 filter_reason += f" [{stage_label} Recovery Hurdle Active: Conviction must be >={effective_threshold*100:.0f}%]"
             logger.info(f"[RISK FILTER] {filter_reason} for {market.market_id}. Capital preserved.")
             return RiskEvaluationResult(
@@ -225,7 +261,7 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold
@@ -247,7 +283,7 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold,
@@ -263,7 +299,7 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold,
@@ -284,7 +320,7 @@ class RiskGuard:
                 market_id=market.market_id,
                 action=decision.action,
                 target_price=target_price,
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold,
@@ -301,7 +337,7 @@ class RiskGuard:
                 market_id=market.market_id,
                 action=decision.action,
                 target_price=target_price,
-                martingale_step=self.current_martingale_step,
+                martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
                 effective_threshold=effective_threshold,
@@ -311,12 +347,12 @@ class RiskGuard:
         # Formula: Cap position exposure by max_position_size_usdt
         max_possible_contracts = int(self.max_position_size_usdt / target_price) if target_price > 0 else 0
 
-        if self.martingale_enabled and self.current_martingale_step > 0:
+        if self.martingale_enabled and step > 0:
             raw_contracts = int(self.default_order_contracts * multiplier)
             contracts = max(1, min(raw_contracts, max_possible_contracts))
-            approval_reason = f"Martingale Recovery Order ({stage_label}) approved"
+            approval_reason = f"Martingale Recovery Order ({stage_label}) approved for {sym}"
             logger.info(
-                f"[MARTINGALE ORDER SIZING] {stage_label}: {contracts} contracts "
+                f"[MARTINGALE ORDER SIZING] {sym} {stage_label}: {contracts} contracts "
                 f"({multiplier:.0f}x base {self.default_order_contracts}) | Exposure: ${contracts * target_price:.2f}"
             )
         else:
@@ -347,7 +383,7 @@ class RiskGuard:
             market_id=market.market_id,
             action=decision.action,
             target_price=target_price,
-            martingale_step=self.current_martingale_step,
+            martingale_step=step,
             stage_label=stage_label,
             multiplier=multiplier,
             effective_threshold=effective_threshold,
@@ -449,5 +485,6 @@ class RiskGuard:
                 "consecutive_wins": self.consecutive_wins,
                 "last_settled_result": self.last_settled_result,
                 "recovery_cycles_completed": self.recovery_cycles_completed,
+                "symbol_steps": dict(self._symbol_martingale_step),
             }
         }

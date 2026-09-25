@@ -265,9 +265,9 @@ class TradingBotCoordinator:
         # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
         recent_perf = self.binance_client.get_recent_performance(symbol=market.symbol, limit=5)
         market.recent_performance = recent_perf
-        market.martingale_step = self.risk_guard.current_martingale_step
-        market.martingale_stage = self.risk_guard.get_stage_label()
-        market.effective_hurdle = self.risk_guard.get_effective_confidence_threshold()
+        market.martingale_step = self.risk_guard.get_symbol_martingale_step(market.symbol)
+        market.martingale_stage = self.risk_guard.get_stage_label(market.symbol)
+        market.effective_hurdle = self.risk_guard.get_effective_confidence_threshold(market.symbol)
         logger.info(
             f"[FEEDBACK LOOP] {recent_perf['summary']} | "
             f"Stage: {market.martingale_stage} (Hurdle: {market.effective_hurdle*100:.0f}%)"
