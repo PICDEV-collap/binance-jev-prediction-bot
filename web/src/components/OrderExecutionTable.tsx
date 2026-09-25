@@ -15,7 +15,8 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   ShieldCheck,
-  Award
+  Award,
+  Sparkles
 } from 'lucide-react';
 import { OrderItem, PositionItem, ClosedPositionItem } from '../types/trading';
 
@@ -23,6 +24,7 @@ interface OrderExecutionTableProps {
   orders: OrderItem[];
   openPositions?: PositionItem[];
   closedPositions?: ClosedPositionItem[];
+  onClaimWinnings?: () => Promise<void> | void;
 }
 
 type MainTab = 'OPEN_POSITIONS' | 'CLOSED_POSITIONS' | 'ORDER_LOG';
@@ -31,10 +33,12 @@ type OrderFilter = 'ALL' | 'FILLED' | 'SIMULATED' | 'REJECTED';
 export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({ 
   orders = [], 
   openPositions = [], 
-  closedPositions = [] 
+  closedPositions = [],
+  onClaimWinnings
 }) => {
   const [activeTab, setActiveTab] = useState<MainTab>('OPEN_POSITIONS');
   const [orderFilter, setOrderFilter] = useState<OrderFilter>('ALL');
+  const [isClaiming, setIsClaiming] = useState(false);
 
   // Filtered Orders
   const filteredOrders = orders.filter((order) => {
@@ -346,7 +350,7 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
         <div className="space-y-4">
           
           {/* Summary Metric Ribbon for Closed Positions */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800/70 font-mono text-xs">
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800/70 font-mono text-xs items-center">
             <div>
               <span className="text-slate-500 text-[11px] block">TOTAL ROUNDS SETTLED</span>
               <span className="text-white font-bold text-sm">
@@ -371,6 +375,26 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                 $1.00 USDT / Win Contract
               </span>
             </div>
+            <div className="flex items-center justify-end">
+              <button
+                onClick={async () => {
+                  if (onClaimWinnings) {
+                    setIsClaiming(true);
+                    try {
+                      await onClaimWinnings();
+                    } finally {
+                      setIsClaiming(false);
+                    }
+                  }
+                }}
+                disabled={isClaiming || !onClaimWinnings}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold transition-all disabled:opacity-50 active:scale-95"
+                title="Trigger instant auto-claim via Binance Prediction API"
+              >
+                <Sparkles className={`w-3.5 h-3.5 text-emerald-400 ${isClaiming ? 'animate-spin' : ''}`} />
+                <span>{isClaiming ? 'Claiming...' : 'Claim Winnings'}</span>
+              </button>
+            </div>
           </div>
 
           <div className="overflow-x-auto">
@@ -387,12 +411,13 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                   <th className="py-2.5 px-3 font-medium text-right">FINAL SPOT PRICE</th>
                   <th className="py-2.5 px-3 font-medium text-center">OUTCOME</th>
                   <th className="py-2.5 px-3 font-medium text-right">REALIZED PnL</th>
+                  <th className="py-2.5 px-3 font-medium text-center">CLAIM STATUS</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/40">
                 {closedPositions.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="py-12 text-center text-slate-500 font-mono">
+                    <td colSpan={11} className="py-12 text-center text-slate-500 font-mono">
                       <div className="flex flex-col items-center justify-center gap-2">
                         <History className="w-8 h-8 text-slate-700 stroke-1" />
                         <span className="text-sm font-semibold text-slate-400">No Settled Positions Yet</span>
@@ -490,6 +515,21 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                           <span className={`text-sm ${pos.realized_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                             {pos.realized_pnl >= 0 ? `+$${pos.realized_pnl.toFixed(2)}` : `-$${Math.abs(pos.realized_pnl).toFixed(2)}`}
                           </span>
+                        </td>
+
+                        {/* Claim Status Badge */}
+                        <td className="py-3 px-3 text-center whitespace-nowrap">
+                          {isWin ? (
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold border inline-flex items-center gap-1 ${
+                              pos.is_claimed
+                                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                                : 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
+                            }`}>
+                              <span>{pos.is_claimed ? '✓ CLAIMED' : 'AUTO-CLAIM'}</span>
+                            </span>
+                          ) : (
+                            <span className="text-slate-600 text-[11px]">-</span>
+                          )}
                         </td>
                       </tr>
                     );

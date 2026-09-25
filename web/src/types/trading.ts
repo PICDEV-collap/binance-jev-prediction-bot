@@ -85,6 +85,7 @@ export interface PositionItem {
   unrealized_pnl: number;
   martingale_step?: number;
   stage?: string;
+  token_id?: string;
   entry_time: number;
 }
 
@@ -102,6 +103,8 @@ export interface ClosedPositionItem {
   realized_pnl: number;
   martingale_step?: number;
   stage?: string;
+  token_id?: string;
+  is_claimed?: boolean;
   entry_time: number;
   settled_at: number;
 }

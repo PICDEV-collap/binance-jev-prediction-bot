@@ -200,7 +200,11 @@ class TradingBotCoordinator:
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 5 == 0 or self.binance_client._live_balance_usdt <= 0.05):
                     asyncio.create_task(self.binance_client.fetch_live_balance())
 
-                # Settle paper trading positions when a round expires
+                # Periodic auto-claim sweep every 30s to claim any pending won contracts
+                if not self.binance_client.paper_trading and (heartbeat_ticks % 30 == 0):
+                    asyncio.create_task(self.binance_client.claim_all_won_positions())
+
+                # Settle prediction positions when a round expires
                 if markets:
                     active_market_ids = {m["market_id"] for m in markets}
                     current_prices = {m["symbol"]: m["underlying_price"] for m in markets}
@@ -213,6 +217,8 @@ class TradingBotCoordinator:
                             pnl=rec["pnl"],
                             symbol=rec["symbol"]
                         )
+                    if any(rec.get("won") for rec in settled_records):
+                        asyncio.create_task(self.binance_client.claim_all_won_positions())
                     # Prune expired rounds from memory set
                     self.evaluated_rounds = {rid for rid in self.evaluated_rounds if rid in active_market_ids}
 
@@ -773,6 +779,19 @@ async def manual_trade_endpoint(req: ManualTradeRequest) -> Dict[str, Any]:
         "open_positions": bot.binance_client.get_positions(),
         "closed_positions": bot.binance_client.get_closed_positions(),
         "account": bot.binance_client.get_account_summary(),
+    }
+
+
+@app.post("/api/trade/claim")
+async def claim_winnings_endpoint() -> Dict[str, Any]:
+    """Manually or programmatically trigger claim/batch-redeem for all won prediction contracts."""
+    res = await bot.binance_client.claim_all_won_positions()
+    await bot.binance_client.fetch_live_balance()
+    return {
+        "status": "success" if res.get("success", True) else "failed",
+        "claim_result": res,
+        "account": bot.binance_client.get_account_summary(),
+        "closed_positions": bot.binance_client.get_closed_positions(),
     }
 
 

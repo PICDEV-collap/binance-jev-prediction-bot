@@ -103,38 +103,40 @@ def test_rolling_candle_aggregator():
     print("      -> RollingCandleAggregator verified successfully.")
 
 
-async def test_jev_client_decision_engine():
+def test_jev_client_decision_engine():
     print("[3/5] Testing JevClient evaluation with enriched telemetry...")
-    client = JevClient(api_key="")  # Offline heuristic mode
-    ctx = MarketContext(
-        market_id="BTCUSDT-15M-TEST",
-        symbol="BTCUSDT",
-        question="BTC Up or Down 15m",
-        odds_yes=0.51,
-        odds_no=0.49,
-        underlying_price=84250.0,
-        target_price=84100.0,
-        price_diff=+150.0,
-        momentum_pct=0.40,
-        atr_1m=18.0,
-        dvr_ratio=+2.10,
-        rsi_1m=64.0,
-        rsi_5m=66.0,
-        ema_trend="STRONG_UPTREND",
-        order_book_imbalance=+0.55,
-        market_regime="TREND_EXPANSION",
-        expiry_danger_flag=False,
-    )
+    async def _run():
+        client = JevClient(api_key="")  # Offline heuristic mode
+        ctx = MarketContext(
+            market_id="BTCUSDT-15M-TEST",
+            symbol="BTCUSDT",
+            question="BTC Up or Down 15m",
+            odds_yes=0.51,
+            odds_no=0.49,
+            underlying_price=84250.0,
+            target_price=84100.0,
+            price_diff=+150.0,
+            momentum_pct=0.40,
+            atr_1m=18.0,
+            dvr_ratio=+2.10,
+            rsi_1m=64.0,
+            rsi_5m=66.0,
+            ema_trend="STRONG_UPTREND",
+            order_book_imbalance=+0.55,
+            market_regime="TREND_EXPANSION",
+            expiry_danger_flag=False,
+        )
 
-    t0 = time.perf_counter()
-    decision = await client.evaluate_market(ctx)
-    latency_ms = (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter()
+        decision = await client.evaluate_market(ctx)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
 
-    assert decision.action == "UP"
-    assert decision.confidence >= 0.85
-    assert "DVR" in decision.reasoning
-    assert "Trend" in decision.reasoning
-    print(f"      -> JevClient decision: {decision.action} ({decision.confidence*100:.1f}%) in {latency_ms:.2f}ms.")
+        assert decision.action == "UP"
+        assert decision.confidence >= 0.85
+        assert "DVR" in decision.reasoning
+        assert "Trend" in decision.reasoning
+        print(f"      -> JevClient decision: {decision.action} ({decision.confidence*100:.1f}%) in {latency_ms:.2f}ms.")
+    asyncio.run(_run())
 
 
 def test_risk_guard_gates():

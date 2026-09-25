@@ -53,6 +53,7 @@ class PositionInfo(BaseModel):
     unrealized_pnl: float
     martingale_step: int = 0
     stage: str = "ไม้ 1 (Base)"
+    token_id: str = ""
     entry_time: float = Field(default_factory=time.time)
 
 
@@ -71,6 +72,8 @@ class ClosedPositionInfo(BaseModel):
     realized_pnl: float
     martingale_step: int = 0
     stage: str = "ไม้ 1 (Base)"
+    token_id: str = ""
+    is_claimed: bool = False
     entry_time: float
     settled_at: float = Field(default_factory=time.time)
 
@@ -463,6 +466,7 @@ class BinanceClient:
                         unrealized_pnl=0.0,
                         martingale_step=martingale_step,
                         stage=stage,
+                        token_id=str(token_id or ""),
                     )
 
                     logger.info(
@@ -617,6 +621,7 @@ class BinanceClient:
             unrealized_pnl=0.0,
             martingale_step=martingale_step,
             stage=stage,
+            token_id=f"SIM_TOKEN_{clean_side}_{uuid.uuid4().hex[:6]}",
         )
 
         result = OrderResult(
@@ -721,6 +726,8 @@ class BinanceClient:
                     realized_pnl=round(realized_pnl, 2),
                     martingale_step=pos.martingale_step,
                     stage=pos.stage,
+                    token_id=pos.token_id,
+                    is_claimed=False,
                     entry_time=pos.entry_time,
                     settled_at=time.time(),
                 )
@@ -738,12 +745,19 @@ class BinanceClient:
                     "martingale_step": pos.martingale_step,
                     "stage": pos.stage,
                     "mode": mode_label,
+                    "token_id": pos.token_id,
                 })
 
                 if mode_label == "LIVE":
                     try:
                         loop = asyncio.get_running_loop()
                         loop.create_task(self.fetch_live_balance())
+                        if won and getattr(pos, "token_id", None):
+                            logger.info(
+                                f"[AUTO-CLAIM TRIGGER] Won live contract {pos.symbol} {pos.side} "
+                                f"(token: {pos.token_id[:16]}...). Triggering instant batch redeem..."
+                            )
+                            loop.create_task(self.redeem_prediction_tokens([pos.token_id]))
                     except RuntimeError:
                         pass
 
@@ -953,14 +967,14 @@ class BinanceClient:
             available_balance = round(self._live_available_usdt, 2)
             unrealized_pnl = round(self._live_unrealized_usdt, 2)
             committed_margin = round(max(0.0, total_equity - available_balance), 2)
-            realized_pnl = 0.0
+            realized_pnl = round(sum(p.realized_pnl for p in self._closed_positions), 2)
             if self._live_initial_capital > 0:
                 total_profit = round(total_equity - self._live_initial_capital, 2)
                 total_profit_pct = round((total_profit / self._live_initial_capital) * 100.0, 2)
             else:
                 total_profit = 0.0
                 total_profit_pct = 0.0
-            open_count = len(self._paper_positions)
+            open_count = len(self._live_positions)
         else:
             committed_margin = round(sum(p.contracts * p.entry_price for p in self._paper_positions.values()), 2)
             unrealized_pnl = round(sum(p.unrealized_pnl for p in self._paper_positions.values()), 2)
@@ -987,3 +1001,141 @@ class BinanceClient:
             "total_fills": self._total_fills,
             "time_offset_ms": self._time_offset_ms,
         }
+
+    async def fetch_claimable_positions(self) -> List[str]:
+        """Fetch pending claim outcome token IDs from Binance Prediction API."""
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            return []
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "walletAddress": self._wallet_address,
+            "walletId": self._wallet_id,
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/position/list?{signed_query}"
+
+        token_ids: List[str] = []
+        try:
+            assert self._session is not None
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    positions = data.get("positions", [])
+                    for pos in positions:
+                        token_id = str(pos.get("tokenId", "")).strip()
+                        can_claim = bool(pos.get("canClaim", False))
+                        pos_status = str(pos.get("positionStatus", "")).upper()
+                        if token_id and (can_claim or pos_status in ("CLAIMABLE", "PENDING_CLAIM", "RESOLVED", "SETTLED", "ENDED")):
+                            token_ids.append(token_id)
+        except Exception as e:
+            logger.warning(f"Could not fetch claimable positions from Binance API: {e}")
+        return token_ids
+
+    async def redeem_prediction_tokens(self, token_ids: List[str]) -> Dict[str, Any]:
+        """
+        Execute official Binance Prediction batch-redeem API to claim winnings into wallet balance.
+        Endpoint: POST /sapi/v1/w3w/wallet/prediction/batch-redeem
+        """
+        if not token_ids:
+            return {"success": True, "message": "No tokens to redeem", "redeemed_count": 0}
+
+        # Filter out empty or duplicate strings
+        clean_ids = list(dict.fromkeys([str(t).strip() for t in token_ids if str(t).strip()]))
+        if not clean_ids:
+            return {"success": True, "message": "No valid token IDs", "redeemed_count": 0}
+
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            logger.info(f"[PAPER AUTO-CLAIM] Simulated claim for {len(clean_ids)} token(s): {clean_ids}")
+            for pos in self._closed_positions:
+                if pos.token_id in clean_ids:
+                    pos.is_claimed = True
+            return {"success": True, "message": "Paper claim simulated", "token_ids": clean_ids}
+
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "tokenIds": ",".join(clean_ids),
+            "walletAddress": self._wallet_address,
+            "walletId": self._wallet_id,
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        signed_query = self._sign_payload(query_params)
+        endpoint_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/batch-redeem?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.post(endpoint_url, json={}, timeout=aiohttp.ClientTimeout(total=8.0)) as resp:
+                status = resp.status
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raw_text = await resp.text()
+                    data = {"raw": raw_text[:200]}
+
+                if status in (200, 201):
+                    batch_id = data.get("batchId", "")
+                    results = data.get("results", [])
+                    success_count = 0
+                    for r in results:
+                        res_status = r.get("status", "").upper()
+                        err = r.get("error", "")
+                        # If SUCCESS or already claimed by Binance UI Auto-Claim, it's claimed!
+                        if res_status == "SUCCESS" or "already claimed" in err.lower():
+                            success_count += 1
+
+                    # Mark matched closed positions as claimed
+                    for pos in self._closed_positions:
+                        if pos.token_id in clean_ids:
+                            pos.is_claimed = True
+
+                    logger.info(
+                        f"[BINANCE AUTO-CLAIM SUCCESS] Redeemed {len(clean_ids)} token(s) (Batch: {batch_id}) | "
+                        f"Claimed: {success_count}/{len(clean_ids)}"
+                    )
+                    # Trigger balance refresh so the UI updates immediately
+                    asyncio.create_task(self.fetch_live_balance())
+                    return {
+                        "success": True,
+                        "batch_id": batch_id,
+                        "token_ids": clean_ids,
+                        "results": results,
+                        "claimed_count": success_count,
+                    }
+                else:
+                    err_msg = data.get("msg", data.get("message", f"HTTP {status}"))
+                    logger.warning(f"[BINANCE AUTO-CLAIM ERROR] Batch redeem failed: {err_msg}")
+                    return {"success": False, "error": err_msg, "token_ids": clean_ids}
+        except Exception as e:
+            logger.error(f"[BINANCE AUTO-CLAIM EXCEPTION] Error calling batch-redeem: {e}")
+            return {"success": False, "error": str(e), "token_ids": clean_ids}
+
+    async def claim_all_won_positions(self) -> Dict[str, Any]:
+        """
+        Identify all unredeemed won prediction positions (both local history and Binance API)
+        and execute batch redemption.
+        """
+        token_ids_to_claim: Set[str] = set()
+
+        # 1. Check local closed positions that won but haven't been claimed
+        for pos in self._closed_positions:
+            if pos.result in ("WIN", "TIE (50-50)") and pos.token_id and not getattr(pos, "is_claimed", False):
+                token_ids_to_claim.add(pos.token_id)
+
+        # 2. In live trading, also query Binance for any pending claimable positions
+        if not self.paper_trading:
+            api_claimable = await self.fetch_claimable_positions()
+            for tid in api_claimable:
+                token_ids_to_claim.add(tid)
+
+        if not token_ids_to_claim:
+            return {"success": True, "message": "No unredeemed winning positions found", "claimed_count": 0}
+
+        return await self.redeem_prediction_tokens(list(token_ids_to_claim))
