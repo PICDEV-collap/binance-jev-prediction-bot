@@ -13,6 +13,7 @@ import logging
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Dict, Any, List, Set, Optional
 
 import uvicorn
@@ -36,15 +37,32 @@ logger = logging.getLogger("main_engine")
 
 
 class ConfigUpdateRequest(BaseModel):
+    # Risk & Martingale
     confidence_threshold: float | None = None
-    max_position_size_usdt: float | None = None
-    cooldown_seconds: int | None = None
-    paper_trading: bool | None = None
+    default_order_contracts: int | None = None
     martingale_enabled: bool | None = None
     martingale_multiplier: float | None = None
     martingale_max_steps: int | None = None
     martingale_confidence_step: float | None = None
     martingale_max_confidence: float | None = None
+
+    # Exposure & Circuit Breaker Limits
+    max_position_size_usdt: float | None = None
+    cooldown_seconds: int | None = None
+    max_daily_loss_usdt: float | None = None
+    max_concurrent_positions: int | None = None
+
+    # Target Market & Strategy
+    target_symbol: str | None = None
+    target_timeframe: str | None = None
+
+    # Operating Environment & Credentials
+    paper_trading: bool | None = None
+    binance_api_key: str | None = None
+    binance_api_secret: str | None = None
+    jev_ai_api_key: str | None = None
+    jev_ai_model: str | None = None
+    persist_to_env: bool | None = False
 
 
 class TargetMarketRequest(BaseModel):
@@ -453,22 +471,173 @@ async def get_positions_endpoint() -> Dict[str, Any]:
     }
 
 
+def _persist_config_to_env(req: ConfigUpdateRequest) -> None:
+    """Helper to update local .env file with non-empty configuration entries."""
+    env_path = Path(".env")
+    lines: List[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    mapping: Dict[str, str] = {}
+    if req.confidence_threshold is not None:
+        mapping["CONFIDENCE_THRESHOLD"] = f"{req.confidence_threshold:.2f}"
+    if req.default_order_contracts is not None:
+        mapping["DEFAULT_ORDER_CONTRACTS"] = str(req.default_order_contracts)
+    if req.max_position_size_usdt is not None:
+        mapping["MAX_POSITION_SIZE_USDT"] = f"{req.max_position_size_usdt:.1f}"
+    if req.cooldown_seconds is not None:
+        mapping["COOLDOWN_SECONDS"] = str(req.cooldown_seconds)
+    if req.max_daily_loss_usdt is not None:
+        mapping["MAX_DAILY_LOSS_USDT"] = f"{req.max_daily_loss_usdt:.1f}"
+    if req.max_concurrent_positions is not None:
+        mapping["MAX_CONCURRENT_POSITIONS"] = str(req.max_concurrent_positions)
+    if req.martingale_enabled is not None:
+        mapping["MARTINGALE_ENABLED"] = "true" if req.martingale_enabled else "false"
+    if req.martingale_multiplier is not None:
+        mapping["MARTINGALE_MULTIPLIER"] = f"{req.martingale_multiplier:.1f}"
+    if req.martingale_max_steps is not None:
+        mapping["MARTINGALE_MAX_STEPS"] = str(req.martingale_max_steps)
+    if req.martingale_confidence_step is not None:
+        mapping["MARTINGALE_CONFIDENCE_STEP"] = f"{req.martingale_confidence_step:.2f}"
+    if req.martingale_max_confidence is not None:
+        mapping["MARTINGALE_MAX_CONFIDENCE"] = f"{req.martingale_max_confidence:.2f}"
+    if req.target_symbol is not None:
+        mapping["TARGET_SYMBOL"] = req.target_symbol.upper()
+    if req.target_timeframe is not None:
+        mapping["TARGET_TIMEFRAME"] = req.target_timeframe.lower()
+    if req.paper_trading is not None:
+        mapping["PAPER_TRADING"] = "true" if req.paper_trading else "false"
+    if req.binance_api_key is not None and req.binance_api_key.strip():
+        mapping["BINANCE_API_KEY"] = req.binance_api_key.strip()
+    if req.binance_api_secret is not None and req.binance_api_secret.strip():
+        mapping["BINANCE_API_SECRET"] = req.binance_api_secret.strip()
+    if req.jev_ai_api_key is not None and req.jev_ai_api_key.strip():
+        mapping["JEV_AI_API_KEY"] = req.jev_ai_api_key.strip()
+    if req.jev_ai_model is not None and req.jev_ai_model.strip():
+        mapping["JEV_AI_MODEL"] = req.jev_ai_model.strip()
+
+    if not mapping:
+        return
+
+    updated_keys = set()
+    new_lines: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k, _ = stripped.split("=", 1)
+            k = k.strip()
+            if k in mapping:
+                new_lines.append(f"{k}={mapping[k]}")
+                updated_keys.add(k)
+                continue
+        new_lines.append(line)
+
+    for k, v in mapping.items():
+        if k not in updated_keys:
+            new_lines.append(f"{k}={v}")
+
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+@app.get("/api/config")
+async def get_config_endpoint() -> Dict[str, Any]:
+    """Get complete active configuration and credential status."""
+    rg = bot.risk_guard
+    binance_key = bot.binance_client.api_key
+    jev_key = bot.jev_client.api_key
+
+    masked_binance = ""
+    if binance_key:
+        masked_binance = f"{binance_key[:4]}••••{binance_key[-4:]}" if len(binance_key) > 8 else "••••••••"
+
+    masked_jev = ""
+    if jev_key:
+        masked_jev = f"{jev_key[:4]}••••{jev_key[-4:]}" if len(jev_key) > 8 else "••••••••"
+
+    return {
+        "status": "success",
+        "config": {
+            # Risk & Martingale
+            "confidence_threshold": rg.confidence_threshold,
+            "default_order_contracts": rg.default_order_contracts,
+            "martingale_enabled": rg.martingale_enabled,
+            "martingale_multiplier": rg.martingale_multiplier,
+            "martingale_max_steps": rg.martingale_max_steps,
+            "martingale_confidence_step": rg.martingale_confidence_step,
+            "martingale_max_confidence": rg.martingale_max_confidence,
+            # Exposure & Limits
+            "max_position_size_usdt": rg.max_position_size_usdt,
+            "cooldown_seconds": rg.cooldown_seconds,
+            "max_daily_loss_usdt": rg.max_daily_loss_usdt,
+            "max_concurrent_positions": rg.max_concurrent_positions,
+            # Strategy Targets
+            "target_symbol": bot.target_symbol,
+            "target_timeframe": bot.target_timeframe,
+            # Mode & Credentials Status
+            "paper_trading": bot.binance_client.paper_trading,
+            "has_binance_key": bool(binance_key),
+            "has_binance_secret": bool(bot.binance_client.api_secret),
+            "binance_api_key_masked": masked_binance,
+            "has_jev_key": bool(jev_key),
+            "jev_ai_model": bot.jev_client.model,
+            "jev_ai_key_masked": masked_jev,
+        }
+    }
+
+
 @app.post("/api/config")
 async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
-    """Dynamically adjust risk thresholds and operating mode from dashboard."""
+    """Dynamically adjust risk thresholds, strategy targets, credentials, and operating mode from dashboard."""
     bot.risk_guard.update_thresholds(
         confidence_threshold=req.confidence_threshold,
         max_position_size_usdt=req.max_position_size_usdt,
+        default_order_contracts=req.default_order_contracts,
         cooldown_seconds=req.cooldown_seconds,
+        max_daily_loss_usdt=req.max_daily_loss_usdt,
+        max_concurrent_positions=req.max_concurrent_positions,
         martingale_enabled=req.martingale_enabled,
         martingale_multiplier=req.martingale_multiplier,
         martingale_max_steps=req.martingale_max_steps,
         martingale_confidence_step=req.martingale_confidence_step,
         martingale_max_confidence=req.martingale_max_confidence,
     )
+
+    if req.target_symbol is not None and req.target_symbol.strip():
+        bot.target_symbol = req.target_symbol.upper().strip()
+        logger.info(f"Target symbol updated to: {bot.target_symbol}")
+
+    if req.target_timeframe is not None and req.target_timeframe.strip():
+        bot.target_timeframe = req.target_timeframe.lower().strip()
+        logger.info(f"Target timeframe updated to: {bot.target_timeframe}")
+
     if req.paper_trading is not None:
         bot.binance_client.paper_trading = req.paper_trading
         logger.info(f"Updated Paper Trading mode to: {req.paper_trading}")
+
+    if req.binance_api_key is not None and req.binance_api_key.strip():
+        bot.binance_client.api_key = req.binance_api_key.strip()
+        logger.info("Updated Binance API Key")
+
+    if req.binance_api_secret is not None and req.binance_api_secret.strip():
+        bot.binance_client.api_secret = req.binance_api_secret.strip()
+        logger.info("Updated Binance API Secret")
+
+    if req.jev_ai_api_key is not None and req.jev_ai_api_key.strip():
+        bot.jev_client.api_key = req.jev_ai_api_key.strip()
+        if bot.jev_client._session and not bot.jev_client._session.closed:
+            bot.jev_client._session.headers["Authorization"] = f"Bearer {bot.jev_client.api_key}"
+        logger.info("Updated Jev AI API Key")
+
+    if req.jev_ai_model is not None and req.jev_ai_model.strip():
+        bot.jev_client.model = req.jev_ai_model.strip()
+        logger.info(f"Updated Jev AI Model to: {bot.jev_client.model}")
+
+    if req.persist_to_env:
+        try:
+            _persist_config_to_env(req)
+            logger.info("Configuration successfully written to local .env file")
+        except Exception as e:
+            logger.error(f"Failed to persist configuration to .env: {e}")
 
     return {
         "status": "success",

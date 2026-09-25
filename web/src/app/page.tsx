@@ -17,7 +17,8 @@ import {
   OrderItem, 
   PositionItem,
   ClosedPositionItem,
-  ActionType 
+  ActionType,
+  BotConfig
 } from '../types/trading';
 
 // Default initial markets for immediate rendering and offline demo
@@ -571,22 +572,20 @@ export default function DashboardPage() {
     }
   };
 
-  const handleSaveConfig = async (newConfig: {
-    confidence_threshold: number;
-    max_position_size_usdt: number;
-    cooldown_seconds: number;
-    paper_trading: boolean;
-    martingale_enabled?: boolean;
-    martingale_multiplier?: number;
-    martingale_max_steps?: number;
-    martingale_confidence_step?: number;
-  }) => {
+  const handleSaveConfig = async (newConfig: BotConfig) => {
     try {
-      await fetch(getApiUrl('/api/config'), {
+      const res = await fetch(getApiUrl('/api/config'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newConfig),
       });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.current_status) {
+          setStatus(data.current_status);
+          return;
+        }
+      }
     } catch {
       console.log('Backend offline; simulated local config update');
     }
@@ -596,17 +595,32 @@ export default function DashboardPage() {
       return {
         ...prev,
         trading_mode: newConfig.paper_trading ? 'PAPER_TRADING' : 'LIVE_TRADING',
+        target_market: {
+          target_symbol: newConfig.target_symbol ?? prev.target_market?.target_symbol ?? 'BTCUSDT',
+          target_timeframe: newConfig.target_timeframe ?? prev.target_market?.target_timeframe ?? '15m',
+          evaluated_rounds_count: prev.target_market?.evaluated_rounds_count ?? 0,
+          evaluation_policy: prev.target_market?.evaluation_policy ?? '1x_per_round',
+        },
+        jev_ai: {
+          ...prev.jev_ai,
+          model: newConfig.jev_ai_model ?? prev.jev_ai.model,
+          has_api_key: newConfig.jev_ai_api_key ? true : prev.jev_ai.has_api_key,
+        },
         risk_guard: {
           ...prev.risk_guard,
           confidence_threshold: newConfig.confidence_threshold,
           max_position_size_usdt: newConfig.max_position_size_usdt,
+          default_order_contracts: newConfig.default_order_contracts ?? prev.risk_guard.default_order_contracts,
           cooldown_seconds: newConfig.cooldown_seconds,
+          max_daily_loss_usdt: newConfig.max_daily_loss_usdt ?? prev.risk_guard.max_daily_loss_usdt,
+          max_concurrent_positions: newConfig.max_concurrent_positions ?? prev.risk_guard.max_concurrent_positions,
           martingale: prev.risk_guard.martingale ? {
             ...prev.risk_guard.martingale,
             enabled: newConfig.martingale_enabled ?? prev.risk_guard.martingale.enabled,
             multiplier: newConfig.martingale_multiplier ?? prev.risk_guard.martingale.multiplier,
             max_steps: newConfig.martingale_max_steps ?? prev.risk_guard.martingale.max_steps,
             confidence_step: newConfig.martingale_confidence_step ?? prev.risk_guard.martingale.confidence_step,
+            max_confidence: newConfig.martingale_max_confidence ?? prev.risk_guard.martingale.max_confidence,
           } : undefined,
         },
       };
@@ -758,12 +772,19 @@ export default function DashboardPage() {
         onClose={() => setIsConfigOpen(false)}
         currentThreshold={currentThreshold}
         currentPositionSize={status?.risk_guard?.max_position_size_usdt ?? 50.0}
+        currentDefaultOrderContracts={status?.risk_guard?.default_order_contracts ?? 10}
         currentCooldown={status?.risk_guard?.cooldown_seconds ?? 45}
+        currentDailyLossLimit={status?.risk_guard?.max_daily_loss_usdt ?? 200.0}
+        currentMaxConcurrentPositions={status?.risk_guard?.max_concurrent_positions ?? 5}
+        currentTargetSymbol={status?.target_market?.target_symbol ?? 'BTCUSDT'}
+        currentTargetTimeframe={status?.target_market?.target_timeframe ?? '15m'}
         currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
         currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}
         currentMartingaleMultiplier={status?.risk_guard?.martingale?.multiplier ?? 2.0}
         currentMartingaleMaxSteps={status?.risk_guard?.martingale?.max_steps ?? 4}
         currentMartingaleConfidenceStep={status?.risk_guard?.martingale?.confidence_step ?? 0.04}
+        currentMartingaleMaxConfidence={status?.risk_guard?.martingale?.max_confidence ?? 0.95}
+        currentJevAiModel={status?.jev_ai?.model ?? 'jev-latest'}
         serverUrl={serverUrl}
         onSaveServerUrl={handleSaveServerUrl}
         onSaveConfig={handleSaveConfig}

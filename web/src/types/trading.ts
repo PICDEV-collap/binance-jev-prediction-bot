@@ -121,6 +121,8 @@ export interface SystemStatus {
   risk_guard: {
     confidence_threshold: number;
     max_position_size_usdt: number;
+    default_order_contracts?: number;
+    max_concurrent_positions?: number;
     cooldown_seconds: number;
     max_daily_loss_usdt: number;
     daily_realized_loss: number;
@@ -195,3 +197,31 @@ export interface TelemetryRecord {
   };
   order?: OrderItem | null;
 }
+
+export interface BotConfig {
+  confidence_threshold: number;
+  default_order_contracts: number;
+  martingale_enabled: boolean;
+  martingale_multiplier: number;
+  martingale_max_steps: number;
+  martingale_confidence_step: number;
+  martingale_max_confidence: number;
+  max_position_size_usdt: number;
+  cooldown_seconds: number;
+  max_daily_loss_usdt: number;
+  max_concurrent_positions: number;
+  target_symbol: string;
+  target_timeframe: string;
+  paper_trading: boolean;
+  has_binance_key?: boolean;
+  has_binance_secret?: boolean;
+  binance_api_key_masked?: string;
+  binance_api_key?: string;
+  binance_api_secret?: string;
+  has_jev_key?: boolean;
+  jev_ai_model?: string;
+  jev_ai_key_masked?: string;
+  jev_ai_api_key?: string;
+  persist_to_env?: boolean;
+}
+

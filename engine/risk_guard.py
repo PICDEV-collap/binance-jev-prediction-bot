@@ -410,7 +410,10 @@ class RiskGuard:
         self,
         confidence_threshold: Optional[float] = None,
         max_position_size_usdt: Optional[float] = None,
+        default_order_contracts: Optional[int] = None,
         cooldown_seconds: Optional[int] = None,
+        max_daily_loss_usdt: Optional[float] = None,
+        max_concurrent_positions: Optional[int] = None,
         martingale_enabled: Optional[bool] = None,
         martingale_multiplier: Optional[float] = None,
         martingale_max_steps: Optional[int] = None,
@@ -422,8 +425,14 @@ class RiskGuard:
             self.confidence_threshold = max(0.5, min(0.99, confidence_threshold))
         if max_position_size_usdt is not None:
             self.max_position_size_usdt = max(5.0, max_position_size_usdt)
+        if default_order_contracts is not None:
+            self.default_order_contracts = max(1, min(500, int(default_order_contracts)))
         if cooldown_seconds is not None:
             self.cooldown_seconds = max(5, cooldown_seconds)
+        if max_daily_loss_usdt is not None:
+            self.max_daily_loss_usdt = max(10.0, float(max_daily_loss_usdt))
+        if max_concurrent_positions is not None:
+            self.max_concurrent_positions = max(1, min(24, int(max_concurrent_positions)))
         if martingale_enabled is not None:
             self.martingale_enabled = bool(martingale_enabled)
         if martingale_multiplier is not None:
@@ -437,9 +446,10 @@ class RiskGuard:
 
         logger.info(
             f"Risk parameters updated: Conf={self.confidence_threshold:.2f}, "
-            f"Size=${self.max_position_size_usdt:.1f}, Cooldown={self.cooldown_seconds}s, "
-            f"Martingale={self.martingale_enabled} (Mult={self.martingale_multiplier}x, "
-            f"MaxSteps={self.martingale_max_steps}, ConfStep={self.martingale_confidence_step*100:.1f}%)"
+            f"BaseContracts={self.default_order_contracts}, Size=${self.max_position_size_usdt:.1f}, "
+            f"DailyLossLimit=${self.max_daily_loss_usdt:.1f}, MaxPos={self.max_concurrent_positions}, "
+            f"Cooldown={self.cooldown_seconds}s, Martingale={self.martingale_enabled} "
+            f"(Mult={self.martingale_multiplier}x, MaxSteps={self.martingale_max_steps})"
         )
 
     def _record_rejection(self, reason_code: str) -> None:
@@ -462,6 +472,8 @@ class RiskGuard:
         return {
             "confidence_threshold": self.confidence_threshold,
             "max_position_size_usdt": self.max_position_size_usdt,
+            "default_order_contracts": self.default_order_contracts,
+            "max_concurrent_positions": self.max_concurrent_positions,
             "cooldown_seconds": self.cooldown_seconds,
             "max_daily_loss_usdt": self.max_daily_loss_usdt,
             "daily_realized_loss": round(self._daily_realized_loss, 2),
