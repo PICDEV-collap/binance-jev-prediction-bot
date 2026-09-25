@@ -96,11 +96,11 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="glass-panel w-full max-w-lg rounded-2xl border border-slate-700/80 p-6 shadow-2xl relative">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200 overflow-y-auto">
+      <div className="glass-panel w-full max-w-xl max-h-[90vh] flex flex-col rounded-2xl border border-slate-700/80 shadow-2xl relative overflow-hidden bg-slate-950/95">
         
         {/* Modal Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+        <div className="flex items-center justify-between p-4 sm:p-5 pb-3.5 border-b border-slate-800 shrink-0 bg-slate-950/90">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
               <Sliders className="w-4 h-4 text-cyan-400" />
@@ -117,14 +117,14 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
 
           <button
             onClick={onClose}
-            className="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-slate-800"
+            className="text-slate-400 hover:text-white transition-colors p-1.5 rounded-lg hover:bg-slate-800"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Modal Body */}
-        <div className="space-y-5 my-5">
+        {/* Modal Body (Scrollable) */}
+        <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4.5">
           
           {/* 1. Confidence Threshold Slider */}
           <div className="space-y-2">
@@ -371,8 +371,8 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
 
         </div>
 
-        {/* Modal Actions */}
-        <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
+        {/* Modal Actions (Pinned at bottom) */}
+        <div className="flex items-center justify-end gap-3 p-4 sm:p-5 pt-3.5 border-t border-slate-800 shrink-0 bg-slate-950/90">
           <button
             onClick={onClose}
             className="px-4 py-2 rounded-xl text-xs font-mono text-slate-400 hover:text-white transition-colors"
