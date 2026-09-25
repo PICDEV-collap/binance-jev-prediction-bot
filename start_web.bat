@@ -11,6 +11,7 @@ echo  [+] Safe Isolated Port: 3888 (No collision with 3000)
 echo.
 
 cd web
+start "" http://localhost:3888
 npm run dev
 if %ERRORLEVEL% NEQ 0 (
     echo.

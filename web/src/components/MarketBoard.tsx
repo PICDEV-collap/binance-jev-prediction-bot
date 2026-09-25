@@ -82,9 +82,26 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 text-xs font-mono text-slate-400">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span>{filteredMarkets.length} of {markets.length} Markets</span>
+        <div className="flex flex-wrap items-center gap-2.5 text-xs font-mono">
+          {targetSymbol !== 'ALL' && onSetAiTarget && (
+            <button
+              onClick={() => onSetAiTarget('ALL', selectedTf === 'all' ? (targetTimeframe || '5m') : selectedTf)}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 transition-all font-bold cursor-pointer"
+              title="Activate AI evaluation across all 6 pairs"
+            >
+              <span>⚡ AI Scan All Pairs</span>
+            </button>
+          )}
+          {targetSymbol === 'ALL' && (
+            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold">
+              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+              <span>Scanning All Pairs</span>
+            </span>
+          )}
+          <div className="flex items-center gap-2 text-slate-400">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span>{filteredMarkets.length} of {markets.length} Markets</span>
+          </div>
         </div>
       </div>
 
@@ -113,7 +130,12 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
           {ASSETS.map((asset) => (
             <button
               key={asset.value}
-              onClick={() => setSelectedAsset(asset.value)}
+              onClick={() => {
+                setSelectedAsset(asset.value);
+                if (asset.value === 'all' && targetSymbol !== 'ALL' && onSetAiTarget) {
+                  onSetAiTarget('ALL', selectedTf === 'all' ? (targetTimeframe || '5m') : selectedTf);
+                }
+              }}
               className={`px-2.5 py-1 rounded-lg text-xs font-mono font-semibold transition-all ${
                 selectedAsset === asset.value
                   ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
@@ -135,7 +157,7 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filteredMarkets.map((market) => {
-            const isSelected = selectedMarketId === market.market_id;
+            const isSelected = selectedMarketId === market.market_id || (Boolean(selectedMarketId) && market.symbol === selectedMarketId!.split('-')[0] && market.market_id.split('-')[1] === selectedMarketId!.split('-')[1]);
             const upPct = market.odds_yes * 100;
             const downPct = market.odds_no * 100;
             const isBullish = market.momentum_pct >= 0;
@@ -293,16 +315,20 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
                 <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 pt-1">
                   <span>Pool: ${(market.volume_24h / 1000).toFixed(0)}k</span>
                   
-                  {!isAiTarget && onSetAiTarget && (
+                  {onSetAiTarget && (
                     <button
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
                         onSetAiTarget(market.symbol, tf);
                       }}
-                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-emerald-500/20 text-slate-400 hover:text-emerald-300 border border-slate-700 hover:border-emerald-500/40 transition-all font-semibold"
+                      className={`px-2 py-0.5 rounded border transition-all font-semibold ${
+                        isAiTarget && targetSymbol !== 'ALL'
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          : 'bg-slate-800 hover:bg-emerald-500/20 text-slate-400 hover:text-emerald-300 border-slate-700 hover:border-emerald-500/40'
+                      }`}
                     >
-                      🎯 Focus AI
+                      {targetSymbol === 'ALL' ? '🎯 Solo Focus' : isAiTarget ? '🎯 Active' : '🎯 Focus AI'}
                     </button>
                   )}
                 </div>

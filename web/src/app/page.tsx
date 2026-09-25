@@ -15,6 +15,8 @@ import {
   MarketItem, 
   TelemetryRecord, 
   OrderItem, 
+  PositionItem,
+  ClosedPositionItem,
   ActionType 
 } from '../types/trading';
 
@@ -118,6 +120,8 @@ export default function DashboardPage() {
   const [selectedMarketId, setSelectedMarketId] = useState<string | null>('BTCUSDT-15M-R3120');
   const [records, setRecords] = useState<TelemetryRecord[]>([]);
   const [orders, setOrders] = useState<OrderItem[]>([]);
+  const [openPositions, setOpenPositions] = useState<PositionItem[]>([]);
+  const [closedPositions, setClosedPositions] = useState<ClosedPositionItem[]>([]);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isConfigOpen, setIsConfigOpen] = useState<boolean>(false);
   const [serverUrl, setServerUrl] = useState<string>('http://localhost:8899');
@@ -259,13 +263,47 @@ export default function DashboardPage() {
               }
               setOrders(deduped);
             }
+            if (message.open_positions) {
+              setOpenPositions(message.open_positions);
+            } else if (message.positions) {
+              setOpenPositions(message.positions);
+            }
+            if (message.closed_positions) {
+              setClosedPositions(message.closed_positions);
+            }
           } else if (message.type === 'HEARTBEAT') {
             if (message.system_status) setStatus(message.system_status);
-            if (message.active_markets?.length > 0) setMarkets(message.active_markets);
+            if (message.open_positions) {
+              setOpenPositions(message.open_positions);
+            } else if (message.positions) {
+              setOpenPositions(message.positions);
+            }
+            if (message.closed_positions) {
+              setClosedPositions(message.closed_positions);
+            }
+            if (message.active_markets?.length > 0) {
+              setMarkets(message.active_markets);
+              setSelectedMarketId((curr) => {
+                if (curr && !message.active_markets.some((m: MarketItem) => m.market_id === curr)) {
+                  const currSym = curr.split('-')[0];
+                  const sameSym = message.active_markets.find((m: MarketItem) => m.symbol === currSym);
+                  return sameSym ? sameSym.market_id : message.active_markets[0].market_id;
+                }
+                return curr;
+              });
+            }
           } else if (message.type === 'MARKET_EVALUATION') {
             const newRecord: TelemetryRecord = message.data;
             if (message.system_status) setStatus(message.system_status);
             if (message.active_markets?.length > 0) setMarkets(message.active_markets);
+            if (message.open_positions) {
+              setOpenPositions(message.open_positions);
+            } else if (message.positions) {
+              setOpenPositions(message.positions);
+            }
+            if (message.closed_positions) {
+              setClosedPositions(message.closed_positions);
+            }
 
             setRecords((prev) => {
               if (prev.length > 0 && prev[0].timestamp === newRecord.timestamp && prev[0].market_id === newRecord.market_id) {
@@ -531,12 +569,19 @@ export default function DashboardPage() {
           side: side,
           contracts: 10,
           target_price: side === 'UP' ? market.odds_yes : market.odds_no,
+          strike_price: market.target_price,
         }),
       });
       if (res.ok) {
         const data = await res.json();
         if (data.order) {
           setOrders((prev) => [data.order, ...prev.slice(0, 49)]);
+        }
+        if (data.open_positions) {
+          setOpenPositions(data.open_positions);
+        }
+        if (data.account && status) {
+          setStatus((prev) => prev ? { ...prev, account: data.account } : null);
         }
       }
     } catch (e) {
@@ -609,8 +654,12 @@ export default function DashboardPage() {
 
         </div>
 
-        {/* Real-time Order Execution Logs */}
-        <OrderExecutionTable orders={orders} />
+        {/* Real-time Positions Desk & Order Execution Logs */}
+        <OrderExecutionTable 
+          orders={orders} 
+          openPositions={openPositions}
+          closedPositions={closedPositions}
+        />
 
         {/* Live Terminal Log Stream */}
         <LiveTerminalLog records={records} />

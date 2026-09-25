@@ -24,7 +24,7 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
   const decision = latestRecord?.decision;
   const risk = latestRecord?.risk_validation;
 
-  const action = decision?.action ?? 'PASS';
+  const action = decision?.action === 'DOWN' || decision?.action === 'BUY_NO' ? 'DOWN' : 'UP';
   const confidence = decision?.confidence ?? 0.50;
   const confidencePct = Math.round(confidence * 100);
   const reasoning = decision?.reasoning ?? 'Awaiting market tick evaluation from Jev AI Decision Engine...';
@@ -36,12 +36,11 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (confidence * circumference);
 
-  // Determine color accent based on decision and confidence
+  // Determine color accent based on directional decision and confidence threshold
   const isHighConfidence = confidence >= confidenceThreshold;
-  let gaugeColor = '#f59e0b'; // Amber
-  if ((action === 'UP' || action === 'BUY_YES') && isHighConfidence) gaugeColor = '#10b981'; // Emerald
-  else if ((action === 'DOWN' || action === 'BUY_NO') && isHighConfidence) gaugeColor = '#f43f5e'; // Rose
-  else if (!isHighConfidence) gaugeColor = '#64748b'; // Slate
+  const gaugeColor = action === 'UP' 
+    ? (isHighConfidence ? '#10b981' : '#059669') 
+    : (isHighConfidence ? '#f43f5e' : '#e11d48');
 
   return (
     <div className="glass-panel rounded-2xl p-5 border border-slate-800/80 flex flex-col justify-between">
@@ -57,13 +56,13 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
               Jev AI Decision Engine
             </h2>
             <p className="text-xs text-slate-400 font-mono">
-              Typesafe Structured Inference ({decision?.model ?? 'jev-predict-v1'})
+              Binary Prediction Core ({decision?.model ?? 'jev-binary-v1'})
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] font-mono text-cyan-400">
-          <Zap className="w-3 h-3 text-cyan-400" />
+          <Zap className="w-3.5 h-3.5 text-cyan-400" />
           <span>{latency.toFixed(1)} ms</span>
         </div>
       </div>
@@ -113,7 +112,7 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
 
           <div className="mt-2 text-center">
             <span className="text-[11px] font-mono text-slate-400">
-              Threshold: <strong className="text-white">{(confidenceThreshold * 100).toFixed(0)}%</strong>
+              Conviction Gate: <strong className="text-white">{(confidenceThreshold * 100).toFixed(0)}%</strong>
             </span>
           </div>
         </div>
@@ -124,19 +123,24 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
           {/* Action Badge */}
           <div>
             <span className="text-[10px] font-mono uppercase text-slate-400 block mb-1">
-              Engine Recommended Action
+              Engine Directional Signal (Binary)
             </span>
             <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl border text-sm font-mono font-bold tracking-wide ${
-              action === 'UP' || action === 'BUY_YES'
+              action === 'UP'
                 ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300 shadow-lg shadow-emerald-950/50'
-                : action === 'DOWN' || action === 'BUY_NO'
-                ? 'bg-rose-500/20 border-rose-500/50 text-rose-300 shadow-lg shadow-rose-950/50'
-                : 'bg-slate-800/80 border-slate-700 text-slate-300'
+                : 'bg-rose-500/20 border-rose-500/50 text-rose-300 shadow-lg shadow-rose-950/50'
             }`}>
-              {(action === 'UP' || action === 'BUY_YES') && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
-              {(action === 'DOWN' || action === 'BUY_NO') && <XCircle className="w-4 h-4 text-rose-400" />}
-              {action === 'PASS' && <MinusCircle className="w-4 h-4 text-slate-400" />}
-              <span>{action === 'BUY_YES' ? 'PREDICT UP ▲' : action === 'UP' ? 'PREDICT UP ▲' : action === 'BUY_NO' ? 'PREDICT DOWN ▼' : action === 'DOWN' ? 'PREDICT DOWN ▼' : 'PASS —'}</span>
+              {action === 'UP' ? (
+                <>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>PREDICT UP ▲</span>
+                </>
+              ) : (
+                <>
+                  <XCircle className="w-4 h-4 text-rose-400" />
+                  <span>PREDICT DOWN ▼</span>
+                </>
+              )}
             </div>
           </div>
 
@@ -153,7 +157,7 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
               <ShieldCheck className={`w-4 h-4 mt-0.5 shrink-0 ${isApproved ? 'text-emerald-400' : 'text-slate-500'}`} />
               <div>
                 <span className="font-semibold block">
-                  {isApproved ? 'EXECUTION APPROVED' : 'ORDER BLOCKED / PASS'}
+                  {isApproved ? 'EXECUTION APPROVED (ORDER DISPATCHED)' : 'ORDER FILTERED (HOLDING CAPITAL)'}
                 </span>
                 <span className="text-[11px] text-slate-400">
                   {risk?.reason ?? 'No active execution required'}
@@ -163,8 +167,49 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
           </div>
 
         </div>
-
       </div>
+
+      {/* Historical Feedback Loop & Regime Calibration (Approach 3: Hybrid) */}
+      {latestRecord?.recent_performance && latestRecord.recent_performance.total_rounds > 0 && (
+        <div className="bg-slate-950/60 rounded-xl p-2.5 border border-slate-800/80 mb-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs font-mono">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-slate-400 font-semibold text-[11px]">FEEDBACK:</span>
+            <div className="flex items-center gap-1">
+              {latestRecord.recent_performance.recent_results.map((res, i) => (
+                <span
+                  key={i}
+                  className={`px-1.5 py-0.2 rounded text-[10px] font-bold ${
+                    res === 'WIN'
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                      : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                  }`}
+                >
+                  {res === 'WIN' ? 'W' : 'L'}
+                </span>
+              ))}
+            </div>
+            <span className="text-[11px] text-slate-400">
+              ({latestRecord.recent_performance.win_rate_pct.toFixed(0)}% Win Rate)
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {latestRecord.recent_performance.consecutive_losses >= 2 ? (
+              <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[10px] font-semibold flex items-center gap-1">
+                <span>⚠️ Defensive Hurdle Active ({latestRecord.recent_performance.consecutive_losses} Losses)</span>
+              </span>
+            ) : latestRecord.recent_performance.consecutive_wins >= 2 ? (
+              <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[10px] font-semibold flex items-center gap-1">
+                <span>🔥 Momentum Streak ({latestRecord.recent_performance.consecutive_wins} Wins)</span>
+              </span>
+            ) : (
+              <span className="text-[10px] text-slate-400">
+                Regime: Normal Sizing
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Structured Reasoning Card */}
       <div className="bg-slate-950/80 rounded-xl p-3.5 border border-slate-800/80">

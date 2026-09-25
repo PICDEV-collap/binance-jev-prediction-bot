@@ -52,6 +52,23 @@ class PositionInfo(BaseModel):
     entry_time: float = Field(default_factory=time.time)
 
 
+class ClosedPositionInfo(BaseModel):
+    """Historical record of a settled prediction contract position."""
+    position_id: str
+    market_id: str
+    symbol: str
+    side: str  # "UP" or "DOWN"
+    contracts: int
+    entry_price: float
+    target_price: float  # Price to Beat (Strike)
+    settlement_price: float  # Final spot price
+    timeframe: str = "15m"
+    result: str  # "WIN" or "LOSS"
+    realized_pnl: float
+    entry_time: float
+    settled_at: float = Field(default_factory=time.time)
+
+
 class BinanceClient:
     """
     High-performance asynchronous client for Binance Prediction API.
@@ -82,6 +99,7 @@ class BinanceClient:
         # Simulated Paper Trading State
         self._paper_balance_usdt: float = 1000.0  # Starting mock wallet
         self._paper_positions: Dict[str, PositionInfo] = {}
+        self._closed_positions: List[ClosedPositionInfo] = []
         self._order_history: List[OrderResult] = []
 
     async def start(self) -> None:
@@ -156,6 +174,8 @@ class BinanceClient:
         side: str,  # "BUY_YES" or "BUY_NO"
         contracts: int,
         target_price: float,
+        strike_price: float = 0.0,
+        spot_price: float = 0.0,
     ) -> OrderResult:
         """
         Execute an order on Binance Prediction Markets.
@@ -172,6 +192,8 @@ class BinanceClient:
                 side=side,
                 contracts=contracts,
                 target_price=target_price,
+                strike_price=strike_price,
+                spot_price=spot_price,
                 client_order_id=client_order_id,
                 start_time=start_time
             )
@@ -270,6 +292,8 @@ class BinanceClient:
         side: str,
         contracts: int,
         target_price: float,
+        strike_price: float,
+        spot_price: float,
         client_order_id: str,
         start_time: float
     ) -> OrderResult:
@@ -291,6 +315,10 @@ class BinanceClient:
         executed_price = round(target_price, 4)
         order_cost = executed_price * contracts
 
+        # Strike price is the price to beat; spot is current underlying spot price
+        beat_price = strike_price if strike_price > 0 else (spot_price if spot_price > 0 else target_price)
+        current_spot = spot_price if spot_price > 0 else beat_price
+
         # Check mock balance
         if order_cost > self._paper_balance_usdt:
             result = OrderResult(
@@ -304,7 +332,7 @@ class BinanceClient:
                 status="REJECTED",
                 latency_ms=round(elapsed_ms, 2),
                 timeframe=tf,
-                price_to_beat=target_price,
+                price_to_beat=beat_price,
                 error_message="Insufficient paper balance"
             )
             self._order_history.append(result)
@@ -321,8 +349,8 @@ class BinanceClient:
             side=clean_side,
             contracts=contracts,
             entry_price=executed_price,
-            current_price=executed_price,
-            target_price=target_price,
+            current_price=current_spot,
+            target_price=beat_price,
             timeframe=tf,
             unrealized_pnl=0.0
         )
@@ -338,7 +366,7 @@ class BinanceClient:
             status="SIMULATED",
             latency_ms=round(elapsed_ms, 2),
             timeframe=tf,
-            price_to_beat=target_price
+            price_to_beat=beat_price
         )
 
         self._total_orders_dispatched += 1
@@ -391,6 +419,27 @@ class BinanceClient:
                 realized_pnl = -cost
 
             total_net_pnl += realized_pnl
+
+            # Record into settled positions history
+            closed_item = ClosedPositionInfo(
+                position_id=pos.position_id,
+                market_id=pos.market_id,
+                symbol=pos.symbol,
+                side=pos.side,
+                contracts=pos.contracts,
+                entry_price=pos.entry_price,
+                target_price=pos.target_price,
+                settlement_price=spot,
+                timeframe=pos.timeframe,
+                result="WIN" if won else "LOSS",
+                realized_pnl=round(realized_pnl, 2),
+                entry_time=pos.entry_time,
+                settled_at=time.time(),
+            )
+            self._closed_positions.append(closed_item)
+            if len(self._closed_positions) > 100:
+                self._closed_positions.pop(0)
+
             logger.info(
                 f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe}) SETTLED! "
                 f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
@@ -399,13 +448,90 @@ class BinanceClient:
 
         return round(total_net_pnl, 2)
 
+    def update_positions_market_data(self, current_prices: Dict[str, float]) -> None:
+        """Update live mark price and calculate real-time unrealized PnL for open positions."""
+        for pos in self._paper_positions.values():
+            if pos.symbol in current_prices:
+                spot = current_prices[pos.symbol]
+                pos.current_price = spot
+                # Check binary ITM (In-The-Money) status
+                if pos.side in ("UP", "BUY_YES"):
+                    is_itm = spot >= pos.target_price
+                else:
+                    is_itm = spot < pos.target_price
+                # Binary contract valuation: winning side approaches $0.98, losing side $0.02
+                live_contract_val = 0.95 if is_itm else 0.05
+                pos.unrealized_pnl = round((pos.contracts * live_contract_val) - (pos.contracts * pos.entry_price), 2)
+
     def get_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the most recent order execution log."""
         return [o.model_dump() for o in reversed(self._order_history[-limit:])]
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        """Return currently held active positions."""
+        """Return currently held active open positions."""
         return [p.model_dump() for p in self._paper_positions.values()]
+
+    def get_closed_positions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return historical settled/closed positions."""
+        return [p.model_dump() for p in reversed(self._closed_positions[-limit:])]
+
+    def get_recent_performance(self, symbol: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
+        """
+        Analyze recent closed positions for feedback-driven AI inference and risk scaling.
+        Returns recent outcomes, win rate, consecutive losses, and streak summary.
+        """
+        relevant = self._closed_positions
+        if symbol:
+            clean_sym = symbol.upper()
+            relevant = [p for p in relevant if p.symbol.upper() == clean_sym]
+
+        recent = relevant[-limit:]
+        if not recent:
+            return {
+                "total_rounds": 0,
+                "recent_results": [],
+                "win_count": 0,
+                "loss_count": 0,
+                "win_rate_pct": 0.0,
+                "consecutive_losses": 0,
+                "consecutive_wins": 0,
+                "summary": "No historical rounds yet on this asset.",
+            }
+
+        results = [p.result for p in recent]
+        win_count = sum(1 for r in results if r == "WIN")
+        loss_count = sum(1 for r in results if r == "LOSS")
+        win_rate = (win_count / len(results)) * 100.0
+
+        consecutive_losses = 0
+        consecutive_wins = 0
+        for r in reversed(results):
+            if r == "LOSS":
+                if consecutive_wins > 0:
+                    break
+                consecutive_losses += 1
+            elif r == "WIN":
+                if consecutive_losses > 0:
+                    break
+                consecutive_wins += 1
+
+        sym_label = symbol or "All Assets"
+        summary = f"{sym_label} Last {len(results)} rounds: {results} | Win Rate: {win_rate:.0f}%"
+        if consecutive_losses >= 2:
+            summary += f" | [DRAWDOWN WARNING: {consecutive_losses} consecutive losses]"
+        elif consecutive_wins >= 2:
+            summary += f" | [MOMENTUM STREAK: {consecutive_wins} consecutive wins]"
+
+        return {
+            "total_rounds": len(results),
+            "recent_results": results,
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "win_rate_pct": round(win_rate, 1),
+            "consecutive_losses": consecutive_losses,
+            "consecutive_wins": consecutive_wins,
+            "summary": summary,
+        }
 
     def get_account_summary(self) -> Dict[str, Any]:
         """Return wallet balances and execution statistics."""

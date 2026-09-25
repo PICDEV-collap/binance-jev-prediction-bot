@@ -20,6 +20,7 @@ interface AiTargetRibbonProps {
 }
 
 const SYMBOLS = [
+  { label: '🌐 All Assets (Multi-Scan)', value: 'ALL' },
   { label: 'BTC/USDT', value: 'BTCUSDT' },
   { label: 'ETH/USDT', value: 'ETHUSDT' },
   { label: 'SOL/USDT', value: 'SOLUSDT' },
@@ -43,6 +44,7 @@ export const AiTargetRibbon: React.FC<AiTargetRibbonProps> = ({
   const currentSymbol = status?.target_market?.target_symbol || 'BTCUSDT';
   const currentTimeframe = status?.target_market?.target_timeframe || '15m';
   const evaluatedCount = status?.target_market?.evaluated_rounds_count ?? 0;
+  const isMultiAsset = currentSymbol === 'ALL';
 
   const [isUpdating, setIsUpdating] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -60,7 +62,7 @@ export const AiTargetRibbon: React.FC<AiTargetRibbonProps> = ({
         }),
       });
       if (res.ok) {
-        setSuccessMsg(`Switched to ${newSymbol} (${newTimeframe})`);
+        setSuccessMsg(newSymbol === 'ALL' ? `Multi-Asset Scan Active (${newTimeframe})` : `Switched to ${newSymbol} (${newTimeframe})`);
         setTimeout(() => setSuccessMsg(null), 3000);
         if (onTargetChanged) onTargetChanged(newSymbol, newTimeframe);
       }
@@ -81,17 +83,23 @@ export const AiTargetRibbon: React.FC<AiTargetRibbonProps> = ({
             <Cpu className="w-5 h-5 text-emerald-400" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-mono font-bold uppercase tracking-wider text-emerald-300 flex items-center gap-1.5">
                 <Zap className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
                 Token-Efficient AI Engine (1 Eval / Round)
               </span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-mono font-semibold">
-                99.9% Token Savings Active
-              </span>
+              {isMultiAsset ? (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono font-semibold animate-pulse">
+                  🌐 Multi-Asset Scan Active (6 Pairs)
+                </span>
+              ) : (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-mono font-semibold">
+                  99.9% Token Savings Active
+                </span>
+              )}
             </div>
             <p className="text-xs text-slate-400 font-mono mt-0.5">
-              Local technical indicator calculation • AI consulted strictly <span className="text-emerald-300 font-bold">1 time per round</span> • Supports dual-sided <span className="text-emerald-400 font-bold">UP ▲</span> & <span className="text-rose-400 font-bold">DOWN ▼</span>
+              Strict binary decision: <span className="text-emerald-400 font-bold">UP ▲</span> vs <span className="text-rose-400 font-bold">DOWN ▼</span> • AI consulted <span className="text-emerald-300 font-bold">1 time per round</span>
             </p>
           </div>
         </div>

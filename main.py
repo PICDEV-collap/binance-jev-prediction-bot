@@ -13,7 +13,7 @@ import logging
 import signal
 import sys
 import time
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Set, Optional
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -53,6 +53,7 @@ class ManualTradeRequest(BaseModel):
     side: str  # "UP" or "DOWN"
     contracts: int = 10
     target_price: float
+    strike_price: float | None = None
 
 
 class LoginRequest(BaseModel):
@@ -159,6 +160,8 @@ class TradingBotCoordinator:
                 if markets:
                     active_market_ids = {m["market_id"] for m in markets}
                     current_prices = {m["symbol"]: m["underlying_price"] for m in markets}
+                    # Update live price and unrealized PnL on active open positions
+                    self.binance_client.update_positions_market_data(current_prices)
                     pnl = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
                     if pnl != 0.0:
                         self.risk_guard.record_pnl(pnl)
@@ -167,10 +170,15 @@ class TradingBotCoordinator:
 
                 if self.ws_clients:
                     status = self.get_system_status()
+                    open_pos = self.binance_client.get_positions()
+                    closed_pos = self.binance_client.get_closed_positions()
                     msg = {
                         "type": "HEARTBEAT",
                         "system_status": status,
                         "active_markets": markets,
+                        "open_positions": open_pos,
+                        "closed_positions": closed_pos,
+                        "positions": open_pos,
                     }
                     disconnected: List[WebSocket] = []
                     for client in list(self.ws_clients):
@@ -228,15 +236,21 @@ class TradingBotCoordinator:
             f"Round: {market.market_id} | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f}"
         )
 
+        # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
+        recent_perf = self.binance_client.get_recent_performance(symbol=market.symbol, limit=5)
+        market.recent_performance = recent_perf
+        logger.info(f"[FEEDBACK LOOP] {recent_perf['summary']}")
+
         # Step 1: AI Evaluation via Jev AI Decision Engine
         decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
 
-        # Step 2: Risk & Execution Guard Validation
+        # Step 2: Risk & Execution Guard Validation (Dynamic Gate + Adaptive Sizing)
         open_positions = len(self.binance_client.get_positions())
         risk_result: RiskEvaluationResult = self.risk_guard.validate_and_size_order(
             decision=decision,
             market=market,
-            current_open_positions_count=open_positions
+            current_open_positions_count=open_positions,
+            recent_performance=recent_perf,
         )
 
         # Store rich telemetry record
@@ -259,6 +273,7 @@ class TradingBotCoordinator:
             "time_left_seconds": market.time_left_seconds,
             "decision": decision.model_dump(),
             "risk_validation": risk_result.model_dump(),
+            "recent_performance": recent_perf,
             "order": None,
         }
 
@@ -275,6 +290,8 @@ class TradingBotCoordinator:
                 side=clean_action,
                 contracts=risk_result.adjusted_contracts,
                 target_price=risk_result.target_price,
+                strike_price=market.target_price,
+                spot_price=market.underlying_price,
             )
             record["order"] = order_result.model_dump()
 
@@ -291,11 +308,16 @@ class TradingBotCoordinator:
         if not self.ws_clients:
             return
 
+        open_pos = self.binance_client.get_positions()
+        closed_pos = self.binance_client.get_closed_positions()
         message = {
             "type": "MARKET_EVALUATION",
             "data": event_data,
             "system_status": self.get_system_status(),
             "active_markets": self.ws_listener.get_active_markets(),
+            "open_positions": open_pos,
+            "closed_positions": closed_pos,
+            "positions": open_pos,
         }
 
         disconnected: List[WebSocket] = []
@@ -387,9 +409,14 @@ async def get_orders(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 @app.get("/api/positions")
-async def get_positions() -> List[Dict[str, Any]]:
-    """Get currently active positions."""
-    return bot.binance_client.get_positions()
+async def get_positions_endpoint() -> Dict[str, Any]:
+    """Get currently active open positions and historical closed/settled positions."""
+    return {
+        "status": "success",
+        "open_positions": bot.binance_client.get_positions(),
+        "closed_positions": bot.binance_client.get_closed_positions(),
+        "account": bot.binance_client.get_account_summary(),
+    }
 
 
 @app.post("/api/config")
@@ -499,10 +526,13 @@ async def manual_trade_endpoint(req: ManualTradeRequest) -> Dict[str, Any]:
         side=clean_side,
         contracts=req.contracts,
         target_price=req.target_price,
+        strike_price=req.strike_price if req.strike_price is not None else 0.0,
     )
     return {
         "status": "success",
         "order": order_result.model_dump(),
+        "open_positions": bot.binance_client.get_positions(),
+        "closed_positions": bot.binance_client.get_closed_positions(),
         "account": bot.binance_client.get_account_summary(),
     }
 
@@ -545,13 +575,17 @@ async def websocket_telemetry_endpoint(websocket: WebSocket) -> None:
     bot.ws_clients.add(websocket)
     try:
         # Send initial snapshot immediately upon connection
+        open_pos = bot.binance_client.get_positions()
+        closed_pos = bot.binance_client.get_closed_positions()
         snapshot = {
             "type": "INITIAL_SNAPSHOT",
             "system_status": bot.get_system_status(),
             "active_markets": bot.ws_listener.get_active_markets(),
             "recent_decisions": list(reversed(bot.recent_decisions[-20:])),
             "orders": bot.binance_client.get_order_history(limit=20),
-            "positions": bot.binance_client.get_positions(),
+            "open_positions": open_pos,
+            "closed_positions": closed_pos,
+            "positions": open_pos,
         }
         await websocket.send_json(snapshot)
 

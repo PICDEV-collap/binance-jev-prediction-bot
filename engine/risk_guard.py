@@ -76,10 +76,12 @@ class RiskGuard:
         self,
         decision: JevEvaluationResult,
         market: MarketContext,
-        current_open_positions_count: int = 0
+        current_open_positions_count: int = 0,
+        recent_performance: Optional[Dict[str, Any]] = None,
     ) -> RiskEvaluationResult:
         """
         Evaluate proposed trade against all risk controls and determine safe sizing.
+        Includes Approach 3 Hybrid feedback: dynamic defensive hurdles and anti-martingale sizing.
         """
         self._total_evaluated += 1
         now = time.time()
@@ -113,19 +115,28 @@ class RiskGuard:
                 action=decision.action
             )
 
-        # Gate 2: Confidence Threshold Check (Required >= 0.80)
-        if decision.confidence < self.confidence_threshold:
+        # Gate 2: Confidence Threshold Check (Required >= threshold)
+        # Dynamic Defensive Hurdle: if on consecutive losses, demand higher conviction
+        effective_threshold = self.confidence_threshold
+        consecutive_losses = 0
+        if recent_performance:
+            consecutive_losses = recent_performance.get("consecutive_losses", 0)
+            if consecutive_losses >= 2:
+                # Dynamic defensive hurdle: raise required threshold by 3% per loss past 1 (capped at 92%)
+                effective_threshold = min(0.92, self.confidence_threshold + (0.03 * (consecutive_losses - 1)))
+
+        if decision.confidence < effective_threshold:
             self._record_rejection("LOW_CONFIDENCE")
-            logger.info(
-                f"[RISK FILTER] Confidence {decision.confidence:.2f} < threshold "
-                f"{self.confidence_threshold:.2f} for {market.market_id}. Rejection logged."
+            filter_reason = (
+                f"AI Signal: {decision.action} ({decision.confidence*100:.1f}%) "
+                f"— Filtered: Below {effective_threshold*100:.0f}% conviction gate"
             )
+            if consecutive_losses >= 2:
+                filter_reason += f" (Defensive gate active: {consecutive_losses} consecutive losses on {market.symbol})"
+            logger.info(f"[RISK FILTER] {filter_reason} for {market.market_id}. Capital preserved.")
             return RiskEvaluationResult(
                 approved=False,
-                reason=(
-                    f"Confidence {decision.confidence:.2f} strictly below "
-                    f"threshold {self.confidence_threshold:.2f}"
-                ),
+                reason=filter_reason,
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
@@ -201,9 +212,25 @@ class RiskGuard:
 
         contracts = max(1, min(self.default_order_contracts, max_possible_contracts))
 
+        # Anti-Martingale / Defensive sizing if on losing streak
+        if consecutive_losses >= 2:
+            contracts = max(1, contracts // 2)
+            logger.info(
+                f"[RISK DEFENSE] Sizing reduced to {contracts}x on {market.symbol} "
+                f"due to {consecutive_losses} consecutive losses."
+            )
+        elif recent_performance and recent_performance.get("consecutive_wins", 0) >= 3:
+            contracts = min(max_possible_contracts, int(contracts * 1.2))
+
         # Successfully Approved!
         self._total_approved += 1
         self._market_last_traded[market.market_id] = now
+        approval_reason = "All risk & execution gates passed successfully"
+        if consecutive_losses >= 2:
+            approval_reason += f" (Defensive sizing: {consecutive_losses} losses on {market.symbol})"
+        elif recent_performance and recent_performance.get("consecutive_wins", 0) >= 2:
+            approval_reason += f" (Momentum streak: {recent_performance.get('consecutive_wins')} wins on {market.symbol})"
+
         logger.info(
             f"[RISK APPROVED] {decision.action} on {market.market_id} | "
             f"Size: {contracts} contracts @ {target_price:.3f} | Conf: {decision.confidence:.2f}"
@@ -211,7 +238,7 @@ class RiskGuard:
 
         return RiskEvaluationResult(
             approved=True,
-            reason="All risk & execution gates passed successfully",
+            reason=approval_reason,
             adjusted_contracts=contracts,
             confidence=decision.confidence,
             market_id=market.market_id,

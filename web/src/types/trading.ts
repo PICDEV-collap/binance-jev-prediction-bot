@@ -57,6 +57,36 @@ export interface OrderItem {
   timestamp: number;
 }
 
+export interface PositionItem {
+  position_id: string;
+  market_id: string;
+  symbol: string;
+  side: ActionType;
+  contracts: number;
+  entry_price: number;
+  current_price: number;
+  target_price: number;
+  timeframe?: string;
+  unrealized_pnl: number;
+  entry_time: number;
+}
+
+export interface ClosedPositionItem {
+  position_id: string;
+  market_id: string;
+  symbol: string;
+  side: ActionType;
+  contracts: number;
+  entry_price: number;
+  target_price: number;
+  settlement_price: number;
+  timeframe?: string;
+  result: 'WIN' | 'LOSS';
+  realized_pnl: number;
+  entry_time: number;
+  settled_at: number;
+}
+
 export interface SystemStatus {
   is_paused: boolean;
   uptime_seconds: number;
@@ -121,5 +151,15 @@ export interface TelemetryRecord {
   time_left_seconds?: number;
   decision: JevDecision;
   risk_validation: RiskValidation;
+  recent_performance?: {
+    total_rounds: number;
+    recent_results: string[];
+    win_count: number;
+    loss_count: number;
+    win_rate_pct: number;
+    consecutive_losses: number;
+    consecutive_wins: number;
+    summary: string;
+  };
   order?: OrderItem | null;
 }

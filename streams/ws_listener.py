@@ -275,7 +275,9 @@ class BinanceWSListener:
             contexts = self._normalize_market_data(data)
             if contexts:
                 for market_context in contexts:
-                    self._active_markets[market_context.market_id] = market_context
+                    # Key by unique symbol + timeframe to guarantee exactly 1 live round per pair (at most 24 total)
+                    key = f"{market_context.symbol}_{market_context.timeframe}"
+                    self._active_markets[key] = market_context
                     self._last_event_time = time.time()
 
                     # Non-blocking distribution to trading core
@@ -472,8 +474,7 @@ class BinanceWSListener:
                 self._messages_received += 1
                 self._last_heartbeat_time = time.time()
                 self._last_event_time = time.time()
-                self._active_markets[symbol] = market
-                self._active_markets[market.market_id] = market
+                self._active_markets[f"{symbol}_{market.timeframe}"] = market
 
                 if self.on_market_event:
                     self._events_dispatched += 1
@@ -482,13 +483,34 @@ class BinanceWSListener:
                 await asyncio.sleep(2.0)
 
     def get_active_markets(self) -> List[Dict[str, Any]]:
-        """Return snapshot of currently active prediction markets across all assets and timeframes."""
+        """
+        Return snapshot of currently active prediction markets across all assets and timeframes.
+        Guarantees strictly 1 active round per symbol-timeframe pair (exactly 24 markets max).
+        """
         now = time.time()
-        # Clean up stale rounds from active markets
+        tf_dict = dict(TIMEFRAMES)
+        active_list: List[MarketContext] = []
+
+        # Prune older round base prices to avoid memory growth
+        if len(self._round_base_prices) > 300:
+            for old_key in list(self._round_base_prices.keys())[:-100]:
+                self._round_base_prices.pop(old_key, None)
+
         for k in list(self._active_markets.keys()):
             m = self._active_markets[k]
-            if m.time_left_seconds <= 0:
-                self._active_markets.pop(k, None)
+            round_period = tf_dict.get(m.timeframe, 300)
+            time_left = round_period - int(now % round_period)
+            current_round_idx = int(now // round_period)
+            expected_round_id = f"{m.symbol}-{m.timeframe.upper()}-R{current_round_idx}"
+
+            # If round transitioned before tick, refresh round ID & time remaining
+            if m.market_id != expected_round_id:
+                m.market_id = expected_round_id
+                if expected_round_id in self._round_base_prices:
+                    m.target_price = self._round_base_prices[expected_round_id]
+
+            m.time_left_seconds = time_left
+            active_list.append(m)
 
         sym_order = {s: i for i, s in enumerate(SUPPORTED_SYMBOLS)}
         tf_order = {"5m": 0, "15m": 1, "1h": 2, "1d": 3}
@@ -496,7 +518,7 @@ class BinanceWSListener:
         def sort_key(m: MarketContext):
             return (sym_order.get(m.symbol, 99), tf_order.get(m.timeframe, 99))
 
-        sorted_markets = sorted(self._active_markets.values(), key=sort_key)
+        sorted_markets = sorted(active_list, key=sort_key)
         return [m.model_dump() for m in sorted_markets]
 
     @property
