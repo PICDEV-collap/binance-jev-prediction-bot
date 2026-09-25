@@ -1,6 +1,9 @@
 import type { Metadata } from 'next';
 import './globals.css';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 export const metadata: Metadata = {
   title: 'Binance Prediction Markets Bot | Jev AI Engine',
   description: 'High-Performance Event-Driven Quantitative Prediction Trading Bot integrated with Jev AI Decision Engine',
