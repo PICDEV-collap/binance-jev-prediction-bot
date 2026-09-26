@@ -1,6 +1,9 @@
-"""
-Unit and integration tests for Binance Prediction Auto-Claim (Batch Redeem) feature.
-"""
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import asyncio
 import time
 import pytest

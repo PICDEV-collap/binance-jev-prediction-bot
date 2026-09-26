@@ -139,6 +139,18 @@ class BinanceClient:
         self._active_account_type: str = "CeDeFi"
         self._prediction_market_cache: Dict[str, Any] = {}
         self._prediction_cache_timestamp: float = 0.0
+        self._background_tasks: Set[asyncio.Task] = set()
+
+    def _spawn_task(self, coro) -> Optional[asyncio.Task]:
+        """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(coro)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return task
+        except RuntimeError:
+            return None
 
     async def start(self) -> None:
         """Initialize session with persistent connection pooling and sync time."""
@@ -166,7 +178,13 @@ class BinanceClient:
                 await self.sync_server_time()
 
     async def close(self) -> None:
-        """Clean up HTTP session."""
+        """Clean up HTTP session and background tasks."""
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+
         if self._session and not self._session.closed:
             await self._session.close()
             await asyncio.sleep(0.05)
@@ -1032,17 +1050,13 @@ class BinanceClient:
                 })
 
                 if mode_label == "LIVE":
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(self.fetch_live_balance())
-                        if won and getattr(pos, "token_id", None):
-                            logger.info(
-                                f"[AUTO-CLAIM TRIGGER] Won live contract {pos.symbol} {pos.side} "
-                                f"(token: {pos.token_id[:16]}...). Triggering instant batch redeem..."
-                            )
-                            loop.create_task(self.redeem_prediction_tokens([pos.token_id]))
-                    except RuntimeError:
-                        pass
+                    self._spawn_task(self.fetch_live_balance())
+                    if won and getattr(pos, "token_id", None):
+                        logger.info(
+                            f"[AUTO-CLAIM QUEUED] Won live contract {pos.symbol} {pos.side} "
+                            f"(token: {pos.token_id[:16]}...). Queued for settlement auto-claim verification."
+                        )
+                        self._spawn_task(self.claim_all_won_positions())
 
                 logger.info(
                     f"[{mode_label} SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
@@ -1477,8 +1491,11 @@ class BinanceClient:
                     positions = data.get("positions", [])
                     for pos in positions:
                         token_id = str(pos.get("tokenId", "")).strip()
-                        can_claim = bool(pos.get("canClaim", False))
-                        claimable_amt = float(pos.get("claimableAmount", 0.0) or 0.0)
+                        can_claim = pos.get("canClaim") is True or str(pos.get("canClaim", "")).lower() == "true"
+                        try:
+                            claimable_amt = float(pos.get("claimableAmount", 0.0) or 0.0)
+                        except (ValueError, TypeError):
+                            claimable_amt = 0.0
                         if token_id and (can_claim or claimable_amt > 0):
                             token_ids.append(token_id)
         except Exception as e:
@@ -1550,7 +1567,7 @@ class BinanceClient:
                         f"Claimed: {success_count}/{len(clean_ids)}"
                     )
                     # Trigger balance refresh so the UI updates immediately
-                    asyncio.create_task(self.fetch_live_balance())
+                    self._spawn_task(self.fetch_live_balance())
                     return {
                         "success": True,
                         "batch_id": batch_id,
@@ -1561,11 +1578,16 @@ class BinanceClient:
                 else:
                     err_msg = data.get("msg", data.get("message", f"HTTP {status}"))
                     logger.warning(f"[BINANCE AUTO-CLAIM ERROR] Batch redeem failed: {err_msg}")
-                    # If Binance returns error (e.g. SYSTEM_ERROR when already auto-credited or sold),
-                    # mark them claimed locally to stop infinite retries.
-                    for pos in self._closed_positions:
-                        if pos.token_id in clean_ids:
-                            pos.is_claimed = True
+                    # Only mark as claimed if Binance explicitly confirms the token was already claimed/redeemed or invalid.
+                    # Never mark as claimed on transient errors (HTTP 429, 502/503, timestamp drift -1021, etc.)
+                    # or pending settlement status (e.g. "not claimable yet").
+                    is_terminal_claim_error = any(kw in str(err_msg).lower() for kw in [
+                        "already claimed", "already redeemed", "invalid token", "not found", "does not exist"
+                    ])
+                    if is_terminal_claim_error:
+                        for pos in self._closed_positions:
+                            if pos.token_id in clean_ids:
+                                pos.is_claimed = True
                     return {"success": False, "error": err_msg, "token_ids": clean_ids}
         except Exception as e:
             logger.error(f"[BINANCE AUTO-CLAIM EXCEPTION] Error calling batch-redeem: {e}")
@@ -1584,12 +1606,14 @@ class BinanceClient:
             for tid in api_claimable:
                 token_ids_to_claim.add(tid)
 
-            # In live trading, if a local winning position is NOT in Binance's claimable list,
-            # Binance has already credited the payout directly to the wallet balance (or it was sold early).
-            # Mark it claimed to keep state clean and avoid infinite retry errors.
+            # In live trading, only mark a local won position as claimed if it settled at least
+            # 300 seconds (5 minutes) ago AND is still not in Binance's claimable list.
+            # This grace period prevents premature marking while Binance backend processes round settlement!
+            now = time.time()
             for pos in self._closed_positions:
                 if pos.token_id and not getattr(pos, "is_claimed", False):
-                    if pos.token_id not in token_ids_to_claim:
+                    settled_age = now - getattr(pos, "settled_at", pos.entry_time)
+                    if pos.token_id not in token_ids_to_claim and settled_age > 300.0:
                         pos.is_claimed = True
         else:
             # Paper trading simulation

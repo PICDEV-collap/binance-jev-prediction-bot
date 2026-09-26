@@ -11,7 +11,7 @@ Multi-tier risk validation firewall:
 from __future__ import annotations
 import logging
 import time
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, Set
 from pydantic import BaseModel, Field
 
 from .jev_client import JevEvaluationResult, MarketContext
@@ -118,8 +118,17 @@ class RiskGuard:
             "NEGATIVE_EV_RISK": 0,
             "UNREALISTIC_VELOCITY_RISK": 0,
             "UNSUPPORTED_PREDICTION_ASSET": 0,
+            "POSITION_SIZE_EXCEEDED": 0,
         }
         self.supported_prediction_symbols: Set[str] = {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+
+    def record_market_traded(self, market_id: str) -> None:
+        """Mark market round as traded to enforce cooldown period."""
+        self._market_last_traded[market_id] = time.time()
+
+    def rollback_market_traded(self, market_id: str) -> None:
+        """Rollback market cooldown if order execution failed or was rejected by exchange."""
+        self._market_last_traded.pop(market_id, None)
 
     def set_supported_symbols(self, symbols: Set[str]) -> None:
         """Update the set of valid binary prediction market symbols."""
@@ -565,8 +574,43 @@ class RiskGuard:
             )
 
         # --- Position Sizing Calculation ---
-        # Formula: Cap position exposure by max_position_size_usdt
-        max_possible_contracts = int(self.max_position_size_usdt / target_price) if target_price > 0 else 0
+        if target_price <= 0:
+            self._record_rejection("INVALID_PRICING")
+            return RiskEvaluationResult(
+                approved=False,
+                reason="Invalid pricing: target_price must be > 0",
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
+
+        # Formula: Cap position exposure strictly by max_position_size_usdt
+        max_possible_contracts = int(self.max_position_size_usdt / target_price)
+        if max_possible_contracts < 1:
+            self._record_rejection("POSITION_SIZE_EXCEEDED")
+            reject_reason = (
+                f"Position size budget (${self.max_position_size_usdt:.2f}) is smaller than "
+                f"single contract price (${target_price:.3f}). Order rejected to preserve capital."
+            )
+            logger.info(f"[RISK FILTER] {reject_reason} for {market.market_id}")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=reject_reason,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                target_price=target_price,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
 
         if self.martingale_enabled and step > 0:
             raw_contracts = int(self.default_order_contracts * multiplier)
@@ -580,11 +624,11 @@ class RiskGuard:
             # Base sizing: Scaled dynamically with confidence excess over threshold
             confidence_scaler = 1.0 + max(0.0, (decision.confidence - self.confidence_threshold) * 2.0)
             budget = min(self.max_position_size_usdt, self.max_position_size_usdt * confidence_scaler)
-            base_limit = int(budget / target_price) if target_price > 0 else 0
-            contracts = max(1, min(self.default_order_contracts, base_limit))
+            base_limit = int(budget / target_price)
+            contracts = max(1, min(self.default_order_contracts, base_limit, max_possible_contracts))
             approval_reason = "Base round order approved"
             if recent_performance and recent_performance.get("consecutive_wins", 0) >= 3:
-                contracts = min(max_possible_contracts, int(contracts * 1.2))
+                contracts = min(max_possible_contracts, max(1, int(contracts * 1.2)))
                 approval_reason += f" (Win streak boost: {recent_performance.get('consecutive_wins')} wins)"
 
         # Successfully Approved!

@@ -376,7 +376,22 @@ class JevClient:
             elif "action" in data and "confidence" in data:
                 content = json.dumps(data)
 
-            parsed = json.loads(content)
+            # Clean and extract JSON safely from markdown code blocks or wrapper text
+            cleaned = content.strip()
+            if cleaned.startswith("```"):
+                first_nl = cleaned.find("\n")
+                if first_nl != -1:
+                    cleaned = cleaned[first_nl + 1:]
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3].strip()
+            if "{" in cleaned and "}" in cleaned:
+                start_idx = cleaned.find("{")
+                end_idx = cleaned.rfind("}")
+                cleaned = cleaned[start_idx : end_idx + 1]
+
+            parsed = json.loads(cleaned) if cleaned else {}
+            if not isinstance(parsed, dict):
+                parsed = {}
             raw_action = str(parsed.get("action", "UP")).upper()
             action = "DOWN" if raw_action in ["DOWN", "BUY_NO"] else "UP"
             confidence = float(parsed.get("confidence", 0.55))

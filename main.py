@@ -173,6 +173,15 @@ class TradingBotCoordinator:
         self.ws_clients: Set[WebSocket] = set()
         self._last_eval_time: Dict[str, float] = {}
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._eval_in_progress: Set[str] = set()
+
+    def _spawn_task(self, coro, name: Optional[str] = None) -> asyncio.Task:
+        """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def start(self) -> None:
         """Start trading core and all network sessions."""
@@ -194,9 +203,9 @@ class TradingBotCoordinator:
         await self.binance_client.start()
         await self.ws_listener.start()
         if not self.binance_client.paper_trading:
-            asyncio.create_task(self.binance_client.fetch_live_balance())
-            asyncio.create_task(self._init_live_catalog())
-        self._heartbeat_task = asyncio.create_task(self._dashboard_heartbeat_loop())
+            self._spawn_task(self.binance_client.fetch_live_balance(), name="init_balance")
+            self._spawn_task(self._init_live_catalog(), name="init_catalog")
+        self._heartbeat_task = self._spawn_task(self._dashboard_heartbeat_loop(), name="heartbeat_loop")
 
     async def _init_live_catalog(self) -> None:
         """Fetch live prediction market catalog and sync supported symbols to RiskGuard."""
@@ -217,6 +226,14 @@ class TradingBotCoordinator:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+
+        # Cancel and drain background tasks
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+
         await self.ws_listener.stop()
         await self.binance_client.close()
         await self.jev_client.close()
@@ -232,15 +249,15 @@ class TradingBotCoordinator:
 
                 # If live trading with API keys, poll Binance live balance every 5s or immediately if not loaded
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 5 == 0 or self.binance_client._live_balance_usdt <= 0.05):
-                    asyncio.create_task(self.binance_client.fetch_live_balance())
+                    self._spawn_task(self.binance_client.fetch_live_balance(), name="periodic_balance")
 
                 # Periodic auto-claim sweep every 30s to claim any pending won contracts
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 30 == 0):
-                    asyncio.create_task(self.binance_client.claim_all_won_positions())
+                    self._spawn_task(self.binance_client.claim_all_won_positions(), name="periodic_claim")
 
                 # Periodic server time re-sync every 60s to continuously prevent clock drift (-1021)
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
-                    asyncio.create_task(self.binance_client.sync_server_time())
+                    self._spawn_task(self.binance_client.sync_server_time(), name="periodic_sync_time")
 
                 # Settle prediction positions when a round expires
                 if markets:
@@ -267,7 +284,7 @@ class TradingBotCoordinator:
                             symbol=rec["symbol"]
                         )
                     if any(rec.get("won") for rec in settled_records):
-                        asyncio.create_task(self.binance_client.claim_all_won_positions())
+                        self._spawn_task(self.binance_client.claim_all_won_positions(), name="settle_claim")
                     # Prune expired rounds from memory sets
                     self.evaluated_rounds = {rid for rid in self.evaluated_rounds if rid in active_market_ids}
                     self.traded_rounds = {rid for rid in self.traded_rounds if rid in active_market_ids}
@@ -288,7 +305,7 @@ class TradingBotCoordinator:
                     disconnected: List[WebSocket] = []
                     for client in list(self.ws_clients):
                         try:
-                            await client.send_json(msg)
+                            await asyncio.wait_for(client.send_json(msg), timeout=0.8)
                         except Exception:
                             disconnected.append(client)
                     for dead in disconnected:
@@ -357,6 +374,10 @@ class TradingBotCoordinator:
             self.traded_rounds.add(market.market_id)
             return
 
+        # Check if an evaluation or order dispatch is already in progress for this round
+        if market.market_id in self._eval_in_progress:
+            return
+
         # Cadence Filter: Evaluate every eval_interval_seconds (default 60s / 1 min)
         now = time.time()
         last_eval = self.last_eval_time.get(market.market_id, 0.0)
@@ -366,103 +387,110 @@ class TradingBotCoordinator:
         # Record this evaluation timestamp
         self.last_eval_time[market.market_id] = now
         self.evaluated_rounds.add(market.market_id)
+        self._eval_in_progress.add(market.market_id)
 
-        logger.info(
-            f"[AI EVALUATION TRIGGERED: Every {self.eval_interval_seconds}s] Symbol: {market.symbol} | TF: {market.timeframe} | "
-            f"Round: {market.market_id} | TimeLeft: {market.time_left_seconds}s | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f} | "
-            f"DVR: {market.dvr_ratio:+.2f}sigma | OBI: {market.order_book_imbalance:+.2f} | Trend: {market.ema_trend} | RSI: {market.rsi_5m:.1f}"
-        )
-
-        # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
-        recent_perf = self.binance_client.get_recent_performance(symbol=market.symbol, limit=5)
-        market.recent_performance = recent_perf
-        market.martingale_step = self.risk_guard.get_symbol_martingale_step(market.symbol)
-        market.martingale_stage = self.risk_guard.get_stage_label(market.symbol)
-        market.effective_hurdle = self.risk_guard.get_effective_confidence_threshold(market.symbol)
-        logger.info(
-            f"[FEEDBACK LOOP] {recent_perf['summary']} | "
-            f"Stage: {market.martingale_stage} (Hurdle: {market.effective_hurdle*100:.0f}%)"
-        )
-
-        # Step 1: AI Evaluation via Jev AI Decision Engine
-        decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
-
-        # Step 2: Risk & Execution Guard Validation (Dynamic Gate + Adaptive Sizing)
-        open_positions = len(self.binance_client.get_positions())
-        risk_result: RiskEvaluationResult = self.risk_guard.validate_and_size_order(
-            decision=decision,
-            market=market,
-            current_open_positions_count=open_positions,
-            recent_performance=recent_perf,
-        )
-
-        # Store rich telemetry record
-        record = {
-            "timestamp": time.time(),
-            "market_id": market.market_id,
-            "symbol": market.symbol,
-            "question": market.question,
-            "timeframe": market.timeframe,
-            "odds_up": getattr(market, "odds_up", market.odds_yes),
-            "odds_down": getattr(market, "odds_down", market.odds_no),
-            "odds_yes": market.odds_yes,
-            "odds_no": market.odds_no,
-            "underlying_price": market.underlying_price,
-            "target_price": market.target_price,
-            "price_diff": market.price_diff,
-            "momentum_pct": market.momentum_pct,
-            "atr_1m": getattr(market, "atr_1m", 0.0),
-            "dvr_ratio": getattr(market, "dvr_ratio", 0.0),
-            "rsi_1m": getattr(market, "rsi_1m", 50.0),
-            "rsi_5m": getattr(market, "rsi_5m", 50.0),
-            "ema_trend": getattr(market, "ema_trend", "NEUTRAL_CHOP"),
-            "order_book_imbalance": getattr(market, "order_book_imbalance", 0.0),
-            "market_regime": getattr(market, "market_regime", "RANGING"),
-            "expiry_danger_flag": getattr(market, "expiry_danger_flag", False),
-            "btc_correlation_dir": getattr(market, "btc_correlation_dir", "FLAT"),
-            "spread": market.spread,
-            "volume_24h": market.volume_24h,
-            "time_left_seconds": market.time_left_seconds,
-            "decision": decision.model_dump(),
-            "risk_validation": risk_result.model_dump(),
-            "recent_performance": recent_perf,
-            "order": None,
-        }
-
-        # Step 3: Order Execution (UP or DOWN if approved by Risk Guard)
-        if risk_result.approved and risk_result.action in ("UP", "DOWN", "BUY_YES", "BUY_NO"):
-            clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
+        try:
             logger.info(
-                f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
-                f"on {market.market_id} ({market.timeframe}) [{risk_result.stage_label}] @ {risk_result.target_price:.3f}"
+                f"[AI EVALUATION TRIGGERED: Every {self.eval_interval_seconds}s] Symbol: {market.symbol} | TF: {market.timeframe} | "
+                f"Round: {market.market_id} | TimeLeft: {market.time_left_seconds}s | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f} | "
+                f"DVR: {market.dvr_ratio:+.2f}sigma | OBI: {market.order_book_imbalance:+.2f} | Trend: {market.ema_trend} | RSI: {market.rsi_5m:.1f}"
             )
-            order_result: OrderResult = await self.binance_client.place_prediction_order(
-                market_id=market.market_id,
-                symbol=market.symbol,
-                side=clean_action,
-                contracts=risk_result.adjusted_contracts,
-                target_price=risk_result.target_price,
-                strike_price=market.target_price,
-                spot_price=market.underlying_price,
-                martingale_step=risk_result.martingale_step,
-                stage=risk_result.stage_label,
-                timeframe=market.timeframe,
+
+            # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
+            recent_perf = self.binance_client.get_recent_performance(symbol=market.symbol, limit=5)
+            market.recent_performance = recent_perf
+            market.martingale_step = self.risk_guard.get_symbol_martingale_step(market.symbol)
+            market.martingale_stage = self.risk_guard.get_stage_label(market.symbol)
+            market.effective_hurdle = self.risk_guard.get_effective_confidence_threshold(market.symbol)
+            logger.info(
+                f"[FEEDBACK LOOP] {recent_perf['summary']} | "
+                f"Stage: {market.martingale_stage} (Hurdle: {market.effective_hurdle*100:.0f}%)"
             )
-            record["order"] = order_result.model_dump()
-            if order_result.status in ("FILLED", "SIMULATED", "NEW"):
-                self.traded_rounds.add(market.market_id)
+
+            # Step 1: AI Evaluation via Jev AI Decision Engine
+            decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
+
+            # Step 2: Risk & Execution Guard Validation (Dynamic Gate + Adaptive Sizing)
+            open_positions = len(self.binance_client.get_positions())
+            risk_result: RiskEvaluationResult = self.risk_guard.validate_and_size_order(
+                decision=decision,
+                market=market,
+                current_open_positions_count=open_positions,
+                recent_performance=recent_perf,
+            )
+
+            # Store rich telemetry record
+            record = {
+                "timestamp": time.time(),
+                "market_id": market.market_id,
+                "symbol": market.symbol,
+                "question": market.question,
+                "timeframe": market.timeframe,
+                "odds_up": getattr(market, "odds_up", market.odds_yes),
+                "odds_down": getattr(market, "odds_down", market.odds_no),
+                "odds_yes": market.odds_yes,
+                "odds_no": market.odds_no,
+                "underlying_price": market.underlying_price,
+                "target_price": market.target_price,
+                "price_diff": market.price_diff,
+                "momentum_pct": market.momentum_pct,
+                "atr_1m": getattr(market, "atr_1m", 0.0),
+                "dvr_ratio": getattr(market, "dvr_ratio", 0.0),
+                "rsi_1m": getattr(market, "rsi_1m", 50.0),
+                "rsi_5m": getattr(market, "rsi_5m", 50.0),
+                "ema_trend": getattr(market, "ema_trend", "NEUTRAL_CHOP"),
+                "order_book_imbalance": getattr(market, "order_book_imbalance", 0.0),
+                "market_regime": getattr(market, "market_regime", "RANGING"),
+                "expiry_danger_flag": getattr(market, "expiry_danger_flag", False),
+                "btc_correlation_dir": getattr(market, "btc_correlation_dir", "FLAT"),
+                "spread": market.spread,
+                "volume_24h": market.volume_24h,
+                "time_left_seconds": market.time_left_seconds,
+                "decision": decision.model_dump(),
+                "risk_validation": risk_result.model_dump(),
+                "recent_performance": recent_perf,
+                "order": None,
+            }
+
+            # Step 3: Order Execution (UP or DOWN if approved by Risk Guard)
+            if risk_result.approved and risk_result.action in ("UP", "DOWN", "BUY_YES", "BUY_NO"):
+                clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
                 logger.info(
-                    f"[ORDER ENTERED] Position open on {market.market_id} ({market.symbol} {clean_action}). "
-                    f"Round entry complete, pausing further evaluations for this round."
+                    f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
+                    f"on {market.market_id} ({market.timeframe}) [{risk_result.stage_label}] @ {risk_result.target_price:.3f}"
                 )
+                order_result: OrderResult = await self.binance_client.place_prediction_order(
+                    market_id=market.market_id,
+                    symbol=market.symbol,
+                    side=clean_action,
+                    contracts=risk_result.adjusted_contracts,
+                    target_price=risk_result.target_price,
+                    strike_price=market.target_price,
+                    spot_price=market.underlying_price,
+                    martingale_step=risk_result.martingale_step,
+                    stage=risk_result.stage_label,
+                    timeframe=market.timeframe,
+                )
+                record["order"] = order_result.model_dump()
+                if order_result.status in ("FILLED", "SIMULATED", "NEW"):
+                    self.traded_rounds.add(market.market_id)
+                    self.risk_guard.record_market_traded(market.market_id)
+                    logger.info(
+                        f"[ORDER ENTERED] Position open on {market.market_id} ({market.symbol} {clean_action}). "
+                        f"Round entry complete, pausing further evaluations for this round."
+                    )
+                else:
+                    self.risk_guard.rollback_market_traded(market.market_id)
 
-        # Cache last 50 decisions
-        self.recent_decisions.append(record)
-        if len(self.recent_decisions) > 50:
-            self.recent_decisions.pop(0)
+            # Cache last 50 decisions
+            self.recent_decisions.append(record)
+            if len(self.recent_decisions) > 50:
+                self.recent_decisions.pop(0)
 
-        # Broadcast update to connected dashboard WebSocket clients
-        await self._broadcast_telemetry(record)
+            # Broadcast update to connected dashboard WebSocket clients
+            await self._broadcast_telemetry(record)
+        finally:
+            self._eval_in_progress.discard(market.market_id)
 
     async def _broadcast_telemetry(self, event_data: Dict[str, Any]) -> None:
         """Broadcast live tick and decision event to all connected dashboard websockets."""
@@ -484,7 +512,7 @@ class TradingBotCoordinator:
         disconnected: List[WebSocket] = []
         for client in list(self.ws_clients):
             try:
-                await client.send_json(message)
+                await asyncio.wait_for(client.send_json(message), timeout=0.8)
             except Exception:
                 disconnected.append(client)
 
@@ -776,10 +804,18 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         bot.binance_client.paper_trading = req.paper_trading
         if prev_mode and not req.paper_trading:
             bot.binance_client.clear_paper_positions()
+            if bot.binance_client.api_key:
+                bot._spawn_task(bot.binance_client.sync_server_time(), name="switch_live_sync_time")
+                bot._spawn_task(bot.binance_client.fetch_live_balance(), name="switch_live_balance")
         logger.info(f"Updated Paper Trading mode to: {req.paper_trading}")
 
     if req.binance_api_key is not None and req.binance_api_key.strip():
         bot.binance_client.api_key = req.binance_api_key.strip()
+        if bot.binance_client._session and not bot.binance_client._session.closed:
+            bot.binance_client._session.headers["X-MBX-APIKEY"] = bot.binance_client.api_key
+        if not bot.binance_client.paper_trading:
+            bot._spawn_task(bot.binance_client.sync_server_time(), name="key_update_sync_time")
+            bot._spawn_task(bot.binance_client.fetch_live_balance(), name="key_update_live_balance")
         logger.info("Updated Binance API Key")
 
     if req.binance_api_secret is not None and req.binance_api_secret.strip():

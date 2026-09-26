@@ -17,7 +17,7 @@ import math
 import random
 import time
 from enum import Enum
-from typing import Callable, Coroutine, Any, Optional, Dict, List
+from typing import Callable, Coroutine, Any, Optional, Dict, List, Set
 
 import aiohttp
 import websockets
@@ -109,6 +109,14 @@ class BinanceWSListener:
         self._round_base_prices: Dict[str, float] = {}
         self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
         self._btc_momentum: float = 0.0
+        self._background_tasks: Set[asyncio.Task] = set()
+
+    def _spawn_task(self, coro) -> asyncio.Task:
+        """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def start(self) -> None:
         """Start the WebSocket listener, watchdog, and network health prober."""
@@ -120,14 +128,14 @@ class BinanceWSListener:
         logger.info(f"Starting Binance WebSocket Listener (Mock Mode: {self.enable_mock_stream})...")
 
         if self.enable_mock_stream:
-            self._mock_task = asyncio.create_task(self._run_mock_stream_generator())
+            self._mock_task = self._spawn_task(self._run_mock_stream_generator())
         else:
             self._http_session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=4.0)
             )
-            self._listener_task = asyncio.create_task(self._connection_supervisor())
-            self._watchdog_task = asyncio.create_task(self._watchdog_rest_poller())
-            self._network_liveness_task = asyncio.create_task(self._network_liveness_prober())
+            self._listener_task = self._spawn_task(self._connection_supervisor())
+            self._watchdog_task = self._spawn_task(self._watchdog_rest_poller())
+            self._network_liveness_task = self._spawn_task(self._network_liveness_prober())
 
     async def stop(self) -> None:
         """Gracefully stop the listener, watchdog, and close sockets."""
@@ -165,6 +173,13 @@ class BinanceWSListener:
                 await self._mock_task
             except asyncio.CancelledError:
                 pass
+
+        # Drain all remaining event dispatch background tasks
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
 
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
@@ -242,7 +257,7 @@ class BinanceWSListener:
             "params": [
                 "btcusdt@ticker",
                 "ethusdt@ticker",
-                "solusdt@ticker",
+                "bnbusdt@ticker",
             ],
             "id": int(time.time()),
         }
@@ -300,7 +315,7 @@ class BinanceWSListener:
                     # Non-blocking distribution to trading core
                     if self.on_market_event:
                         self._events_dispatched += 1
-                        asyncio.create_task(self._safe_dispatch_event(market_context))
+                        self._spawn_task(self._safe_dispatch_event(market_context))
         except Exception as err:
             logger.error(f"Error processing single tick: {err}", exc_info=True)
 
@@ -555,7 +570,7 @@ class BinanceWSListener:
 
                 if self.on_market_event:
                     self._events_dispatched += 1
-                    asyncio.create_task(self._safe_dispatch_event(market))
+                    self._spawn_task(self._safe_dispatch_event(market))
 
                 await asyncio.sleep(2.0)
 
