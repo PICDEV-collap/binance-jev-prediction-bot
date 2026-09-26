@@ -16,6 +16,16 @@ import time
 from pathlib import Path
 from typing import Dict, Any, List, Set, Optional
 
+# Ensure clean UTF-8 encoding on Windows console and streams to prevent garbled text
+if sys.platform == "win32":
+    try:
+        if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -481,6 +491,14 @@ class TradingBotCoordinator:
                     )
                 else:
                     self.risk_guard.rollback_market_traded(market.market_id)
+                    # If quote price was heavily over cap (>= 0.70 vs cap 0.60), back off evaluation on this round
+                    # for 180s to avoid repeatedly hitting Binance quote API every 60s for a runaway round
+                    if order_result.order_id == "REJECTED_QUOTE_CAP" and order_result.price >= 0.70:
+                        self.last_eval_time[market.market_id] = now + 120.0
+                        logger.info(
+                            f"[QUOTE CAP BACKOFF] Market {market.market_id} is heavily overpriced (${order_result.price:.3f} >= $0.70). "
+                            f"Applying 180s evaluation backoff on this round."
+                        )
 
             # Cache last 50 decisions
             self.recent_decisions.append(record)

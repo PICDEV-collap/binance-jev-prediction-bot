@@ -426,10 +426,12 @@ class RiskGuard:
         # Prevents late-round entries where odds polarize (e.g. 0.85 - 0.99) leaving minimal profit potential
         # with full -100% loss risk, or hopeless 0.01 bets.
         time_left = getattr(market, "time_left_seconds", 300)
-        if time_left < self.min_time_left_seconds:
+        is_15m_or_higher = getattr(market, "timeframe", "15m").lower() in ("15m", "1h", "1d")
+        effective_min_time = max(self.min_time_left_seconds, 120) if is_15m_or_higher else self.min_time_left_seconds
+        if time_left < effective_min_time:
             self._record_rejection("OUTSIDE_TIME_WINDOW")
             time_reason = (
-                f"Time-Window Filter: Only {time_left}s remaining in round (< {self.min_time_left_seconds}s threshold). "
+                f"Time-Window Filter: Only {time_left}s remaining in round (< {effective_min_time}s threshold). "
                 f"Late-round entry rejected to prevent low-payout/high-loss asymmetric payoff."
             )
             logger.info(f"[RISK FILTER] {time_reason} for {market.market_id}. Capital preserved.")
