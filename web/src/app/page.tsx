@@ -599,7 +599,8 @@ export default function DashboardPage() {
           target_symbol: newConfig.target_symbol ?? prev.target_market?.target_symbol ?? 'BTCUSDT',
           target_timeframe: newConfig.target_timeframe ?? prev.target_market?.target_timeframe ?? '15m',
           evaluated_rounds_count: prev.target_market?.evaluated_rounds_count ?? 0,
-          evaluation_policy: prev.target_market?.evaluation_policy ?? '1x_per_round',
+          evaluation_policy: newConfig.eval_interval_seconds ? `every_${newConfig.eval_interval_seconds}s` : prev.target_market?.evaluation_policy ?? 'every_60s',
+          eval_interval_seconds: newConfig.eval_interval_seconds ?? prev.target_market?.eval_interval_seconds ?? 60,
         },
         jev_ai: {
           ...prev.jev_ai,
@@ -802,6 +803,7 @@ export default function DashboardPage() {
         currentSlippageBps={status?.risk_guard?.slippage_bps ?? 50}
         currentTargetSymbol={status?.target_market?.target_symbol ?? 'BTCUSDT'}
         currentTargetTimeframe={status?.target_market?.target_timeframe ?? '15m'}
+        currentEvalIntervalSeconds={status?.target_market?.eval_interval_seconds ?? 60}
         currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
         currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}
         currentMartingaleMultiplier={status?.risk_guard?.martingale?.multiplier ?? 2.0}

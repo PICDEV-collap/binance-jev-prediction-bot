@@ -39,6 +39,7 @@ interface RiskControlsModalProps {
   currentSlippageBps?: number;
   currentTargetSymbol?: string;
   currentTargetTimeframe?: string;
+  currentEvalIntervalSeconds?: number;
   currentPaperTrading: boolean;
   currentMartingaleEnabled?: boolean;
   currentMartingaleMultiplier?: number;
@@ -65,6 +66,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentSlippageBps = 50,
   currentTargetSymbol = 'BTCUSDT',
   currentTargetTimeframe = '15m',
+  currentEvalIntervalSeconds = 60,
   currentPaperTrading,
   currentMartingaleEnabled = true,
   currentMartingaleMultiplier = 2.0,
@@ -97,6 +99,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   const [maxConcurrentPositions, setMaxConcurrentPositions] = useState<number>(currentMaxConcurrentPositions);
   const [targetSymbol, setTargetSymbol] = useState<string>(currentTargetSymbol.toUpperCase());
   const [targetTimeframe, setTargetTimeframe] = useState<string>(currentTargetTimeframe.toLowerCase());
+  const [evalIntervalSeconds, setEvalIntervalSeconds] = useState<number>(currentEvalIntervalSeconds);
 
   // Tab 3: Environment & Credentials State
   const [paperTrading, setPaperTrading] = useState<boolean>(currentPaperTrading);
@@ -139,6 +142,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     setMaxConcurrentPositions(currentMaxConcurrentPositions);
     setTargetSymbol(currentTargetSymbol.toUpperCase());
     setTargetTimeframe(currentTargetTimeframe.toLowerCase());
+    setEvalIntervalSeconds(currentEvalIntervalSeconds);
     setPaperTrading(currentPaperTrading);
     setCustomServerUrl(serverUrl);
 
@@ -168,6 +172,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         if (c.max_concurrent_positions !== undefined) setMaxConcurrentPositions(c.max_concurrent_positions);
         if (c.target_symbol !== undefined) setTargetSymbol(c.target_symbol);
         if (c.target_timeframe !== undefined) setTargetTimeframe(c.target_timeframe);
+        if (c.eval_interval_seconds !== undefined) setEvalIntervalSeconds(c.eval_interval_seconds);
         if (c.paper_trading !== undefined) setPaperTrading(c.paper_trading);
         if (c.binance_api_key_masked) setBinanceKeyMasked(c.binance_api_key_masked);
         if (c.jev_ai_key_masked) setJevKeyMasked(c.jev_ai_key_masked);
@@ -201,6 +206,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     currentMaxConcurrentPositions,
     currentTargetSymbol,
     currentTargetTimeframe,
+    currentEvalIntervalSeconds,
     currentPaperTrading,
   ]);
 
@@ -230,6 +236,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         max_concurrent_positions: maxConcurrentPositions,
         target_symbol: targetSymbol,
         target_timeframe: targetTimeframe,
+        eval_interval_seconds: evalIntervalSeconds,
         paper_trading: paperTrading,
         jev_ai_model: jevAiModel,
         persist_to_env: persistToEnv,
@@ -847,6 +854,43 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                     </button>
                   ))}
                 </div>
+              </div>
+
+              {/* 6. AI Evaluation Cadence Selector */}
+              <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 space-y-2">
+                <div className="flex items-center justify-between text-xs font-mono">
+                  <span className="text-slate-200 font-semibold flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-emerald-400" />
+                    AI SCAN CADENCE (ความถี่ในการส่งข้อมูลให้ AI วิเคราะห์)
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/40">
+                    ทุกๆ {evalIntervalSeconds}s {evalIntervalSeconds === 60 ? '(1 นาที - แนะนำ)' : evalIntervalSeconds === 120 ? '(2 นาที)' : evalIntervalSeconds === 300 ? '(5 นาที)' : ''}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 pt-1">
+                  {[
+                    { label: '30 วินาที', val: 30 },
+                    { label: '1 นาที (แนะนำ)', val: 60 },
+                    { label: '2 นาที', val: 120 },
+                    { label: '5 นาที', val: 300 },
+                  ].map((cad) => (
+                    <button
+                      key={cad.val}
+                      type="button"
+                      onClick={() => setEvalIntervalSeconds(cad.val)}
+                      className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-bold transition-all border ${
+                        evalIntervalSeconds === cad.val
+                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 shadow-sm'
+                          : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                      }`}
+                    >
+                      {cad.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] font-mono text-slate-400 bg-slate-950/70 p-2 rounded border border-slate-800">
+                  💡 <span className="text-slate-200 font-medium">สแกนต่อเนื่อง:</span> เมื่อเลือกกรอบเวลา 15 นาที บอทจะส่งข้อมูล Indicator ให้ AI ช่วยวิเคราะห์หาจุดเข้าทุกๆ 1 นาที หากไม้ไหน AI ยังไม่มั่นใจหรือราคาแพงเกินไป บอทจะรอ 1 นาทีแล้วสแกนใหม่ตลอดทั้งรอบ
+                </p>
               </div>
 
             </div>

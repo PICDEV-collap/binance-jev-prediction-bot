@@ -129,9 +129,15 @@ class Settings(BaseSettings):
         alias="MIN_TIME_LEFT_SECONDS"
     )
     max_time_left_seconds: int = Field(
-        default=270,
+        default=870,
         ge=60,
         alias="MAX_TIME_LEFT_SECONDS"
+    )
+    eval_interval_seconds: int = Field(
+        default=60,
+        ge=10,
+        le=900,
+        alias="EVAL_INTERVAL_SECONDS"
     )
 
     # --- Early Take-Profit Feature ---

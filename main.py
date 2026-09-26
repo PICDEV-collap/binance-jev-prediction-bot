@@ -65,6 +65,7 @@ class ConfigUpdateRequest(BaseModel):
     # Target Market & Strategy
     target_symbol: str | None = None
     target_timeframe: str | None = None
+    eval_interval_seconds: int | None = None
 
     # Operating Environment & Credentials
     paper_trading: bool | None = None
@@ -106,10 +107,13 @@ class TradingBotCoordinator:
         self.is_paused: bool = False
         self.bot_status: str = "RUNNING"  # "RUNNING" or "STOPPED"
 
-        # User-selected Target Pair & Timeframe for AI evaluation (Token efficiency)
+        # User-selected Target Pair & Timeframe for AI evaluation
         self.target_symbol: str = getattr(settings, "target_symbol", "BTCUSDT").upper()
         self.target_timeframe: str = getattr(settings, "target_timeframe", "15m").lower()
+        self.eval_interval_seconds: int = getattr(settings, "eval_interval_seconds", 60)
+        self.last_eval_time: Dict[str, float] = {}
         self.evaluated_rounds: Set[str] = set()
+        self.traded_rounds: Set[str] = set()
 
         # Initialize core components
         self.jev_client = JevClient(
@@ -264,8 +268,10 @@ class TradingBotCoordinator:
                         )
                     if any(rec.get("won") for rec in settled_records):
                         asyncio.create_task(self.binance_client.claim_all_won_positions())
-                    # Prune expired rounds from memory set
+                    # Prune expired rounds from memory sets
                     self.evaluated_rounds = {rid for rid in self.evaluated_rounds if rid in active_market_ids}
+                    self.traded_rounds = {rid for rid in self.traded_rounds if rid in active_market_ids}
+                    self.last_eval_time = {mid: t for mid, t in self.last_eval_time.items() if mid in active_market_ids}
 
                 if self.ws_clients:
                     status = self.get_system_status()
@@ -329,24 +335,41 @@ class TradingBotCoordinator:
         if self.target_timeframe != "ALL" and market.timeframe.lower() != self.target_timeframe.lower():
             return
 
-        # Timing Filter: Ensure round is within optimal evaluation window before spending AI tokens
-        # (e.g. For 15m/900s round, wait until <= 850s to let trend develop, and skip if < 180s left)
+        # Timing Filter: Ensure round is within active trading window
         time_left = getattr(market, "time_left_seconds", 300)
-        if time_left > self.risk_guard.max_time_left_seconds:
-            return
+        round_period = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}.get(market.timeframe.lower(), 900)
+
+        # Skip late round entries (< min_time_left_seconds, e.g. < 60s) to prevent asymmetric expiry risk
         if time_left < self.risk_guard.min_time_left_seconds:
             return
 
-        # Token Filter 3: Check if already evaluated this round (1x per round)
-        if market.market_id in self.evaluated_rounds:
+        # Skip the first 10 seconds of a brand new round so the strike / spot baseline price stabilizes
+        if time_left > (round_period - 10):
             return
 
-        # Mark round as evaluated immediately to guarantee strictly 1 AI call per round
+        # Check if an order has already been executed on this round
+        if market.market_id in self.traded_rounds:
+            return
+
+        # Check if we already hold an open position on this market round
+        open_positions = self.binance_client.get_positions()
+        if any(p.get("market_id") == market.market_id for p in open_positions):
+            self.traded_rounds.add(market.market_id)
+            return
+
+        # Cadence Filter: Evaluate every eval_interval_seconds (default 60s / 1 min)
+        now = time.time()
+        last_eval = self.last_eval_time.get(market.market_id, 0.0)
+        if (now - last_eval) < self.eval_interval_seconds:
+            return
+
+        # Record this evaluation timestamp
+        self.last_eval_time[market.market_id] = now
         self.evaluated_rounds.add(market.market_id)
 
         logger.info(
-            f"[AI EVALUATION TRIGGERED: 1x/Round] Symbol: {market.symbol} | TF: {market.timeframe} | "
-            f"Round: {market.market_id} | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f} | "
+            f"[AI EVALUATION TRIGGERED: Every {self.eval_interval_seconds}s] Symbol: {market.symbol} | TF: {market.timeframe} | "
+            f"Round: {market.market_id} | TimeLeft: {market.time_left_seconds}s | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f} | "
             f"DVR: {market.dvr_ratio:+.2f}sigma | OBI: {market.order_book_imbalance:+.2f} | Trend: {market.ema_trend} | RSI: {market.rsi_5m:.1f}"
         )
 
@@ -426,6 +449,12 @@ class TradingBotCoordinator:
                 timeframe=market.timeframe,
             )
             record["order"] = order_result.model_dump()
+            if order_result.status in ("FILLED", "SIMULATED", "NEW"):
+                self.traded_rounds.add(market.market_id)
+                logger.info(
+                    f"[ORDER ENTERED] Position open on {market.market_id} ({market.symbol} {clean_action}). "
+                    f"Round entry complete, pausing further evaluations for this round."
+                )
 
         # Cache last 50 decisions
         self.recent_decisions.append(record)
@@ -475,7 +504,8 @@ class TradingBotCoordinator:
                 "target_symbol": self.target_symbol,
                 "target_timeframe": self.target_timeframe,
                 "evaluated_rounds_count": len(self.evaluated_rounds),
-                "evaluation_policy": "1x_per_round",
+                "evaluation_policy": f"every_{self.eval_interval_seconds}s",
+                "eval_interval_seconds": self.eval_interval_seconds,
             },
             "network_health": {
                 "state": self.ws_listener.metrics.get("network_state", "ONLINE"),
@@ -611,6 +641,8 @@ def _persist_config_to_env(req: ConfigUpdateRequest) -> None:
         mapping["TARGET_SYMBOL"] = req.target_symbol.upper()
     if req.target_timeframe is not None:
         mapping["TARGET_TIMEFRAME"] = req.target_timeframe.lower()
+    if req.eval_interval_seconds is not None:
+        mapping["EVAL_INTERVAL_SECONDS"] = str(req.eval_interval_seconds)
     if req.paper_trading is not None:
         mapping["PAPER_TRADING"] = "true" if req.paper_trading else "false"
     if req.binance_api_key is not None and req.binance_api_key.strip():
@@ -685,6 +717,7 @@ async def get_config_endpoint() -> Dict[str, Any]:
             # Strategy Targets
             "target_symbol": bot.target_symbol,
             "target_timeframe": bot.target_timeframe,
+            "eval_interval_seconds": bot.eval_interval_seconds,
             # Mode & Credentials Status
             "paper_trading": bot.binance_client.paper_trading,
             "has_binance_key": bool(binance_key),
@@ -733,6 +766,10 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
     if req.target_timeframe is not None and req.target_timeframe.strip():
         bot.target_timeframe = req.target_timeframe.lower().strip()
         logger.info(f"Target timeframe updated to: {bot.target_timeframe}")
+
+    if req.eval_interval_seconds is not None:
+        bot.eval_interval_seconds = max(10, min(900, int(req.eval_interval_seconds)))
+        logger.info(f"Evaluation interval updated to: {bot.eval_interval_seconds}s")
 
     if req.paper_trading is not None:
         prev_mode = bot.binance_client.paper_trading
@@ -912,6 +949,8 @@ async def force_evaluate_endpoint(market_id: str) -> Dict[str, Any]:
         ask=m_info.get("ask", 0.51),
     )
     bot.evaluated_rounds.discard(market_id)
+    bot.traded_rounds.discard(market_id)
+    bot.last_eval_time.pop(market_id, None)
     await bot.on_market_tick(ctx)
     return {"status": "success", "message": f"Forced evaluation executed for {market_id}"}
 

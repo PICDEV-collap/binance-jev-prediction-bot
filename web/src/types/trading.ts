@@ -183,6 +183,7 @@ export interface SystemStatus {
     target_timeframe: string;
     evaluated_rounds_count: number;
     evaluation_policy: string;
+    eval_interval_seconds?: number;
   };
   network_health?: {
     state: 'ONLINE' | 'DEGRADED' | 'OFFLINE';
@@ -248,6 +249,7 @@ export interface BotConfig {
   slippage_bps?: number;
   target_symbol: string;
   target_timeframe: string;
+  eval_interval_seconds?: number;
   paper_trading: boolean;
   has_binance_key?: boolean;
   has_binance_secret?: boolean;
