@@ -93,7 +93,11 @@ class BinanceClient:
         paper_trading: bool = True,
         slippage_tolerance: float = 0.03,
         funding_source: str = "CEX",
-        slippage_bps: int = 1000,
+        slippage_bps: int = 200,
+        max_odds_cap: float = 0.60,
+        min_odds_floor: float = 0.20,
+        enable_early_take_profit: bool = True,
+        take_profit_odds: float = 0.82,
     ) -> None:
         self.api_key = api_key.strip()
         self.api_secret = api_secret.strip()
@@ -107,6 +111,10 @@ class BinanceClient:
         self.slippage_tolerance = slippage_tolerance
         self.funding_source = funding_source
         self.slippage_bps = slippage_bps
+        self.max_odds_cap = max_odds_cap
+        self.min_odds_floor = min_odds_floor
+        self.enable_early_take_profit = enable_early_take_profit
+        self.take_profit_odds = take_profit_odds
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._time_offset_ms: int = 0
@@ -128,6 +136,7 @@ class BinanceClient:
         self._live_positions: Dict[str, PositionInfo] = {}
         self._wallet_address: str = "0x8bd02cfadc1065dba4db288997ea24d26a788936"
         self._wallet_id: str = "a34494abf3d7403796af191a0accdd86"
+        self._active_account_type: str = "CeDeFi"
         self._prediction_market_cache: Dict[str, Any] = {}
         self._prediction_cache_timestamp: float = 0.0
 
@@ -164,40 +173,57 @@ class BinanceClient:
             logger.info("Binance Client HTTP session closed.")
 
     async def sync_server_time(self) -> None:
-        """Synchronize client with Binance server time to prevent timestamp drift."""
+        """Synchronize client with Binance server time using median ping to prevent timestamp drift."""
+        if self._session is None or self._session.closed:
+            await self.start()
         try:
             assert self._session is not None
-            # Try core spot/general time endpoint first, fall back to fapi if needed
             url = f"{self.base_url}/api/v3/time"
-            t0 = int(time.time() * 1000)
-            async with self._session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    t1 = int(time.time() * 1000)
-                    server_time = data.get("serverTime", t1)
-                    one_way_latency = (t1 - t0) // 2
-                    self._time_offset_ms = server_time - (t1 - one_way_latency)
-                    logger.info(f"Binance server time synced via /api/v3/time. Offset: {self._time_offset_ms}ms")
-                    return
-                elif resp.status == 404:
-                    # Fallback to fapi time
-                    fallback_url = f"{self.base_url}/fapi/v1/time"
-                    async with self._session.get(fallback_url) as fresp:
-                        if fresp.status == 200:
-                            fdata = await fresp.json()
+            offsets = []
+            for _ in range(3):
+                t0 = int(time.time() * 1000)
+                try:
+                    async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
                             t1 = int(time.time() * 1000)
-                            server_time = fdata.get("serverTime", t1)
-                            one_way_latency = (t1 - t0) // 2
-                            self._time_offset_ms = server_time - (t1 - one_way_latency)
-                            logger.info(f"Binance server time synced via /fapi/v1/time. Offset: {self._time_offset_ms}ms")
-                            return
+                            server_time = data.get("serverTime", t1)
+                            one_way_latency = max(0, (t1 - t0) // 2)
+                            offset = server_time - (t1 - one_way_latency)
+                            offsets.append(offset)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)
+
+            if offsets:
+                offsets.sort()
+                self._time_offset_ms = offsets[len(offsets) // 2]
+                logger.info(f"Binance server time synced via /api/v3/time (median of {len(offsets)}). Offset: {self._time_offset_ms}ms")
+                return
+
+            # Fallback to fapi time if spot /api/v3/time unavailable
+            fallback_url = f"{self.base_url}/fapi/v1/time"
+            t0 = int(time.time() * 1000)
+            async with self._session.get(fallback_url, timeout=aiohttp.ClientTimeout(total=2.0)) as fresp:
+                if fresp.status == 200:
+                    fdata = await fresp.json()
+                    t1 = int(time.time() * 1000)
+                    server_time = fdata.get("serverTime", t1)
+                    one_way_latency = max(0, (t1 - t0) // 2)
+                    self._time_offset_ms = server_time - (t1 - one_way_latency)
+                    logger.info(f"Binance server time synced via /fapi/v1/time. Offset: {self._time_offset_ms}ms")
+                    return
         except Exception as e:
-            logger.warning(f"Could not sync Binance server time ({e}). Using local clock.")
-            self._time_offset_ms = 0
+            logger.warning(f"Could not sync Binance server time ({e}). Using existing offset {self._time_offset_ms}ms.")
 
     def _get_timestamp(self) -> int:
-        """Get calibrated timestamp in milliseconds."""
-        return int(time.time() * 1000) + self._time_offset_ms
+        """
+        Get calibrated timestamp in milliseconds with safety buffer.
+        Binance permits: serverTime - recvWindow <= timestamp <= serverTime + 1000ms.
+        Subtracting a 500ms safety buffer guarantees timestamp is NEVER ahead of server time,
+        while safely residing well within standard recvWindow.
+        """
+        return int(time.time() * 1000) + self._time_offset_ms - 500
 
     def _sign_payload(self, params: Dict[str, Any]) -> str:
         """Generate HMAC-SHA256 signature for Binance request parameters."""
@@ -235,6 +261,22 @@ class BinanceClient:
                     self._prediction_cache_timestamp = now
                     return data.get("marketTopics", [])
                 else:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {}
+                    if data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
+                        logger.warning("Detected time drift (-1021) in market list. Re-syncing Binance server time...")
+                        await self.sync_server_time()
+                        query_params["timestamp"] = self._get_timestamp()
+                        signed_query = self._sign_payload(query_params)
+                        retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/market/list?{signed_query}"
+                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=5.0)) as r_resp:
+                            if r_resp.status == 200:
+                                r_data = await r_resp.json()
+                                self._prediction_market_cache = r_data
+                                self._prediction_cache_timestamp = now
+                                return r_data.get("marketTopics", [])
                     logger.warning(f"Failed to fetch prediction market list: HTTP {resp.status}")
         except Exception as e:
             logger.warning(f"Exception fetching prediction market list: {e}")
@@ -276,6 +318,14 @@ class BinanceClient:
                 data = await resp.json()
                 if resp.status == 200:
                     return data
+                elif data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
+                    logger.warning("Detected time drift (-1021) in get_prediction_quote. Re-syncing Binance time and retrying quote...")
+                    await self.sync_server_time()
+                    query_params["timestamp"] = self._get_timestamp()
+                    signed_query = self._sign_payload(query_params)
+                    retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/trade/get-quote?{signed_query}"
+                    async with self._session.post(retry_url, timeout=aiohttp.ClientTimeout(total=5.0)) as r_resp:
+                        return await r_resp.json()
                 else:
                     logger.warning(f"Failed to get prediction quote: HTTP {resp.status} - {data}")
                     return data
@@ -330,29 +380,27 @@ class BinanceClient:
         # 1. Resolve active prediction market topic and outcome token ID
         topics = await self.fetch_prediction_market_topics()
         token_id: Optional[str] = None
-        for t in topics:
-            if t.get("symbol") == symbol or (symbol.startswith("BTC") and t.get("symbol") == "BTCUSDT"):
-                markets = t.get("markets", [])
-                if markets:
-                    for out in markets[0].get("outcomes", []):
-                        if out.get("name", "").lower() == ("Up" if prediction_choice == "UP" else "Down").lower():
-                            token_id = str(out.get("tokenId", ""))
-                            break
-            if token_id:
-                break
+        target_tf_key = "1d" if "1d" in str(timeframe).lower() else "5m"
 
+        def _find_token(topic_list: List[Dict[str, Any]]) -> Optional[str]:
+            for t in topic_list:
+                t_sym = str(t.get("symbol", ""))
+                t_title = str(t.get("title", ""))
+                is_sym_match = t_sym == symbol or (symbol.startswith("BTC") and (t_sym == "BTCUSDT" or "BTC" in t_title))
+                if is_sym_match and (target_tf_key in t_title.lower() or "up or down" in t_title.lower()):
+                    for m in t.get("markets", []):
+                        for out in m.get("outcomes", []):
+                            out_name = out.get("name", "").lower()
+                            if (prediction_choice == "UP" and out_name in ("up", "yes")) or (prediction_choice == "DOWN" and out_name in ("down", "no")):
+                                tid = str(out.get("tokenId", "")).strip()
+                                if tid:
+                                    return tid
+            return None
+
+        token_id = _find_token(topics)
         if not token_id:
             topics = await self.fetch_prediction_market_topics(force_refresh=True)
-            for t in topics:
-                if t.get("symbol") == symbol or (symbol.startswith("BTC") and t.get("symbol") == "BTCUSDT"):
-                    markets = t.get("markets", [])
-                    if markets:
-                        for out in markets[0].get("outcomes", []):
-                            if out.get("name", "").lower() == ("Up" if prediction_choice == "UP" else "Down").lower():
-                                token_id = str(out.get("tokenId", ""))
-                                break
-                if token_id:
-                    break
+            token_id = _find_token(topics)
 
         # 2. Inquire Quote: Binance Market orders require >= ~1.5 USDT in wei (18 decimals)
         order_cost_usdt = max(1.5, float(contracts * target_price))
@@ -369,6 +417,18 @@ class BinanceClient:
             )
 
         quote_id = quote_data.get("quoteId") if quote_data else None
+
+        # Auto-retry with smaller amount if Binance reports liquidity threshold issue
+        if not quote_id and quote_data and quote_data.get("code") == -9000 and "smaller amount" in str(quote_data.get("msg", "")).lower():
+            logger.info("Retrying quote with smaller amount (1.0 USDT) due to thin order book liquidity...")
+            quote_data = await self.get_prediction_quote(
+                token_id=token_id,
+                amount_wei=str(int(1.0 * 10**18)),
+                side="BUY",
+                order_type="MARKET",
+                slippage_bps=self.slippage_bps,
+            )
+            quote_id = quote_data.get("quoteId") if quote_data else None
 
         if not quote_id:
             err_msg = quote_data.get("msg") if quote_data else f"Token not found for {symbol} {prediction_choice}"
@@ -390,11 +450,75 @@ class BinanceClient:
             self._total_orders_dispatched += 1
             self._order_history.append(result)
             return result
+        # 2.5. Quote Price Guard: Inspect actual execution price offered in the Binance quote
+        quoted_price: Optional[float] = None
+        if quote_data:
+            if "price" in quote_data:
+                try:
+                    quoted_price = float(quote_data["price"])
+                except (ValueError, TypeError):
+                    pass
+            elif "amountOut" in quote_data and "amountIn" in quote_data:
+                try:
+                    amt_in = float(quote_data["amountIn"]) / 10**18
+                    amt_out = float(quote_data["amountOut"]) / 10**18
+                    if amt_out > 0:
+                        quoted_price = amt_in / amt_out
+                except (ValueError, TypeError, ZeroDivisionError):
+                    pass
 
-        # 3. Parameters for official Binance Prediction Trading API (place-order-bundle)
+        if quoted_price is not None:
+            if quoted_price > self.max_odds_cap:
+                payout_pct = ((1.0 - quoted_price) / max(0.001, quoted_price)) * 100.0
+                logger.warning(
+                    f"[BINANCE LIVE REJECTION] Order {client_order_id} on {market_id} BLOCKED BY QUOTE GUARD: "
+                    f"Quoted price ${quoted_price:.3f} > max cap ${self.max_odds_cap:.2f} "
+                    f"(Win profit would only be +{payout_pct:.1f}% vs -100% loss risk). Aborting order to protect capital!"
+                )
+                result = OrderResult(
+                    order_id="REJECTED_QUOTE_CAP",
+                    client_order_id=client_order_id,
+                    market_id=market_id,
+                    symbol=symbol,
+                    side=side,
+                    contracts=contracts,
+                    price=quoted_price,
+                    status="REJECTED",
+                    latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                    martingale_step=martingale_step,
+                    stage=stage,
+                    error_message=f"Quoted price ${quoted_price:.3f} exceeds max cap ${self.max_odds_cap:.2f} (Potential win: +{payout_pct:.1f}%)"
+                )
+                self._total_orders_dispatched += 1
+                self._order_history.append(result)
+                return result
+
+            if quoted_price < self.min_odds_floor:
+                logger.warning(
+                    f"[BINANCE LIVE REJECTION] Order {client_order_id} on {market_id} BLOCKED BY QUOTE GUARD: "
+                    f"Quoted price ${quoted_price:.3f} < min floor ${self.min_odds_floor:.2f}. Aborting underdog order!"
+                )
+                result = OrderResult(
+                    order_id="REJECTED_QUOTE_FLOOR",
+                    client_order_id=client_order_id,
+                    market_id=market_id,
+                    symbol=symbol,
+                    side=side,
+                    contracts=contracts,
+                    price=quoted_price,
+                    status="REJECTED",
+                    latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                    martingale_step=martingale_step,
+                    stage=stage,
+                    error_message=f"Quoted price ${quoted_price:.3f} below floor ${self.min_odds_floor:.2f}"
+                )
+                self._total_orders_dispatched += 1
+                self._order_history.append(result)
+                return result
+
         query_params = {
             "accountType": "SPOT",
-            "fundingSource": "MPC",
+            "fundingSource": self.funding_source or "MPC",
             "orderType": "MARKET",
             "quoteId": quote_id,
             "slippageBps": self.slippage_bps,
@@ -477,6 +601,64 @@ class BinanceClient:
                 else:
                     err_code = response_data.get("code")
                     err_msg = response_data.get("msg", f"HTTP {resp.status}")
+                    if err_code == -1021 or "ahead of the server's time" in str(err_msg).lower():
+                        logger.warning(f"[BINANCE LIVE RETRY] Detected time drift (-1021) on order {client_order_id}. Re-syncing time and retrying...")
+                        await self.sync_server_time()
+                        query_params["timestamp"] = self._get_timestamp()
+                        signed_query = self._sign_payload(query_params)
+                        retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle?{signed_query}"
+                        async with self._session.post(retry_url, json={}) as r_resp:
+                            r_elapsed = (time.perf_counter() - start_time) * 1000.0
+                            try:
+                                r_data = await r_resp.json()
+                            except Exception:
+                                r_data = {}
+                            if r_resp.status in (200, 201):
+                                order_id = str(r_data.get("orderId", client_order_id))
+                                result = OrderResult(
+                                    order_id=order_id,
+                                    client_order_id=client_order_id,
+                                    market_id=market_id,
+                                    symbol=symbol,
+                                    side=side,
+                                    contracts=contracts,
+                                    price=target_price,
+                                    status="FILLED",
+                                    latency_ms=round(r_elapsed, 2),
+                                    martingale_step=martingale_step,
+                                    stage=stage,
+                                )
+                                self._total_orders_dispatched += 1
+                                self._total_fills += 1
+                                self._order_history.append(result)
+                                self._in_flight_orders.pop(client_order_id, None)
+
+                                pos_id = f"POS_LIVE_{market_id}_{clean_side}_{uuid.uuid4().hex[:4]}"
+                                self._live_positions[pos_id] = PositionInfo(
+                                    position_id=pos_id,
+                                    market_id=market_id,
+                                    symbol=symbol,
+                                    side=clean_side,
+                                    contracts=contracts,
+                                    entry_price=target_price,
+                                    current_price=spot_price if spot_price > 0 else target_price,
+                                    target_price=strike_price if strike_price > 0 else target_price,
+                                    timeframe=timeframe,
+                                    unrealized_pnl=0.0,
+                                    martingale_step=martingale_step,
+                                    stage=stage,
+                                    token_id=str(token_id or ""),
+                                )
+                                logger.info(
+                                    f"LIVE PREDICTION ORDER EXECUTED (TIME RESYNC RETRY): {side} {contracts}x on {market_id} [{stage}] "
+                                    f"@ {target_price:.3f} (Latency: {r_elapsed:.1f}ms)"
+                                )
+                                return result
+                            else:
+                                response_data = r_data
+                                err_code = response_data.get("code")
+                                err_msg = response_data.get("msg", f"HTTP {r_resp.status}")
+
                     if err_code == -31003:
                         full_err = "[Code -31003] SAS authorization required: กรุณาเปิดใช้งาน Secure Auto Sign (SAS) ในแอป Binance เพื่ออนุญาตให้บอทส่งคำสั่งเทรดได้อัตโนมัติ"
                     else:
@@ -785,6 +967,169 @@ class BinanceClient:
                 live_contract_val = 0.95 if is_itm else 0.05
                 pos.unrealized_pnl = round((pos.contracts * live_contract_val) - (pos.contracts * pos.entry_price), 2)
 
+    async def check_and_execute_early_take_profits(
+        self,
+        markets: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Check open positions and close them early if profit target is reached (e.g. odds >= take_profit_odds, default 0.82).
+        Locks in gains (+50% to +80%) before expiration, eliminating the risk of late-round reversals.
+        """
+        if not self.enable_early_take_profit:
+            return []
+
+        market_map: Dict[str, Any] = {}
+        for m in markets:
+            m_id = m.market_id if hasattr(m, "market_id") else (m.get("market_id", "") if isinstance(m, dict) else "")
+            if m_id:
+                market_map[m_id] = m
+
+        take_profit_events: List[Dict[str, Any]] = []
+        target_positions = self._live_positions if not self.paper_trading else self._paper_positions
+
+        for pid, pos in list(target_positions.items()):
+            m = market_map.get(pos.market_id)
+            if not m:
+                continue
+
+            odds_up = getattr(m, "odds_yes", 0.50) if hasattr(m, "odds_yes") else (m.get("odds_yes", 0.50) if isinstance(m, dict) else 0.50)
+            odds_down = getattr(m, "odds_no", 0.50) if hasattr(m, "odds_no") else (m.get("odds_no", 0.50) if isinstance(m, dict) else 0.50)
+
+            current_odds = odds_up if pos.side in ("UP", "BUY_YES") else odds_down
+
+            if current_odds >= self.take_profit_odds:
+                logger.info(
+                    f"[EARLY TAKE-PROFIT TRIGGER] {pos.symbol} {pos.side} ({pos.market_id}) | "
+                    f"Entry: ${pos.entry_price:.3f} -> Current Odds: ${current_odds:.3f} >= ${self.take_profit_odds:.2f} | "
+                    f"Locking in gains ahead of expiration!"
+                )
+
+                if self.paper_trading:
+                    cost = pos.contracts * pos.entry_price
+                    payout = pos.contracts * current_odds
+                    realized_pnl = round(payout - cost, 2)
+                    self._paper_balance_usdt += payout
+
+                    closed_item = ClosedPositionInfo(
+                        position_id=pos.position_id,
+                        market_id=pos.market_id,
+                        symbol=pos.symbol,
+                        side=pos.side,
+                        contracts=pos.contracts,
+                        entry_price=pos.entry_price,
+                        target_price=pos.target_price,
+                        settlement_price=pos.current_price,
+                        timeframe=pos.timeframe,
+                        result="TAKE_PROFIT",
+                        realized_pnl=realized_pnl,
+                        martingale_step=pos.martingale_step,
+                        stage=pos.stage,
+                        token_id=pos.token_id,
+                        is_claimed=True,
+                        entry_time=pos.entry_time,
+                        settled_at=time.time(),
+                    )
+                    self._closed_positions.append(closed_item)
+                    target_positions.pop(pid, None)
+
+                    take_profit_events.append({
+                        "position_id": pos.position_id,
+                        "symbol": pos.symbol,
+                        "market_id": pos.market_id,
+                        "side": pos.side,
+                        "won": True,
+                        "pnl": realized_pnl,
+                        "martingale_step": pos.martingale_step,
+                        "stage": pos.stage,
+                        "mode": "PAPER",
+                        "token_id": pos.token_id,
+                        "take_profit": True,
+                    })
+                else:
+                    token_id = getattr(pos, "token_id", None)
+                    if token_id:
+                        amount_wei = str(int(pos.contracts * 10**18))
+                        quote_data = await self.get_prediction_quote(
+                            token_id=token_id,
+                            amount_wei=amount_wei,
+                            side="SELL",
+                            order_type="MARKET",
+                            slippage_bps=self.slippage_bps,
+                        )
+                        quote_id = quote_data.get("quoteId") if quote_data else None
+                        if quote_id:
+                            query_params = {
+                                "accountType": "SPOT",
+                                "fundingSource": self.funding_source or "MPC",
+                                "orderType": "MARKET",
+                                "quoteId": quote_id,
+                                "slippageBps": self.slippage_bps,
+                                "timeInForce": "FOK",
+                                "recvWindow": self.recv_window,
+                                "timestamp": self._get_timestamp(),
+                            }
+                            if self._wallet_address:
+                                query_params["walletAddress"] = self._wallet_address
+                            if self._wallet_id:
+                                query_params["walletId"] = self._wallet_id
+                            signed_query = self._sign_payload(query_params)
+                            sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+                            endpoint_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle?{signed_query}"
+
+                            try:
+                                assert self._session is not None
+                                async with self._session.post(endpoint_url, json={}) as resp:
+                                    res_data = await resp.json()
+                                    is_success = resp.status in (200, 201) and ("orderId" in res_data or res_data.get("code") in ("000000", 0))
+                                    already_sold = res_data.get("code") == -9000 and "exceeded your available shares" in str(res_data.get("msg", "")).lower()
+
+                                    if is_success or already_sold:
+                                        cost = pos.contracts * pos.entry_price
+                                        payout = pos.contracts * current_odds
+                                        realized_pnl = round(payout - cost, 2)
+                                        closed_item = ClosedPositionInfo(
+                                            position_id=pos.position_id,
+                                            market_id=pos.market_id,
+                                            symbol=pos.symbol,
+                                            side=pos.side,
+                                            contracts=pos.contracts,
+                                            entry_price=pos.entry_price,
+                                            target_price=pos.target_price,
+                                            settlement_price=pos.current_price,
+                                            timeframe=pos.timeframe,
+                                            result="TAKE_PROFIT",
+                                            realized_pnl=realized_pnl,
+                                            martingale_step=pos.martingale_step,
+                                            stage=pos.stage,
+                                            token_id=pos.token_id,
+                                            is_claimed=True,
+                                            entry_time=pos.entry_time,
+                                            settled_at=time.time(),
+                                        )
+                                        self._closed_positions.append(closed_item)
+                                        target_positions.pop(pid, None)
+
+                                        take_profit_events.append({
+                                            "position_id": pos.position_id,
+                                            "symbol": pos.symbol,
+                                            "market_id": pos.market_id,
+                                            "side": pos.side,
+                                            "won": True,
+                                            "pnl": realized_pnl,
+                                            "martingale_step": pos.martingale_step,
+                                            "stage": pos.stage,
+                                            "mode": "LIVE",
+                                            "token_id": pos.token_id,
+                                            "take_profit": True,
+                                        })
+                                        logger.info(f"[LIVE TAKE-PROFIT SUCCESS] Closed position {pid} at profit +${realized_pnl:.2f}!")
+                                    else:
+                                        logger.warning(f"[LIVE TAKE-PROFIT REJECTED] Failed sell bundle: {res_data}")
+                            except Exception as ex:
+                                logger.error(f"[LIVE TAKE-PROFIT ERROR] Exception executing early sell: {ex}")
+
+        return take_profit_events
+
     def clear_paper_positions(self) -> int:
         """Clear lingering simulated paper positions from the active desk."""
         cleared_count = len(self._paper_positions)
@@ -900,6 +1245,9 @@ class BinanceClient:
                         if total_pred_bal > 0:
                             if cedefi_bal > 0:
                                 self.funding_source = "MPC"
+                                self._active_account_type = "CeDeFi"
+                            else:
+                                self._active_account_type = "SPOT"
                             self._live_balance_usdt = round(total_pred_bal, 2)
                             self._live_available_usdt = round(total_pred_bal, 2)
                             self._live_unrealized_usdt = 0.0
@@ -1029,8 +1377,8 @@ class BinanceClient:
                     for pos in positions:
                         token_id = str(pos.get("tokenId", "")).strip()
                         can_claim = bool(pos.get("canClaim", False))
-                        pos_status = str(pos.get("positionStatus", "")).upper()
-                        if token_id and (can_claim or pos_status in ("CLAIMABLE", "PENDING_CLAIM", "RESOLVED", "SETTLED", "ENDED")):
+                        claimable_amt = float(pos.get("claimableAmount", 0.0) or 0.0)
+                        if token_id and (can_claim or claimable_amt > 0):
                             token_ids.append(token_id)
         except Exception as e:
             logger.warning(f"Could not fetch claimable positions from Binance API: {e}")
@@ -1112,6 +1460,11 @@ class BinanceClient:
                 else:
                     err_msg = data.get("msg", data.get("message", f"HTTP {status}"))
                     logger.warning(f"[BINANCE AUTO-CLAIM ERROR] Batch redeem failed: {err_msg}")
+                    # If Binance returns error (e.g. SYSTEM_ERROR when already auto-credited or sold),
+                    # mark them claimed locally to stop infinite retries.
+                    for pos in self._closed_positions:
+                        if pos.token_id in clean_ids:
+                            pos.is_claimed = True
                     return {"success": False, "error": err_msg, "token_ids": clean_ids}
         except Exception as e:
             logger.error(f"[BINANCE AUTO-CLAIM EXCEPTION] Error calling batch-redeem: {e}")
@@ -1124,16 +1477,24 @@ class BinanceClient:
         """
         token_ids_to_claim: Set[str] = set()
 
-        # 1. Check local closed positions that won but haven't been claimed
-        for pos in self._closed_positions:
-            if pos.result in ("WIN", "TIE (50-50)") and pos.token_id and not getattr(pos, "is_claimed", False):
-                token_ids_to_claim.add(pos.token_id)
-
-        # 2. In live trading, also query Binance for any pending claimable positions
         if not self.paper_trading:
+            # Query Binance API for actual claimable positions
             api_claimable = await self.fetch_claimable_positions()
             for tid in api_claimable:
                 token_ids_to_claim.add(tid)
+
+            # In live trading, if a local winning position is NOT in Binance's claimable list,
+            # Binance has already credited the payout directly to the wallet balance (or it was sold early).
+            # Mark it claimed to keep state clean and avoid infinite retry errors.
+            for pos in self._closed_positions:
+                if pos.token_id and not getattr(pos, "is_claimed", False):
+                    if pos.token_id not in token_ids_to_claim:
+                        pos.is_claimed = True
+        else:
+            # Paper trading simulation
+            for pos in self._closed_positions:
+                if pos.result in ("WIN", "TIE (50-50)") and pos.token_id and not getattr(pos, "is_claimed", False):
+                    token_ids_to_claim.add(pos.token_id)
 
         if not token_ids_to_claim:
             return {"success": True, "message": "No unredeemed winning positions found", "claimed_count": 0}

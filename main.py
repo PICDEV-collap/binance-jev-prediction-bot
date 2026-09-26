@@ -27,11 +27,15 @@ from engine.jev_client import JevClient, JevEvaluationResult, MarketContext
 from engine.risk_guard import RiskGuard, RiskEvaluationResult
 from streams.ws_listener import BinanceWSListener, ConnectionState
 
-# Setup structured logging
+# Setup structured logging (Console + Persistent bot.log for background execution)
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", encoding="utf-8", mode="a"),
+    ]
 )
 logger = logging.getLogger("main_engine")
 
@@ -51,6 +55,12 @@ class ConfigUpdateRequest(BaseModel):
     cooldown_seconds: int | None = None
     max_daily_loss_usdt: float | None = None
     max_concurrent_positions: int | None = None
+    max_odds_cap: float | None = None
+    min_odds_floor: float | None = None
+    min_ev_edge: float | None = None
+    min_time_left_seconds: int | None = None
+    max_time_left_seconds: int | None = None
+    slippage_bps: int | None = None
 
     # Target Market & Strategy
     target_symbol: str | None = None
@@ -117,7 +127,11 @@ class TradingBotCoordinator:
             paper_trading=settings.paper_trading,
             slippage_tolerance=settings.slippage_tolerance,
             funding_source=getattr(settings, "funding_source", "CEX"),
-            slippage_bps=getattr(settings, "slippage_bps", 1000),
+            slippage_bps=getattr(settings, "slippage_bps", 200),
+            max_odds_cap=getattr(settings, "max_odds_cap", 0.60),
+            min_odds_floor=getattr(settings, "min_odds_floor", 0.20),
+            enable_early_take_profit=getattr(settings, "enable_early_take_profit", True),
+            take_profit_odds=getattr(settings, "take_profit_odds", 0.82),
         )
 
         self.risk_guard = RiskGuard(
@@ -127,6 +141,11 @@ class TradingBotCoordinator:
             cooldown_seconds=settings.cooldown_seconds,
             max_daily_loss_usdt=settings.max_daily_loss_usdt,
             max_concurrent_positions=settings.max_concurrent_positions,
+            max_odds_cap=getattr(settings, "max_odds_cap", 0.60),
+            min_odds_floor=getattr(settings, "min_odds_floor", 0.20),
+            min_ev_edge=getattr(settings, "min_ev_edge", 0.05),
+            min_time_left_seconds=getattr(settings, "min_time_left_seconds", 180),
+            max_time_left_seconds=getattr(settings, "max_time_left_seconds", 850),
             martingale_enabled=getattr(settings, "martingale_enabled", True),
             martingale_multiplier=getattr(settings, "martingale_multiplier", 2.0),
             martingale_max_steps=getattr(settings, "martingale_max_steps", 4),
@@ -204,12 +223,27 @@ class TradingBotCoordinator:
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 30 == 0):
                     asyncio.create_task(self.binance_client.claim_all_won_positions())
 
+                # Periodic server time re-sync every 60s to continuously prevent clock drift (-1021)
+                if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
+                    asyncio.create_task(self.binance_client.sync_server_time())
+
                 # Settle prediction positions when a round expires
                 if markets:
                     active_market_ids = {m["market_id"] for m in markets}
                     current_prices = {m["symbol"]: m["underlying_price"] for m in markets}
                     # Update live price and unrealized PnL on active open positions
                     self.binance_client.update_positions_market_data(current_prices)
+
+                    # Check and execute early take-profit if target odds reached (e.g. >= 0.82)
+                    if getattr(settings, "enable_early_take_profit", True):
+                        tp_records = await self.binance_client.check_and_execute_early_take_profits(markets)
+                        for tp_rec in tp_records:
+                            self.risk_guard.record_settlement_result(
+                                won=True,
+                                pnl=tp_rec["pnl"],
+                                symbol=tp_rec["symbol"]
+                            )
+
                     pnl, settled_records = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
                     for rec in settled_records:
                         self.risk_guard.record_settlement_result(
@@ -276,6 +310,14 @@ class TradingBotCoordinator:
 
         # Token Filter 2: Check selected timeframe
         if self.target_timeframe != "ALL" and market.timeframe.lower() != self.target_timeframe.lower():
+            return
+
+        # Timing Filter: Ensure round is within optimal evaluation window before spending AI tokens
+        # (e.g. For 15m/900s round, wait until <= 850s to let trend develop, and skip if < 180s left)
+        time_left = getattr(market, "time_left_seconds", 300)
+        if time_left > self.risk_guard.max_time_left_seconds:
+            return
+        if time_left < self.risk_guard.min_time_left_seconds:
             return
 
         # Token Filter 3: Check if already evaluated this round (1x per round)
@@ -364,6 +406,7 @@ class TradingBotCoordinator:
                 spot_price=market.underlying_price,
                 martingale_step=risk_result.martingale_step,
                 stage=risk_result.stage_label,
+                timeframe=market.timeframe,
             )
             record["order"] = order_result.model_dump()
 
@@ -535,6 +578,18 @@ def _persist_config_to_env(req: ConfigUpdateRequest) -> None:
         mapping["MARTINGALE_CONFIDENCE_STEP"] = f"{req.martingale_confidence_step:.2f}"
     if req.martingale_max_confidence is not None:
         mapping["MARTINGALE_MAX_CONFIDENCE"] = f"{req.martingale_max_confidence:.2f}"
+    if req.max_odds_cap is not None:
+        mapping["MAX_ODDS_CAP"] = f"{req.max_odds_cap:.2f}"
+    if req.min_odds_floor is not None:
+        mapping["MIN_ODDS_FLOOR"] = f"{req.min_odds_floor:.2f}"
+    if req.min_ev_edge is not None:
+        mapping["MIN_EV_EDGE"] = f"{req.min_ev_edge:.2f}"
+    if req.min_time_left_seconds is not None:
+        mapping["MIN_TIME_LEFT_SECONDS"] = str(req.min_time_left_seconds)
+    if req.max_time_left_seconds is not None:
+        mapping["MAX_TIME_LEFT_SECONDS"] = str(req.max_time_left_seconds)
+    if req.slippage_bps is not None:
+        mapping["SLIPPAGE_BPS"] = str(req.slippage_bps)
     if req.target_symbol is not None:
         mapping["TARGET_SYMBOL"] = req.target_symbol.upper()
     if req.target_timeframe is not None:
@@ -604,6 +659,12 @@ async def get_config_endpoint() -> Dict[str, Any]:
             "cooldown_seconds": rg.cooldown_seconds,
             "max_daily_loss_usdt": rg.max_daily_loss_usdt,
             "max_concurrent_positions": rg.max_concurrent_positions,
+            "max_odds_cap": rg.max_odds_cap,
+            "min_odds_floor": rg.min_odds_floor,
+            "min_ev_edge": rg.min_ev_edge,
+            "min_time_left_seconds": rg.min_time_left_seconds,
+            "max_time_left_seconds": rg.max_time_left_seconds,
+            "slippage_bps": bot.binance_client.slippage_bps,
             # Strategy Targets
             "target_symbol": bot.target_symbol,
             "target_timeframe": bot.target_timeframe,
@@ -634,7 +695,19 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         martingale_max_steps=req.martingale_max_steps,
         martingale_confidence_step=req.martingale_confidence_step,
         martingale_max_confidence=req.martingale_max_confidence,
+        max_odds_cap=req.max_odds_cap,
+        min_odds_floor=req.min_odds_floor,
+        min_ev_edge=req.min_ev_edge,
+        min_time_left_seconds=req.min_time_left_seconds,
+        max_time_left_seconds=req.max_time_left_seconds,
     )
+
+    if req.slippage_bps is not None:
+        bot.binance_client.slippage_bps = req.slippage_bps
+    if req.max_odds_cap is not None:
+        bot.binance_client.max_odds_cap = req.max_odds_cap
+    if req.min_odds_floor is not None:
+        bot.binance_client.min_odds_floor = req.min_odds_floor
 
     if req.target_symbol is not None and req.target_symbol.strip():
         bot.target_symbol = req.target_symbol.upper().strip()

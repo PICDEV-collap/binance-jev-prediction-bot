@@ -31,19 +31,19 @@ class Settings(BaseSettings):
         default="wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker/bnbusdt@ticker/dogeusdt@ticker/xrpusdt@ticker",
         alias="BINANCE_PREDICTION_WS_URL"
     )
-    binance_recv_window: int = Field(default=5000, alias="BINANCE_RECV_WINDOW")
+    binance_recv_window: int = Field(default=10000, alias="BINANCE_RECV_WINDOW")
     active_timeframes: str = Field(default="5m,15m,1h,1d", alias="ACTIVE_TIMEFRAMES")
     active_symbols: str = Field(
         default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT,XRPUSDT",
         alias="ACTIVE_SYMBOLS"
     )
     target_symbol: str = Field(default="BTCUSDT", alias="TARGET_SYMBOL")
-    target_timeframe: str = Field(default="15m", alias="TARGET_TIMEFRAME")
+    target_timeframe: str = Field(default="5m", alias="TARGET_TIMEFRAME")
     evaluations_per_round: int = Field(default=1, alias="EVALUATIONS_PER_ROUND")
 
     # --- Binance Prediction Trading & Network Resilience ---
     funding_source: str = Field(default="CEX", alias="FUNDING_SOURCE")  # "CEX" or "MPC"
-    slippage_bps: int = Field(default=1000, alias="SLIPPAGE_BPS")        # 10% auto-slippage
+    slippage_bps: int = Field(default=200, alias="SLIPPAGE_BPS")        # 2% auto-slippage (strictly controlled to prevent high fills)
     network_heartbeat_interval_seconds: float = Field(
         default=3.0,
         alias="NETWORK_HEARTBEAT_INTERVAL_SECONDS"
@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     )
     jev_ai_model: str = Field(default="jev-latest", alias="JEV_AI_MODEL")
     jev_ai_timeout_seconds: float = Field(
-        default=3.5,
+        default=6.0,
         alias="JEV_AI_TIMEOUT_SECONDS"
     )
 
@@ -102,6 +102,48 @@ class Settings(BaseSettings):
         ge=0.0,
         le=0.5,
         alias="SLIPPAGE_TOLERANCE"
+    )
+
+    # --- Strict Odds, Timing & Value Gates ---
+    max_odds_cap: float = Field(
+        default=0.60,
+        ge=0.30,
+        le=0.90,
+        alias="MAX_ODDS_CAP"
+    )
+    min_odds_floor: float = Field(
+        default=0.20,
+        ge=0.01,
+        le=0.50,
+        alias="MIN_ODDS_FLOOR"
+    )
+    min_ev_edge: float = Field(
+        default=0.05,
+        ge=0.01,
+        le=0.25,
+        alias="MIN_EV_EDGE"
+    )
+    min_time_left_seconds: int = Field(
+        default=60,
+        ge=30,
+        alias="MIN_TIME_LEFT_SECONDS"
+    )
+    max_time_left_seconds: int = Field(
+        default=270,
+        ge=60,
+        alias="MAX_TIME_LEFT_SECONDS"
+    )
+
+    # --- Early Take-Profit Feature ---
+    enable_early_take_profit: bool = Field(
+        default=True,
+        alias="ENABLE_EARLY_TAKE_PROFIT"
+    )
+    take_profit_odds: float = Field(
+        default=0.82,
+        ge=0.50,
+        le=0.99,
+        alias="TAKE_PROFIT_ODDS"
     )
 
     # --- Martingale Recovery Engine Configuration ---

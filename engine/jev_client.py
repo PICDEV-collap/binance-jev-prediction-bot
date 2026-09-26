@@ -156,6 +156,19 @@ class JevClient:
                 f"Do not guess — protect recovery capital."
             )
 
+        tf_directive = ""
+        if context.timeframe.lower() == "15m":
+            tf_directive = (
+                "\n⏱️ 15M TIMEFRAME PERSISTENCE: Macro candle trend structure and order flow carry higher inertia and lower noise. "
+                "Prioritize sustained directional persistence over minor 1m counter-ticks."
+            )
+
+        ev_directive = (
+            "\n⚖️ ASYMMETRIC VALUE & EV RULE: Binary contracts with odds <= 0.60 yield positive risk-reward (pay <= $0.60 to win $1.00 net payout >= +66.7%). "
+            "Do NOT assign high confidence to overpriced odds (> 0.60) unless there is overwhelming multi-factor confluence (EV edge >= +5%). "
+            "When Trend and Order Book Imbalance (OBI) contradict each other, penalize confidence towards 0.50 (market chop/uncertainty)."
+        )
+
         if "systemone" in self.endpoint:
             clean_sym = context.symbol.replace("USDT", "")
             diff_str = f"{context.price_diff:+,.2f}" if context.price_diff else f"{context.underlying_price - context.target_price:+,.2f}"
@@ -178,7 +191,9 @@ class JevClient:
                 f"{tech_line}"
                 f"{danger_line}"
                 f"{recent_track_record_line}"
-                f"{martingale_directive}\n"
+                f"{martingale_directive}"
+                f"{tf_directive}"
+                f"{ev_directive}\n"
                 f"Time Remaining to Expiration: {context.time_left_seconds} seconds."
             )
             payload = {
@@ -235,6 +250,10 @@ class JevClient:
                             "You are Jev AI, an ultra-low latency quantitative decision engine "
                             "specialized in binary prediction markets. Binary decision mode is strictly active: "
                             "you MUST predict either UP or DOWN. "
+                            "TIMEFRAME PERSISTENCE: For 15m markets, give priority to macro trend structure and order flow over transient noise. "
+                            "ASYMMETRIC VALUE & EV: Binary payouts require favorable odds (<= 0.60) to maintain positive expectancy. "
+                            "Demand multi-factor confluence (EMA trend, OBI flow, and DVR) before assigning high confidence (>= 0.65). "
+                            "When signals conflict (e.g. Trend vs OBI contradiction), penalize confidence towards neutral (0.50). "
                             "FEEDBACK DIRECTIVE: If a recent track record is provided, use it to gauge current market regime consistency. "
                             "MARTINGALE RECOVERY RULES: When Martingale Recovery is active, an escalating conviction hurdle is enforced. "
                             "Demand higher analytical momentum and price distance conviction before outputting high confidence. "
@@ -259,7 +278,9 @@ class JevClient:
                             f"- 5m Momentum: {context.momentum_pct:+.2f}%\n"
                             f"- Danger Warning: {'EXPIRY DANGER ZONE (<60s and within noise)' if context.expiry_danger_flag else 'None'}\n"
                             f"{recent_track_record_line}"
-                            f"{martingale_directive}\n"
+                            f"{martingale_directive}"
+                            f"{tf_directive}"
+                            f"{ev_directive}\n"
                             f"Determine whether to predict UP or DOWN."
                         )
                     }
@@ -402,6 +423,10 @@ class JevClient:
         time_left = max(10, context.time_left_seconds)
 
         # Multi-Factor Quantitative Probability Modeling:
+        # Timeframe weight multiplier (15m candles have more momentum & trend inertia)
+        is_15m = context.timeframe.lower() in ("15m", "30m", "1h")
+        trend_mult = 1.35 if is_15m else 1.0
+
         # Factor 1: DVR (Distance-to-Volatility Ratio) via Sigmoid Probability Mapping
         if context.dvr_ratio != 0.0:
             # Sigmoid maps +/- 2.0 sigma to ~ 95% / 5%
@@ -415,13 +440,17 @@ class JevClient:
         # Factor 2: Microstructure / Order Book Imbalance (OBI)
         obi_effect = context.order_book_imbalance * 0.05
 
-        # Factor 3: Momentum & Trend Alignment
+        # Factor 3: Momentum & Trend Alignment (Scaled by timeframe inertia)
         momentum_effect = momentum * 0.04
         trend_effect = 0.0
         if context.ema_trend == "STRONG_UPTREND":
-            trend_effect = +0.03
+            trend_effect = +0.035 * trend_mult
+        elif context.ema_trend == "UPTREND":
+            trend_effect = +0.020 * trend_mult
         elif context.ema_trend == "STRONG_DOWNTREND":
-            trend_effect = -0.03
+            trend_effect = -0.035 * trend_mult
+        elif context.ema_trend == "DOWNTREND":
+            trend_effect = -0.020 * trend_mult
 
         # Factor 4: Technical RSI Overbought / Oversold Mean-Reversion Dampener
         rsi_effect = 0.0
@@ -430,8 +459,42 @@ class JevClient:
         elif context.rsi_5m <= 25:
             rsi_effect = +0.03  # Bounce potential from extreme oversold
 
+        # Factor 5: Multi-Indicator Confluence & Contradiction Dampener
+        confluence_effect = 0.0
+        confluence_note = ""
+        is_bull_trend = "UPTREND" in context.ema_trend
+        is_bear_trend = "DOWNTREND" in context.ema_trend
+        obi = context.order_book_imbalance
+
+        if is_bull_trend and obi > 0.15 and context.rsi_5m < 70 and momentum >= 0:
+            confluence_effect = +0.035  # High-conviction bullish confluence
+            confluence_note = " [Bullish Confluence: Trend+OBI+Mom]"
+        elif is_bear_trend and obi < -0.15 and context.rsi_5m > 30 and momentum <= 0:
+            confluence_effect = -0.035  # High-conviction bearish confluence
+            confluence_note = " [Bearish Confluence: Trend+OBI+Mom]"
+        elif (is_bull_trend and obi < -0.25) or (is_bear_trend and obi > 0.25):
+            confluence_note = " [Contradiction Dampener: Trend vs OBI fight]"
+
+        # Factor 6: BTC Macro Correlation (Crypto-wide directional tailwind)
+        btc_effect = 0.0
+        if context.btc_correlation_dir == "BULLISH":
+            btc_effect = +0.015
+        elif context.btc_correlation_dir == "BEARISH":
+            btc_effect = -0.015
+
         # Aggregate theoretical probability
-        theoretical_prob = prob_dvr + obi_effect + momentum_effect + trend_effect + rsi_effect
+        theoretical_prob = (
+            prob_dvr
+            + obi_effect
+            + momentum_effect
+            + trend_effect
+            + rsi_effect
+            + confluence_effect
+            + btc_effect
+        )
+        if "Contradiction Dampener" in confluence_note:
+            theoretical_prob = 0.50 + (theoretical_prob - 0.50) * 0.70
+
         theoretical_prob = max(0.05, min(0.95, theoretical_prob))
 
         # Edge calculation: discrepancy between theoretical probability and market odds
@@ -439,7 +502,7 @@ class JevClient:
         edge_no = (1.0 - theoretical_prob) - context.odds_no
 
         # Binary decision: strictly UP or DOWN based on expectancy / probability
-        feedback_note = ""
+        feedback_note = confluence_note
         streak_modifier = 1.0
         if context.recent_performance:
             consecutive_losses = context.recent_performance.get("consecutive_losses", 0)
@@ -447,10 +510,10 @@ class JevClient:
             if consecutive_losses >= 2:
                 # Regulate confidence down slightly during drawdown to demand higher signal threshold
                 streak_modifier = max(0.85, 1.0 - (0.05 * (consecutive_losses - 1)))
-                feedback_note = f" [Adaptive Defense: {consecutive_losses} consecutive losses on {context.symbol}]"
+                feedback_note += f" [Adaptive Defense: {consecutive_losses} consecutive losses on {context.symbol}]"
             elif consecutive_wins >= 2:
                 streak_modifier = min(1.05, 1.0 + (0.02 * consecutive_wins))
-                feedback_note = f" [Momentum Feedback: {consecutive_wins} win streak on {context.symbol}]"
+                feedback_note += f" [Momentum Feedback: {consecutive_wins} win streak on {context.symbol}]"
 
         # Expiry Danger Filter (Near-strike Gamma Risk)
         danger_modifier = 1.0
@@ -460,17 +523,33 @@ class JevClient:
 
         if theoretical_prob >= 0.50 or edge_yes >= edge_no:
             action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"] = "UP"
-            raw_conf = max(0.50, min(0.98, theoretical_prob + (max(0.0, edge_yes) * 0.5)))
-            confidence = max(0.50, min(0.98, raw_conf * streak_modifier * danger_modifier))
+            chosen_odds = context.odds_yes
+            chosen_edge = edge_yes
+            prob_chosen = theoretical_prob
         else:
             action = "DOWN"
-            prob_down = 1.0 - theoretical_prob
-            raw_conf = max(0.50, min(0.98, prob_down + (max(0.0, edge_no) * 0.5)))
-            confidence = max(0.50, min(0.98, raw_conf * streak_modifier * danger_modifier))
+            prob_chosen = 1.0 - theoretical_prob
+            chosen_odds = context.odds_no
+            chosen_edge = edge_no
+
+        # Asymmetric Odds modifier:
+        # Penalize confidence if paying > 0.60 odds (poor payout risk/reward)
+        # Boost confidence slightly if odds <= 0.55 and positive EV edge >= 0.05
+        odds_modifier = 1.0
+        if chosen_odds > 0.60:
+            odds_modifier = 0.90
+            feedback_note += " [Asymmetric Odds Penalty: Price > 0.60]"
+        elif chosen_odds <= 0.55 and chosen_edge >= 0.05:
+            odds_modifier = 1.03
+
+        # Contradiction modifier: dampen confidence when trend opposes order flow
+        contradiction_modifier = 0.85 if "Contradiction Dampener" in confluence_note else 1.0
+
+        raw_conf = max(0.50, min(0.98, prob_chosen + (max(0.0, chosen_edge) * 0.5)))
+        confidence = max(0.50, min(0.98, raw_conf * streak_modifier * danger_modifier * odds_modifier * contradiction_modifier))
 
         # Martingale Recovery Conviction Hurdle Alignment
         if context.martingale_step > 0 and not context.expiry_danger_flag:
-            chosen_edge = edge_yes if action == "UP" else edge_no
             momentum_aligned = (momentum > 0.03 and action == "UP") or (momentum < -0.03 and action == "DOWN")
             if chosen_edge > 0.03 and momentum_aligned:
                 boost = min(0.12, 0.03 * context.martingale_step + chosen_edge * 0.5)
@@ -487,7 +566,7 @@ class JevClient:
             )
         else:
             reasoning = (
-                f"Binary DOWN conviction: Theoretical P(DOWN) {prob_down:.1%} (Market Odds: {context.odds_no:.1%}, "
+                f"Binary DOWN conviction: Theoretical P(DOWN) {prob_chosen:.1%} (Market Odds: {context.odds_no:.1%}, "
                 f"Edge: {edge_no*100:+.1f}%). {dvr_info} with {time_left}s remaining.{feedback_note}"
             )
 

@@ -50,7 +50,11 @@ class RiskGuard:
         cooldown_seconds: int = 45,
         max_daily_loss_usdt: float = 200.0,
         max_concurrent_positions: int = 5,
-        max_odds_cap: float = 0.90,
+        max_odds_cap: float = 0.60,
+        min_odds_floor: float = 0.20,
+        min_ev_edge: float = 0.05,
+        min_time_left_seconds: int = 120,
+        max_time_left_seconds: int = 850,
         martingale_enabled: bool = True,
         martingale_multiplier: float = 2.0,
         martingale_max_steps: int = 4,
@@ -64,6 +68,10 @@ class RiskGuard:
         self.max_daily_loss_usdt = max_daily_loss_usdt
         self.max_concurrent_positions = max_concurrent_positions
         self.max_odds_cap = max_odds_cap
+        self.min_odds_floor = min_odds_floor
+        self.min_ev_edge = min_ev_edge
+        self.min_time_left_seconds = min_time_left_seconds
+        self.max_time_left_seconds = max_time_left_seconds
 
         # Martingale Recovery State
         self.martingale_enabled: bool = martingale_enabled
@@ -103,6 +111,7 @@ class RiskGuard:
             "EXTREME_ODDS_RISK": 0,
             "WIDE_SPREAD": 0,
             "INVALID_PRICING": 0,
+            "OUTSIDE_TIME_WINDOW": 0,
             "EXPIRY_DANGER": 0,
             "CONTRADICTION_RISK": 0,
             "NETWORK_OFFLINE": 0,
@@ -377,6 +386,30 @@ class RiskGuard:
                 effective_threshold=effective_threshold
             )
 
+        # Gate 2.8: Round Time-Window Filter (Timing & Asymmetric Payoff Risk)
+        # Prevents late-round entries where odds polarize (e.g. 0.85 - 0.99) leaving minimal profit potential
+        # with full -100% loss risk, or hopeless 0.01 bets.
+        time_left = getattr(market, "time_left_seconds", 300)
+        if time_left < self.min_time_left_seconds:
+            self._record_rejection("OUTSIDE_TIME_WINDOW")
+            time_reason = (
+                f"Time-Window Filter: Only {time_left}s remaining in round (< {self.min_time_left_seconds}s threshold). "
+                f"Late-round entry rejected to prevent low-payout/high-loss asymmetric payoff."
+            )
+            logger.info(f"[RISK FILTER] {time_reason} for {market.market_id}. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=time_reason,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
+            )
+
         # Gate 3: Cooldown Throttle per Market
         last_trade_time = self._market_last_traded.get(market.market_id, 0.0)
         elapsed_since_last_trade = now - last_trade_time
@@ -415,16 +448,23 @@ class RiskGuard:
                 effective_threshold=effective_threshold,
             )
 
-        # Gate 5: Odds Pricing and Skew Sanity Check
+        # Gate 5: Expected Value (EV) Gate
+        # In Binary Prediction Markets, winning payout is $1.00 per contract.
+        # Cost = target_price. EV = (Confidence * $1.00) - target_price.
+        # Must have a positive edge (EV >= min_ev_edge, e.g. at least +5% edge over market odds).
         target_price = market.odds_yes if decision.action in ("BUY_YES", "UP") else market.odds_no
-        if target_price <= 0.02 or target_price > self.max_odds_cap:
-            self._record_rejection("EXTREME_ODDS_RISK")
+        expected_value = (decision.confidence * 1.00) - target_price
+        min_ev_edge = self.min_ev_edge
+        if expected_value < min_ev_edge:
+            self._record_rejection("NEGATIVE_EV_RISK")
+            ev_reason = (
+                f"Negative/Low Expected Value Filter: EV is {expected_value:+.3f} (Edge: {expected_value*100:+.1f}% < {min_ev_edge*100:.1f}%). "
+                f"Market price {target_price:.3f} is too expensive for conviction {decision.confidence*100:.0f}%."
+            )
+            logger.info(f"[RISK FILTER] {ev_reason} for {market.market_id}. Capital preserved.")
             return RiskEvaluationResult(
                 approved=False,
-                reason=(
-                    f"Entry price {target_price:.3f} outside safe odds bounds "
-                    f"(0.02 - {self.max_odds_cap:.2f})"
-                ),
+                reason=ev_reason,
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
@@ -436,22 +476,39 @@ class RiskGuard:
                 effective_threshold=effective_threshold,
             )
 
-        # Gate 5.5: Expected Value (EV) Gate
-        # In Binary Prediction Markets, winning payout is $1.00 per contract.
-        # Cost = target_price. EV = (Confidence * $1.00) - target_price.
-        # Must have a positive edge (EV >= +0.02, or at least +2% edge over market odds).
-        expected_value = (decision.confidence * 1.00) - target_price
-        min_ev_edge = 0.02
-        if expected_value < min_ev_edge:
-            self._record_rejection("NEGATIVE_EV_RISK")
-            ev_reason = (
-                f"Negative/Low Expected Value Filter: EV is {expected_value:+.3f} (Edge: {expected_value*100:+.1f}%). "
-                f"Market price {target_price:.3f} is too expensive for conviction {decision.confidence*100:.0f}%."
+        # Gate 5.5: Odds Pricing and Skew Sanity Check (Strict Bounds to guarantee favorable Risk/Reward)
+        if target_price < self.min_odds_floor:
+            self._record_rejection("EXTREME_ODDS_RISK")
+            reason_str = (
+                f"Entry price {target_price:.3f} below minimum odds floor {self.min_odds_floor:.2f}. "
+                f"Extreme underdog bet has negligible statistical probability."
             )
-            logger.info(f"[RISK FILTER] {ev_reason} for {market.market_id}. Capital preserved.")
+            logger.info(f"[RISK FILTER] {reason_str} for {market.market_id}. Capital preserved.")
             return RiskEvaluationResult(
                 approved=False,
-                reason=ev_reason,
+                reason=reason_str,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                target_price=target_price,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
+
+        if target_price > self.max_odds_cap:
+            self._record_rejection("EXTREME_ODDS_RISK")
+            payout_pct = ((1.0 - target_price) / max(0.001, target_price)) * 100.0
+            reason_str = (
+                f"Entry price {target_price:.3f} exceeds maximum odds cap {self.max_odds_cap:.2f} "
+                f"(Win payout: +{payout_pct:.1f}% vs Loss: -100%). Unfavorable Risk/Reward."
+            )
+            logger.info(f"[RISK FILTER] {reason_str} for {market.market_id}. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=reason_str,
                 adjusted_contracts=0,
                 confidence=decision.confidence,
                 market_id=market.market_id,
@@ -581,6 +638,11 @@ class RiskGuard:
         martingale_max_steps: Optional[int] = None,
         martingale_confidence_step: Optional[float] = None,
         martingale_max_confidence: Optional[float] = None,
+        max_odds_cap: Optional[float] = None,
+        min_odds_floor: Optional[float] = None,
+        min_ev_edge: Optional[float] = None,
+        min_time_left_seconds: Optional[int] = None,
+        max_time_left_seconds: Optional[int] = None,
     ) -> None:
         """Dynamically update risk parameters and Martingale settings at runtime from web dashboard."""
         if confidence_threshold is not None:
@@ -595,6 +657,16 @@ class RiskGuard:
             self.max_daily_loss_usdt = max(10.0, float(max_daily_loss_usdt))
         if max_concurrent_positions is not None:
             self.max_concurrent_positions = max(1, min(24, int(max_concurrent_positions)))
+        if max_odds_cap is not None:
+            self.max_odds_cap = max(0.30, min(0.90, max_odds_cap))
+        if min_odds_floor is not None:
+            self.min_odds_floor = max(0.01, min(0.50, min_odds_floor))
+        if min_ev_edge is not None:
+            self.min_ev_edge = max(0.01, min(0.25, min_ev_edge))
+        if min_time_left_seconds is not None:
+            self.min_time_left_seconds = max(30, min_time_left_seconds)
+        if max_time_left_seconds is not None:
+            self.max_time_left_seconds = max(60, max_time_left_seconds)
         if martingale_enabled is not None:
             self.martingale_enabled = bool(martingale_enabled)
         if martingale_multiplier is not None:
@@ -608,6 +680,8 @@ class RiskGuard:
 
         logger.info(
             f"Risk parameters updated: Conf={self.confidence_threshold:.2f}, "
+            f"MaxOdds={self.max_odds_cap:.2f}, MinOdds={self.min_odds_floor:.2f}, MinEV={self.min_ev_edge:.2f}, "
+            f"MinTimeLeft={self.min_time_left_seconds}s, MaxTimeLeft={self.max_time_left_seconds}s, "
             f"BaseContracts={self.default_order_contracts}, Size=${self.max_position_size_usdt:.1f}, "
             f"DailyLossLimit=${self.max_daily_loss_usdt:.1f}, MaxPos={self.max_concurrent_positions}, "
             f"Cooldown={self.cooldown_seconds}s, Martingale={self.martingale_enabled} "
@@ -638,6 +712,11 @@ class RiskGuard:
             "max_concurrent_positions": self.max_concurrent_positions,
             "cooldown_seconds": self.cooldown_seconds,
             "max_daily_loss_usdt": self.max_daily_loss_usdt,
+            "max_odds_cap": self.max_odds_cap,
+            "min_odds_floor": self.min_odds_floor,
+            "min_ev_edge": self.min_ev_edge,
+            "min_time_left_seconds": self.min_time_left_seconds,
+            "max_time_left_seconds": self.max_time_left_seconds,
             "daily_net_pnl": round(self._daily_net_pnl, 2),
             "daily_realized_loss": round(self._daily_realized_loss, 2),
             "circuit_breaker_active": self._circuit_breaker_active,
