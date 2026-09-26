@@ -117,7 +117,14 @@ class RiskGuard:
             "NETWORK_OFFLINE": 0,
             "NEGATIVE_EV_RISK": 0,
             "UNREALISTIC_VELOCITY_RISK": 0,
+            "UNSUPPORTED_PREDICTION_ASSET": 0,
         }
+        self.supported_prediction_symbols: Set[str] = {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+
+    def set_supported_symbols(self, symbols: Set[str]) -> None:
+        """Update the set of valid binary prediction market symbols."""
+        if symbols:
+            self.supported_prediction_symbols = {s.upper() for s in symbols}
 
     def get_symbol_martingale_step(self, symbol: Optional[str] = None) -> int:
         """Get Martingale recovery step for a specific symbol or global fallback."""
@@ -254,6 +261,26 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action="PASS",
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold
+            )
+
+        # Gate 0.1: Supported Binary Prediction Asset Check
+        clean_sym = market.symbol.upper()
+        if clean_sym not in self.supported_prediction_symbols:
+            self._record_rejection("UNSUPPORTED_PREDICTION_ASSET")
+            valid_list = ", ".join(sorted(self.supported_prediction_symbols))
+            reason = f"Asset {clean_sym} has no binary prediction contracts on Binance. Supported: {valid_list}."
+            logger.warning(f"[RISK FILTER] {reason} Order not dispatched. Capital preserved.")
+            return RiskEvaluationResult(
+                approved=False,
+                reason=reason,
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
                 martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,

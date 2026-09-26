@@ -28,7 +28,7 @@ from engine.indicators import RollingCandleAggregator
 
 logger = logging.getLogger("ws_listener")
 
-SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "XRPUSDT")
+SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT", "BNBUSDT")
 TIMEFRAMES: List[tuple[str, int]] = [
     ("5m", 300),
     ("15m", 900),
@@ -37,9 +37,9 @@ TIMEFRAMES: List[tuple[str, int]] = [
 ]
 
 SPOT_COMBINED_STREAM_URL = (
-    "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker/bnbusdt@ticker/dogeusdt@ticker/xrpusdt@ticker"
+    "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/bnbusdt@ticker"
 )
-REST_TICKER_API = "https://api.binance.com/api/v3/ticker/24hr?symbols=%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22BNBUSDT%22,%22DOGEUSDT%22,%22XRPUSDT%22%5D"
+REST_TICKER_API = "https://api.binance.com/api/v3/ticker/24hr?symbols=%5B%22BTCUSDT%22,%22ETHUSDT%22,%22BNBUSDT%22%5D"
 
 
 class ConnectionState(str, Enum):

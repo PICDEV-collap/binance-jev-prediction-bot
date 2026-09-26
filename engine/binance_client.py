@@ -307,6 +307,26 @@ class BinanceClient:
 
         return self._prediction_market_cache.get("marketTopics", [])
 
+    def get_supported_prediction_symbols(self) -> Set[str]:
+        """
+        Dynamically return the set of cryptocurrency symbols that have active
+        binary prediction market contracts on Binance (discovered from marketTopics catalog).
+        Defaults to {"BTCUSDT", "ETHUSDT", "BNBUSDT"}.
+        """
+        symbols: Set[str] = set()
+        topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
+        for t in topics:
+            title = str(t.get("title", ""))
+            sym = str(t.get("symbol", "")).upper()
+            if "Up or Down" in title or t.get("chartType") == "CRYPTO_UP_DOWN":
+                if sym and "USDT" in sym:
+                    symbols.add(sym)
+                for candidate in ["BTCUSDT", "ETHUSDT", "BNBUSDT"]:
+                    base = candidate.replace("USDT", "")
+                    if base in title.upper():
+                        symbols.add(candidate)
+        return symbols or {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+
     async def get_prediction_quote(
         self,
         token_id: str,
@@ -414,6 +434,32 @@ class BinanceClient:
 
         clean_sym = symbol.upper().strip()
         clean_base = clean_sym.replace("USDT", "")
+
+        # Validate that symbol is offered on Binance Prediction Markets in live mode
+        supported_syms = self.get_supported_prediction_symbols()
+        if not self.paper_trading and clean_sym not in supported_syms:
+            err_msg = (
+                f"Asset {symbol} has no binary prediction contracts on Binance. "
+                f"Actively supported prediction pairs: {', '.join(sorted(supported_syms))}."
+            )
+            logger.warning(f"[BINANCE LIVE REJECTION] {err_msg}")
+            result = OrderResult(
+                order_id="FAILED",
+                client_order_id=client_order_id,
+                market_id=market_id,
+                symbol=symbol,
+                side=side,
+                contracts=contracts,
+                price=target_price,
+                status="REJECTED",
+                latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                martingale_step=martingale_step,
+                stage=stage,
+                error_message=err_msg
+            )
+            self._total_orders_dispatched += 1
+            self._order_history.append(result)
+            return result
 
         def _find_token(topic_list: List[Dict[str, Any]]) -> Optional[str]:
             import re

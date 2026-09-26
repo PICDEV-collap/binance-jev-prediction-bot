@@ -218,3 +218,29 @@ def test_asymmetric_odds_penalty():
 
     asyncio.run(_run())
 
+
+def test_unsupported_prediction_asset_rejection():
+    """Verify that assets without binary prediction contracts (e.g. SOLUSDT, DOGEUSDT) are rejected at Gate 0.1."""
+    guard = RiskGuard(confidence_threshold=0.80)
+    guard.set_supported_symbols({"BTCUSDT", "ETHUSDT", "BNBUSDT"})
+
+    ctx_sol = MarketContext(
+        market_id="SOLUSDT-15M-TEST",
+        symbol="SOLUSDT",
+        question="SOL Up or Down 15m",
+        timeframe="15m",
+        odds_yes=0.50,
+        odds_no=0.50,
+        underlying_price=135.0,
+        target_price=134.0,
+        time_left_seconds=500,
+    )
+    decision = JevEvaluationResult(action="DOWN", confidence=0.88, reasoning="Bearish momentum")
+
+    res = guard.validate_and_size_order(decision, ctx_sol)
+    assert res.approved is False
+    assert "has no binary prediction contracts on Binance" in res.reason
+    assert "Supported: BNBUSDT, BTCUSDT, ETHUSDT" in res.reason
+    assert guard._rejection_counts["UNSUPPORTED_PREDICTION_ASSET"] == 1
+
+

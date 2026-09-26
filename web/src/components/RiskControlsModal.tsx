@@ -235,7 +235,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     }
   };
 
-  const availableSymbols = ['ALL', 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'DOGEUSDT', 'XRPUSDT'];
+  const availableSymbols = ['ALL', 'BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
   const availableTimeframes = ['ALL', '5m', '15m', '1h', '1d'];
   const availableModels = ['jev-latest', 'jev-1.13.0', 'jev-turbo', 'jev-predict-v1'];
 

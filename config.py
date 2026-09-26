@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     binance_recv_window: int = Field(default=10000, alias="BINANCE_RECV_WINDOW")
     active_timeframes: str = Field(default="5m,15m,1h,1d", alias="ACTIVE_TIMEFRAMES")
     active_symbols: str = Field(
-        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT,XRPUSDT",
+        default="BTCUSDT,ETHUSDT,BNBUSDT",
         alias="ACTIVE_SYMBOLS"
     )
     target_symbol: str = Field(default="BTCUSDT", alias="TARGET_SYMBOL")

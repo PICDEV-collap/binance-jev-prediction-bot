@@ -20,13 +20,10 @@ interface AiTargetRibbonProps {
 }
 
 const SYMBOLS = [
-  { label: '🌐 All Assets (Multi-Scan)', value: 'ALL' },
-  { label: 'BTC/USDT', value: 'BTCUSDT' },
-  { label: 'ETH/USDT', value: 'ETHUSDT' },
-  { label: 'SOL/USDT', value: 'SOLUSDT' },
-  { label: 'BNB/USDT', value: 'BNBUSDT' },
-  { label: 'DOGE/USDT', value: 'DOGEUSDT' },
-  { label: 'XRP/USDT', value: 'XRPUSDT' },
+  { label: '🌐 All Active Pairs (BTC, ETH, BNB)', value: 'ALL' },
+  { label: 'BTC/USDT (Bitcoin)', value: 'BTCUSDT' },
+  { label: 'ETH/USDT (Ethereum)', value: 'ETHUSDT' },
+  { label: 'BNB/USDT (Binance Coin)', value: 'BNBUSDT' },
 ];
 
 const TIMEFRAMES = [

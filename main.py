@@ -191,7 +191,18 @@ class TradingBotCoordinator:
         await self.ws_listener.start()
         if not self.binance_client.paper_trading:
             asyncio.create_task(self.binance_client.fetch_live_balance())
+            asyncio.create_task(self._init_live_catalog())
         self._heartbeat_task = asyncio.create_task(self._dashboard_heartbeat_loop())
+
+    async def _init_live_catalog(self) -> None:
+        """Fetch live prediction market catalog and sync supported symbols to RiskGuard."""
+        try:
+            await self.binance_client.fetch_prediction_market_topics(force_refresh=True)
+            supported = self.binance_client.get_supported_prediction_symbols()
+            self.risk_guard.set_supported_symbols(supported)
+            logger.info(f"[CATALOG SYNC] Live Binance Prediction Pairs discovered: {', '.join(sorted(supported))}")
+        except Exception as e:
+            logger.debug(f"Catalog init notice: {e}")
 
     async def stop(self) -> None:
         """Stop all subsystems and clean up sessions."""
@@ -303,6 +314,12 @@ class TradingBotCoordinator:
         """
         if self.bot_status != "RUNNING" or self.is_paused:
             return
+
+        # Supported Asset Filter: In live trading, only evaluate coins that Binance Prediction Markets actually supports
+        if not self.binance_client.paper_trading:
+            supported_syms = self.binance_client.get_supported_prediction_symbols()
+            if market.symbol.upper() not in supported_syms:
+                return
 
         # Token Filter 1: Check selected symbol
         if self.target_symbol != "ALL" and market.symbol.upper() != self.target_symbol.upper():
