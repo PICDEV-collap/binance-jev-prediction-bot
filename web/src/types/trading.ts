@@ -137,6 +137,10 @@ export interface SystemStatus {
     max_concurrent_positions?: number;
     cooldown_seconds: number;
     max_daily_loss_usdt: number;
+    max_odds_cap?: number;
+    min_odds_floor?: number;
+    min_ev_edge?: number;
+    slippage_bps?: number;
     daily_realized_loss: number;
     circuit_breaker_active: boolean;
     total_evaluated: number;
@@ -238,6 +242,10 @@ export interface BotConfig {
   cooldown_seconds: number;
   max_daily_loss_usdt: number;
   max_concurrent_positions: number;
+  max_odds_cap?: number;
+  min_odds_floor?: number;
+  min_ev_edge?: number;
+  slippage_bps?: number;
   target_symbol: string;
   target_timeframe: string;
   paper_trading: boolean;

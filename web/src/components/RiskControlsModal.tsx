@@ -19,7 +19,9 @@ import {
   EyeOff,
   Cpu,
   Save,
-  CheckCircle2
+  CheckCircle2,
+  Scale,
+  Percent
 } from 'lucide-react';
 import { BotConfig } from '../types/trading';
 
@@ -32,6 +34,9 @@ interface RiskControlsModalProps {
   currentCooldown: number;
   currentDailyLossLimit?: number;
   currentMaxConcurrentPositions?: number;
+  currentMaxOddsCap?: number;
+  currentMinOddsFloor?: number;
+  currentSlippageBps?: number;
   currentTargetSymbol?: string;
   currentTargetTimeframe?: string;
   currentPaperTrading: boolean;
@@ -55,6 +60,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentCooldown,
   currentDailyLossLimit = 200,
   currentMaxConcurrentPositions = 5,
+  currentMaxOddsCap = 0.60,
+  currentMinOddsFloor = 0.20,
+  currentSlippageBps = 50,
   currentTargetSymbol = 'BTCUSDT',
   currentTargetTimeframe = '15m',
   currentPaperTrading,
@@ -73,6 +81,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   // Tab 1: Risk & Martingale State
   const [threshold, setThreshold] = useState<number>(currentThreshold * 100);
   const [defaultOrderContracts, setDefaultOrderContracts] = useState<number>(currentDefaultOrderContracts);
+  const [maxOddsCap, setMaxOddsCap] = useState<number>(currentMaxOddsCap);
+  const [minOddsFloor, setMinOddsFloor] = useState<number>(currentMinOddsFloor);
+  const [slippageBps, setSlippageBps] = useState<number>(currentSlippageBps);
   const [martingaleEnabled, setMartingaleEnabled] = useState<boolean>(currentMartingaleEnabled);
   const [martingaleMultiplier, setMartingaleMultiplier] = useState<number>(currentMartingaleMultiplier);
   const [martingaleMaxSteps, setMartingaleMaxSteps] = useState<number>(currentMartingaleMaxSteps);
@@ -114,6 +125,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     // Reset default inputs from props first
     setThreshold(currentThreshold * 100);
     setDefaultOrderContracts(currentDefaultOrderContracts);
+    setMaxOddsCap(currentMaxOddsCap);
+    setMinOddsFloor(currentMinOddsFloor);
+    setSlippageBps(currentSlippageBps);
     setMartingaleEnabled(currentMartingaleEnabled);
     setMartingaleMultiplier(currentMartingaleMultiplier);
     setMartingaleMaxSteps(currentMartingaleMaxSteps);
@@ -140,6 +154,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         const c = data.config;
         if (c.confidence_threshold !== undefined) setThreshold(c.confidence_threshold * 100);
         if (c.default_order_contracts !== undefined) setDefaultOrderContracts(c.default_order_contracts);
+        if (c.max_odds_cap !== undefined) setMaxOddsCap(c.max_odds_cap);
+        if (c.min_odds_floor !== undefined) setMinOddsFloor(c.min_odds_floor);
+        if (c.slippage_bps !== undefined) setSlippageBps(c.slippage_bps);
         if (c.martingale_enabled !== undefined) setMartingaleEnabled(c.martingale_enabled);
         if (c.martingale_multiplier !== undefined) setMartingaleMultiplier(c.martingale_multiplier);
         if (c.martingale_max_steps !== undefined) setMartingaleMaxSteps(c.martingale_max_steps);
@@ -170,6 +187,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     serverUrl,
     currentThreshold,
     currentDefaultOrderContracts,
+    currentMaxOddsCap,
+    currentMinOddsFloor,
+    currentSlippageBps,
     currentMartingaleEnabled,
     currentMartingaleMultiplier,
     currentMartingaleMaxSteps,
@@ -196,6 +216,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
       const payload: BotConfig = {
         confidence_threshold: threshold / 100,
         default_order_contracts: Math.max(1, Math.round(defaultOrderContracts)),
+        max_odds_cap: maxOddsCap,
+        min_odds_floor: minOddsFloor,
+        slippage_bps: slippageBps,
         martingale_enabled: martingaleEnabled,
         martingale_multiplier: martingaleMultiplier,
         martingale_max_steps: martingaleMaxSteps,
@@ -375,7 +398,120 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                 </div>
               </div>
 
-              {/* 3. Martingale Recovery Engine Section */}
+              {/* 3. Quote Odds Guard & Payout Protection (Max Cap / Min Floor) */}
+              <div className="p-4 rounded-xl bg-slate-900/80 border border-cyan-500/40 space-y-3.5 shadow-sm">
+                <div className="flex items-center justify-between pb-2.5 border-b border-slate-800">
+                  <div className="flex items-center gap-2">
+                    <Scale className="w-4 h-4 text-cyan-400" />
+                    <div>
+                      <span className="text-xs font-mono font-bold text-white uppercase flex items-center gap-1.5">
+                        QUOTE ODDS GUARD & PAYOUT PROTECTION
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                          ODDS CAP
+                        </span>
+                      </span>
+                      <span className="text-[10.5px] font-mono text-slate-400">
+                        ควบคุมเพดานราคาเข้าซื้อ เพื่อป้องกันการเข้าเทรดที่อัตราความเสี่ยงไม่คุ้มค่ากำไร (Asymmetric Risk)
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 3.1 Max Odds Cap */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs font-mono">
+                    <span className="text-slate-200 font-semibold flex items-center gap-1.5">
+                      <Shield className="w-3.5 h-3.5 text-cyan-400" />
+                      MAX ODDS CAP (เพดานราคาเข้าซื้อสูงสุด)
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-mono text-emerald-400 font-semibold">
+                        กำไรชนะ: +{(((1.0 - maxOddsCap) / Math.max(0.01, maxOddsCap)) * 100).toFixed(1)}%
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40">
+                        ${maxOddsCap.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.40"
+                    max="0.85"
+                    step="0.01"
+                    value={maxOddsCap}
+                    onChange={(e) => setMaxOddsCap(parseFloat(e.target.value))}
+                    className="w-full accent-cyan-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[10px] font-mono text-slate-500">
+                    <span>$0.40 (+150%)</span>
+                    <span className="text-emerald-400 font-semibold">$0.55 (+81.8%)</span>
+                    <span className="text-cyan-400 font-bold">$0.60 (+66.7% แนะนำ)</span>
+                    <span className="text-amber-400 font-semibold">$0.70 (+42.9%)</span>
+                    <span className="text-rose-400">$0.85 (+17.6%)</span>
+                  </div>
+                  <p className="text-[10px] font-mono text-slate-400 bg-slate-950/70 p-2 rounded border border-slate-800">
+                    💡 <span className="text-slate-200 font-medium">คำอธิบาย:</span> หากราคา Quote ที่ Binance เสนอมาสูงกว่า <span className="text-cyan-300 font-bold">${maxOddsCap.toFixed(2)}</span> บอทจะ <span className="text-rose-400 font-semibold">REJECT</span> ไม้นั้นทันที เพื่อไม่ให้เสี่ยงเงินก้อนใหญ่แลกกำไรเพียงเล็กน้อย (เช่น ซื้อ $0.70 ชนะได้เพียง +$0.30 แต่เสียเต็ม -$0.70)
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                  {/* 3.2 Min Odds Floor */}
+                  <div className="p-3 rounded-lg bg-slate-950/60 border border-slate-800/80 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span className="text-slate-300 font-medium">MIN ODDS FLOOR (ราคาขั้นต่ำ)</span>
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-bold border border-slate-700">
+                        ${minOddsFloor.toFixed(2)}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.05"
+                      max="0.40"
+                      step="0.01"
+                      value={minOddsFloor}
+                      onChange={(e) => setMinOddsFloor(parseFloat(e.target.value))}
+                      className="w-full accent-slate-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
+                    />
+                    <div className="flex justify-between text-[9.5px] font-mono text-slate-500">
+                      <span>$0.05</span>
+                      <span className="text-slate-300 font-semibold">$0.20 (แนะนำ)</span>
+                      <span>$0.40</span>
+                    </div>
+                    <span className="text-[9.5px] font-mono text-slate-400 block">
+                      ป้องกันการเข้าซื้อสัญญา Underdog ที่โอกาสชนะต่ำเกินไป
+                    </span>
+                  </div>
+
+                  {/* 3.3 Slippage Tolerance */}
+                  <div className="p-3 rounded-lg bg-slate-950/60 border border-slate-800/80 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span className="text-slate-300 font-medium">MAX SLIPPAGE TOLERANCE</span>
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-bold border border-slate-700">
+                        {slippageBps} BPS ({(slippageBps / 100).toFixed(2)}%)
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="10"
+                      max="200"
+                      step="5"
+                      value={slippageBps}
+                      onChange={(e) => setSlippageBps(parseInt(e.target.value))}
+                      className="w-full accent-slate-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
+                    />
+                    <div className="flex justify-between text-[9.5px] font-mono text-slate-500">
+                      <span>10 BPS (0.1%)</span>
+                      <span className="text-slate-300 font-semibold">50 BPS (0.5%)</span>
+                      <span>200 BPS (2.0%)</span>
+                    </div>
+                    <span className="text-[9.5px] font-mono text-slate-400 block">
+                      ความต่างราคาที่ยอมรับได้ระหว่าง Quote กับราคาจับคู่จริง
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 4. Martingale Recovery Engine Section */}
               <div className="p-4 rounded-xl bg-slate-950/90 border border-amber-500/30 space-y-4">
                 <div className="flex items-center justify-between pb-2.5 border-b border-slate-800">
                   <div className="flex items-center gap-2">

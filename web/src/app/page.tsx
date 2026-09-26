@@ -614,6 +614,9 @@ export default function DashboardPage() {
           cooldown_seconds: newConfig.cooldown_seconds,
           max_daily_loss_usdt: newConfig.max_daily_loss_usdt ?? prev.risk_guard.max_daily_loss_usdt,
           max_concurrent_positions: newConfig.max_concurrent_positions ?? prev.risk_guard.max_concurrent_positions,
+          max_odds_cap: newConfig.max_odds_cap ?? prev.risk_guard.max_odds_cap,
+          min_odds_floor: newConfig.min_odds_floor ?? prev.risk_guard.min_odds_floor,
+          slippage_bps: newConfig.slippage_bps ?? prev.risk_guard.slippage_bps,
           martingale: prev.risk_guard.martingale ? {
             ...prev.risk_guard.martingale,
             enabled: newConfig.martingale_enabled ?? prev.risk_guard.martingale.enabled,
@@ -794,6 +797,9 @@ export default function DashboardPage() {
         currentCooldown={status?.risk_guard?.cooldown_seconds ?? 45}
         currentDailyLossLimit={status?.risk_guard?.max_daily_loss_usdt ?? 200.0}
         currentMaxConcurrentPositions={status?.risk_guard?.max_concurrent_positions ?? 5}
+        currentMaxOddsCap={status?.risk_guard?.max_odds_cap ?? 0.60}
+        currentMinOddsFloor={status?.risk_guard?.min_odds_floor ?? 0.20}
+        currentSlippageBps={status?.risk_guard?.slippage_bps ?? 50}
         currentTargetSymbol={status?.target_market?.target_symbol ?? 'BTCUSDT'}
         currentTargetTimeframe={status?.target_market?.target_timeframe ?? '15m'}
         currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
