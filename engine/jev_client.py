@@ -289,7 +289,8 @@ class JevClient:
 
         try:
             assert self._session is not None
-            async with self._session.post(self.endpoint, json=payload) as resp:
+            request_timeout = aiohttp.ClientTimeout(total=8.0, connect=5.0)
+            async with self._session.post(self.endpoint, json=payload, timeout=request_timeout) as resp:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
                 if resp.status == 200:
                     data = await resp.json()
@@ -305,13 +306,13 @@ class JevClient:
                     )
                     return await self._evaluate_heuristic(context, start_time)
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as te:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            logger.warning(f"Jev AI API request timed out ({elapsed_ms:.1f}ms). Falling back to heuristic.")
+            logger.warning(f"Jev AI API request timed out ({elapsed_ms:.1f}ms): {te!r}. Falling back to heuristic.")
             return await self._evaluate_heuristic(context, start_time)
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-            logger.error(f"Jev AI client exception: {e}. Falling back to heuristic.")
+            logger.error(f"Jev AI client exception ({elapsed_ms:.1f}ms): {type(e).__name__} - {e}. Falling back to heuristic.")
             return await self._evaluate_heuristic(context, start_time)
 
     def _parse_api_response(
