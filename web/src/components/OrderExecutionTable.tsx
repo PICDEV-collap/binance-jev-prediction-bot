@@ -51,7 +51,7 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
 
   // Calculate Total Realized PnL & Win Rate for Closed Positions
   const totalRealizedPnL = closedPositions.reduce((acc, p) => acc + (p.realized_pnl || 0), 0);
-  const winCount = closedPositions.filter((p) => p.result === 'WIN').length;
+  const winCount = closedPositions.filter((p) => p.result === 'WIN' || p.result === 'TAKE_PROFIT' || (p.realized_pnl && p.realized_pnl > 0)).length;
   const winRate = closedPositions.length > 0 ? (winCount / closedPositions.length) * 100 : 0;
 
   return (
@@ -430,7 +430,8 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                 ) : (
                   closedPositions.map((pos) => {
                     const isUp = pos.side === 'UP' || pos.side === 'BUY_YES';
-                    const isWin = pos.result === 'WIN';
+                    const isTakeProfit = pos.result === 'TAKE_PROFIT';
+                    const isWin = pos.result === 'WIN' || isTakeProfit || (pos.realized_pnl && pos.realized_pnl > 0);
                     const cleanSym = pos.symbol.replace('USDT', '');
                     const date = new Date(pos.settled_at * 1000);
                     const timeStr = date.toTimeString().split(' ')[0];
@@ -506,7 +507,7 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
                               : 'bg-rose-500/20 text-rose-300 border-rose-500/50'
                           }`}>
                             {isWin ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> : <XCircle className="w-3.5 h-3.5 text-rose-400" />}
-                            <span>{isWin ? 'WIN' : 'LOSS'}</span>
+                            <span>{isTakeProfit ? 'TAKE PROFIT' : isWin ? 'WIN' : 'LOSS'}</span>
                           </span>
                         </td>
 

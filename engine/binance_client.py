@@ -1175,9 +1175,9 @@ class BinanceClient:
             }
 
         results = [p.result for p in recent]
-        win_count = sum(1 for r in results if r == "WIN")
+        win_count = sum(1 for r in results if r in ("WIN", "TAKE_PROFIT"))
         loss_count = sum(1 for r in results if r == "LOSS")
-        win_rate = (win_count / len(results)) * 100.0
+        win_rate = (win_count / len(results)) * 100.0 if results else 0.0
 
         consecutive_losses = 0
         consecutive_wins = 0
@@ -1186,7 +1186,7 @@ class BinanceClient:
                 if consecutive_wins > 0:
                     break
                 consecutive_losses += 1
-            elif r == "WIN":
+            elif r in ("WIN", "TAKE_PROFIT"):
                 if consecutive_losses > 0:
                     break
                 consecutive_wins += 1

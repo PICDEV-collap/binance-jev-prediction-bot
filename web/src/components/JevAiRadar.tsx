@@ -202,17 +202,18 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
             <div className="flex items-center gap-1">
               {latestRecord.recent_performance.recent_results.map((res, i) => {
                 const isLatest = i === latestRecord.recent_performance!.recent_results.length - 1;
+                const isWin = res === 'WIN' || res === 'TAKE_PROFIT';
                 return (
                   <span
                     key={i}
                     className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-0.5 ${
-                      res === 'WIN'
+                      isWin
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                         : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                     } ${isLatest ? 'ring-1 ring-white/60 shadow-md font-extrabold' : 'opacity-65'}`}
                     title={isLatest ? 'ไม้ล่าสุดที่จบไป (Previous Settled Round)' : 'รอบก่อนหน้า'}
                   >
-                    <span>{res === 'WIN' ? 'W' : 'L'}</span>
+                    <span>{res === 'TAKE_PROFIT' ? 'TP' : res === 'WIN' ? 'W' : 'L'}</span>
                     {isLatest && <span className="text-[8px] bg-white/20 px-1 rounded text-white ml-0.5 font-sans">ล่าสุด</span>}
                   </span>
                 );

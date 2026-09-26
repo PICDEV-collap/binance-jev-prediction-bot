@@ -99,7 +99,7 @@ export interface ClosedPositionItem {
   target_price: number;
   settlement_price: number;
   timeframe?: string;
-  result: 'WIN' | 'LOSS';
+  result: 'WIN' | 'LOSS' | 'TAKE_PROFIT' | string;
   realized_pnl: number;
   martingale_step?: number;
   stage?: string;
