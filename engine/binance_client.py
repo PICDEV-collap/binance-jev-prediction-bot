@@ -235,17 +235,12 @@ class BinanceClient:
         ).hexdigest()
         return f"{query_str}&signature={signature}"
 
-    async def fetch_prediction_market_topics(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """Fetch active prediction market topics from Binance Web3 Prediction SAPI."""
-        now = time.time()
-        if not force_refresh and self._prediction_market_cache and (now - self._prediction_cache_timestamp < 15.0):
-            return self._prediction_market_cache.get("marketTopics", [])
-
-        if self._session is None or self._session.closed:
-            await self.start()
-
+    async def _fetch_market_page(self, offset: int = 0, limit: int = 100) -> Tuple[List[Dict[str, Any]], int, bool]:
+        """Fetch a single page of prediction market topics."""
         sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
         query_params = {
+            "offset": offset,
+            "limit": limit,
             "recvWindow": self.recv_window,
             "timestamp": self._get_timestamp(),
         }
@@ -254,32 +249,62 @@ class BinanceClient:
 
         try:
             assert self._session is not None
-            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    self._prediction_market_cache = data
-                    self._prediction_cache_timestamp = now
-                    return data.get("marketTopics", [])
+                    topics = data.get("marketTopics", [])
+                    total = data.get("total", 0)
+                    has_more = data.get("hasMore", False)
+                    return topics, total, has_more
                 else:
+                    data = {}
                     try:
                         data = await resp.json()
                     except Exception:
-                        data = {}
+                        pass
                     if data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
-                        logger.warning("Detected time drift (-1021) in market list. Re-syncing Binance server time...")
+                        logger.warning("Detected time drift (-1021) in market page. Re-syncing Binance server time...")
                         await self.sync_server_time()
                         query_params["timestamp"] = self._get_timestamp()
                         signed_query = self._sign_payload(query_params)
                         retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/market/list?{signed_query}"
-                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=5.0)) as r_resp:
+                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=6.0)) as r_resp:
                             if r_resp.status == 200:
                                 r_data = await r_resp.json()
-                                self._prediction_market_cache = r_data
-                                self._prediction_cache_timestamp = now
-                                return r_data.get("marketTopics", [])
-                    logger.warning(f"Failed to fetch prediction market list: HTTP {resp.status}")
+                                return r_data.get("marketTopics", []), r_data.get("total", 0), r_data.get("hasMore", False)
+                    logger.debug(f"Failed to fetch market page offset {offset}: HTTP {resp.status}")
         except Exception as e:
-            logger.warning(f"Exception fetching prediction market list: {e}")
+            logger.debug(f"Exception fetching market page offset {offset}: {e}")
+        return [], 0, False
+
+    async def fetch_prediction_market_topics(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Fetch full catalog of prediction market topics across all pages with high-speed concurrent fetching."""
+        now = time.time()
+        # Return cache if still fresh (valid for 30 seconds)
+        if not force_refresh and self._prediction_market_cache and (now - self._prediction_cache_timestamp < 30.0):
+            return self._prediction_market_cache.get("marketTopics", [])
+
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        # Fetch first page (offset 0, limit 100)
+        first_topics, total, has_more = await self._fetch_market_page(0, 100)
+        all_topics = list(first_topics)
+
+        # If more topics exist, fetch remaining pages concurrently in batches
+        if has_more and total > 100:
+            offsets = list(range(100, min(total + 100, 2500), 100))
+            page_tasks = [self._fetch_market_page(off, 100) for off in offsets]
+            results = await asyncio.gather(*page_tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, tuple) and res[0]:
+                    all_topics.extend(res[0])
+
+        if all_topics:
+            self._prediction_market_cache = {"marketTopics": all_topics}
+            self._prediction_cache_timestamp = now
+            return all_topics
+
         return self._prediction_market_cache.get("marketTopics", [])
 
     async def get_prediction_quote(
@@ -380,21 +405,51 @@ class BinanceClient:
         # 1. Resolve active prediction market topic and outcome token ID
         topics = await self.fetch_prediction_market_topics()
         token_id: Optional[str] = None
-        target_tf_key = "1d" if "1d" in str(timeframe).lower() else "5m"
+        clean_tf = str(timeframe).lower().strip()
+        if not clean_tf or clean_tf == "5m":
+            for candidate in ["15m", "15M", "1h", "1H", "1d", "1D", "5m", "5M"]:
+                if f"-{candidate.upper()}-" in market_id.upper() or f"-{candidate.lower()}-" in market_id.lower():
+                    clean_tf = candidate.lower()
+                    break
+
+        clean_sym = symbol.upper().strip()
+        clean_base = clean_sym.replace("USDT", "")
 
         def _find_token(topic_list: List[Dict[str, Any]]) -> Optional[str]:
+            import re
+            tf_pattern = rf"\b{clean_tf}\b"
+            candidates = []
+
             for t in topic_list:
-                t_sym = str(t.get("symbol", ""))
+                t_sym = str(t.get("symbol", "")).upper()
                 t_title = str(t.get("title", ""))
-                is_sym_match = t_sym == symbol or (symbol.startswith("BTC") and (t_sym == "BTCUSDT" or "BTC" in t_title))
-                if is_sym_match and (target_tf_key in t_title.lower() or "up or down" in t_title.lower()):
-                    for m in t.get("markets", []):
-                        for out in m.get("outcomes", []):
-                            out_name = out.get("name", "").lower()
-                            if (prediction_choice == "UP" and out_name in ("up", "yes")) or (prediction_choice == "DOWN" and out_name in ("down", "no")):
-                                tid = str(out.get("tokenId", "")).strip()
-                                if tid:
-                                    return tid
+
+                # Match symbol (e.g. BNBUSDT, BTCUSDT, or base symbol in title)
+                sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
+                if not sym_match:
+                    continue
+
+                # Match timeframe precisely (e.g. 5m, 15m, 1h, 1d)
+                tf_match = bool(re.search(tf_pattern, t_title, re.IGNORECASE))
+                if not tf_match:
+                    continue
+
+                for m in t.get("markets", []):
+                    for out in m.get("outcomes", []):
+                        out_name = str(out.get("name", "")).strip().lower()
+                        is_side_match = (
+                            (prediction_choice == "UP" and out_name in ("up", "yes")) or
+                            (prediction_choice == "DOWN" and out_name in ("down", "no"))
+                        )
+                        tid = str(out.get("tokenId", "")).strip()
+                        if is_side_match and tid:
+                            candidates.append((m, tid))
+
+            if candidates:
+                for m, tid in candidates:
+                    if m.get("status") in ("REGISTERED", "OPEN"):
+                        return tid
+                return candidates[0][1]
             return None
 
         token_id = _find_token(topics)
