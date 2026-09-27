@@ -755,22 +755,6 @@ export default function DashboardPage() {
     }
   };
 
-  const handleClaimWinnings = async () => {
-    try {
-      const res = await fetch(getApiUrl('/api/trade/claim'), { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.closed_positions) {
-          setClosedPositions(data.closed_positions);
-        }
-        if (data.account && status) {
-          setStatus((prev) => prev ? { ...prev, account: data.account } : null);
-        }
-      }
-    } catch (e) {
-      console.error('Claim winnings error:', e);
-    }
-  };
 
   const selectedRecord = records.find(
     (r) => r.market_id === selectedMarketId || r.symbol === selectedMarketId?.split('-')[0]
@@ -842,7 +826,6 @@ export default function DashboardPage() {
           orders={orders} 
           openPositions={openPositions}
           closedPositions={closedPositions}
-          onClaimWinnings={handleClaimWinnings}
         />
 
         {/* Live Terminal Log Stream */}

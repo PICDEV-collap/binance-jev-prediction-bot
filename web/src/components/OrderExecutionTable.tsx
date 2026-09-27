@@ -38,7 +38,6 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<MainTab>('OPEN_POSITIONS');
   const [orderFilter, setOrderFilter] = useState<OrderFilter>('ALL');
-  const [isClaiming, setIsClaiming] = useState(false);
 
   // Filtered Orders (memoized to avoid re-filtering 50+ items every second)
   const filteredOrders = useMemo(() => {
@@ -384,25 +383,12 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
                 $1.00 USDT / Win Contract
               </span>
             </div>
-            <div className="flex items-center justify-end">
-              <button
-                onClick={async () => {
-                  if (onClaimWinnings) {
-                    setIsClaiming(true);
-                    try {
-                      await onClaimWinnings();
-                    } finally {
-                      setIsClaiming(false);
-                    }
-                  }
-                }}
-                disabled={isClaiming || !onClaimWinnings}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold transition-all disabled:opacity-50 active:scale-95"
-                title="Trigger instant auto-claim via Binance Prediction API"
-              >
-                <Sparkles className={`w-3.5 h-3.5 text-emerald-400 ${isClaiming ? 'animate-spin' : ''}`} />
-                <span>{isClaiming ? 'Claiming...' : 'Claim Winnings'}</span>
-              </button>
+            <div className="flex flex-col justify-center items-end text-right">
+              <span className="text-slate-500 text-[11px] block">SETTLEMENT & CLAIM</span>
+              <span className="text-emerald-400 font-bold text-xs flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                Binance Native
+              </span>
             </div>
           </div>
 
@@ -522,21 +508,26 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
 
                         {/* Realized PnL */}
                         <td className="py-3 px-3 text-right whitespace-nowrap font-mono font-bold">
-                          <span className={`text-sm ${pos.realized_pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {pos.realized_pnl >= 0 ? `+$${pos.realized_pnl.toFixed(2)}` : `-$${Math.abs(pos.realized_pnl).toFixed(2)}`}
-                          </span>
+                          {(() => {
+                            const pnl = pos.realized_pnl ?? 0;
+                            const absPnl = Math.abs(pnl);
+                            const formatted = absPnl > 0 && absPnl < 0.01 ? absPnl.toFixed(4) : absPnl.toFixed(2);
+                            return (
+                              <span className={`text-sm ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {pnl >= 0 ? `+$${formatted}` : `-$${formatted}`}
+                              </span>
+                            );
+                          })()}
                         </td>
 
                         {/* Claim Status Badge */}
                         <td className="py-3 px-3 text-center whitespace-nowrap">
-                          {isWin ? (
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold border inline-flex items-center gap-1 ${
-                              pos.is_claimed
-                                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                                : 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
-                            }`}>
-                              <span>{pos.is_claimed ? '✓ CLAIMED' : 'AUTO-CLAIM'}</span>
+                          {pos.is_claimed ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold border inline-flex items-center gap-1 bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
+                              <span>✓ CLAIMED</span>
                             </span>
+                          ) : isWin ? (
+                            <span className="text-slate-500 text-[11px]" title="Settled & claimed natively by Binance">-</span>
                           ) : (
                             <span className="text-slate-600 text-[11px]">-</span>
                           )}

@@ -344,9 +344,6 @@ class TradingBotCoordinator:
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 5 == 0 or self.binance_client._live_balance_usdt <= 0.05):
                     self._spawn_task(self.binance_client.fetch_live_balance(), name="periodic_balance")
 
-                # Periodic auto-claim sweep every 30s to claim any pending won contracts
-                if not self.binance_client.paper_trading and (heartbeat_ticks % 30 == 0):
-                    self._spawn_task(self.binance_client.claim_all_won_positions(), name="periodic_claim")
 
                 # Periodic server time re-sync every 60s to continuously prevent clock drift (-1021)
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
@@ -399,8 +396,6 @@ class TradingBotCoordinator:
                         )
                     if settled_records:
                         self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
-                    if any(rec.get("won") for rec in settled_records):
-                        self._spawn_task(self.binance_client.claim_all_won_positions(), name="settle_claim")
                     # Prune expired rounds from memory sets
                     self.evaluated_rounds = {rid for rid in self.evaluated_rounds if rid in active_market_ids}
                     self.traded_rounds = {rid for rid in self.traded_rounds if rid in active_market_ids}
@@ -1200,12 +1195,13 @@ async def manual_trade_endpoint(req: ManualTradeRequest) -> Dict[str, Any]:
 
 @app.post("/api/trade/claim")
 async def claim_winnings_endpoint() -> Dict[str, Any]:
-    """Manually or programmatically trigger claim/batch-redeem for all won prediction contracts."""
-    res = await bot.binance_client.claim_all_won_positions()
+    """Claiming is managed natively by Binance Prediction Markets platform or Binance UI.
+    Auto-claim in the bot has been disabled to prevent synchronization and duplicate redeem conflicts."""
+    await bot.binance_client.sync_historical_closed_positions()
     await bot.binance_client.fetch_live_balance()
     return {
-        "status": "success" if res.get("success", True) else "failed",
-        "claim_result": res,
+        "status": "info",
+        "message": "Autoclaim disabled. Settlements and redemptions are handled natively by Binance.",
         "account": bot.binance_client.get_account_summary(),
         "closed_positions": bot.binance_client.get_closed_positions(),
     }

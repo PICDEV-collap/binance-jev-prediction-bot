@@ -53,4 +53,54 @@ def test_token_id_and_settlement_claim_flow():
     # 5. Check position marked claimed
     closed_after = client.get_closed_positions()
     assert closed_after[0]["is_claimed"] is True
-    print("Auto-claim test passed!")
+    print("Paper claim simulation test passed!")
+
+
+def test_autoclaim_disabled_in_live_trading():
+    """Verify live trading does NOT trigger batch-redeem and leaves claiming to Binance."""
+    from unittest.mock import AsyncMock
+    client = BinanceClient(paper_trading=False, api_key="TEST_API_KEY", api_secret="TEST_SECRET")
+    
+    # Mock redeem_prediction_tokens and sync_historical_closed_positions
+    client.redeem_prediction_tokens = AsyncMock()
+    client.sync_historical_closed_positions = AsyncMock(return_value=1)
+    
+    res = asyncio.run(client.claim_all_won_positions())
+    assert res["success"] is True
+    assert "Binance" in res["message"]
+    # redeem_prediction_tokens MUST NOT be called!
+    assert client.redeem_prediction_tokens.call_count == 0
+    # sync_historical_closed_positions MUST be called to synchronize official status
+    assert client.sync_historical_closed_positions.call_count == 1
+
+
+def test_subcent_pnl_preserves_precision():
+    """Verify sub-cent fractional winning contracts (e.g. 0.0048 USDT) retain precision and don't round to 0.0."""
+    from unittest.mock import AsyncMock
+    client = BinanceClient(paper_trading=False, api_key="TEST_API_KEY", api_secret="TEST_SECRET")
+    
+    # Mock Binance SAPI ended position response with sub-cent win
+    mock_ended = [{
+        "tokenId": "TOK_SUBCENT_1",
+        "positionId": "1001",
+        "marketId": "123",
+        "marketTopicTitle": "Bitcoin Price UP/DOWN 5m",
+        "outcomeName": "UP",
+        "shares": "0.02",
+        "totalCost": "0.0152",
+        "unrealizedPnl": "0.00481632",
+        "isWinner": True,
+        "positionStatus": "CLAIMED",
+        "avgPrice": "0.76",
+        "updatedTime": int(time.time() * 1000),
+    }]
+    client.fetch_ended_prediction_positions = AsyncMock(return_value=mock_ended)
+    
+    count = asyncio.run(client.sync_historical_closed_positions())
+    assert count == 1
+    closed = client.get_closed_positions()
+    assert len(closed) == 1
+    # PnL should be 0.0048, NOT 0.0!
+    assert closed[0]["realized_pnl"] == 0.0048
+    assert closed[0]["is_claimed"] is True
+

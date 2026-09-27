@@ -1258,13 +1258,14 @@ class BinanceClient:
                     if len(self._closed_positions) > 100:
                         self._closed_positions.pop(0)
 
+                    pnl_val = round(realized_pnl, 4) if abs(realized_pnl) < 0.05 else round(realized_pnl, 2)
                     settled_events.append({
                         "position_id": pos.position_id,
                         "symbol": pos.symbol,
                         "market_id": pos.market_id,
                         "side": pos.side,
                         "won": won,
-                        "pnl": round(realized_pnl, 2),
+                        "pnl": pnl_val,
                         "martingale_step": pos.martingale_step,
                         "stage": pos.stage,
                         "mode": "LIVE",
@@ -1272,12 +1273,10 @@ class BinanceClient:
                     })
 
                     self._spawn_task(self.fetch_live_balance())
-                    if won and not is_claimed:
-                        self._spawn_task(self.claim_all_won_positions())
 
                     logger.info(
                         f"[BINANCE LIVE SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) "
-                        f"OFFICIALLY SETTLED BY BINANCE! Outcome: {outcome_label} (PnL: {realized_pnl:+.2f} USDT) | "
+                        f"OFFICIALLY SETTLED BY BINANCE! Outcome: {outcome_label} (PnL: {realized_pnl:+.4f} USDT) | "
                         f"Claimed: {is_claimed}"
                     )
                 elif is_round_expired:
@@ -2282,6 +2281,8 @@ class BinanceClient:
             cost = float(item.get("totalCost", 0.0) or 0.0)
             shares = float(item.get("shares", 0.0) or 1.0)
             pnl = raw_pnl if raw_pnl != 0.0 else ((shares * 1.00 - cost) if won else -cost)
+            # High precision PnL for sub-cent values (e.g. 0.0048) to avoid $0.00 truncation
+            pnl_final = round(pnl, 4) if abs(pnl) < 0.05 else round(pnl, 2)
             is_claimed = bool(won and item.get("positionStatus") == "CLAIMED")
             settled_at = float(item.get("updatedTime", 0)) / 1000.0 if item.get("updatedTime") else now
             title = str(item.get("marketTopicTitle") or item.get("marketTitle") or "")
@@ -2296,7 +2297,7 @@ class BinanceClient:
             orig = existing_by_token.get(token_id)
             if orig is not None:
                 orig.result = outcome_label
-                orig.realized_pnl = round(pnl, 2)
+                orig.realized_pnl = pnl_final
                 orig.is_claimed = is_claimed
                 orig.settled_at = settled_at
                 synced_closed.append(orig)
@@ -2314,7 +2315,7 @@ class BinanceClient:
                     settlement_price=0.0,
                     timeframe=tf,
                     result=outcome_label,
-                    realized_pnl=round(pnl, 2),
+                    realized_pnl=pnl_final,
                     martingale_step=0,
                     stage="Binance Official",
                     token_id=token_id,
@@ -2426,26 +2427,20 @@ class BinanceClient:
 
     async def claim_all_won_positions(self) -> Dict[str, Any]:
         """
-        Identify all unredeemed won prediction positions (both local history and Binance API)
-        and execute batch redemption.
+        Reconcile and sync won prediction positions.
+        Automatic background batch-redeem has been disabled because Binance handles
+        claiming natively or via user action on Binance UI. In paper trading mode,
+        simulates marking winning positions as claimed.
         """
-        token_ids_to_claim: Set[str] = set()
-
         if not self.paper_trading:
-            # Query Binance API for actual claimable positions
-            api_claimable = await self.fetch_claimable_positions()
-            for tid in api_claimable:
-                token_ids_to_claim.add(tid)
-
-            # In live trading, sync with Binance official ended positions to accurately confirm CLAIMED status
+            logger.info("[CLAIM INFO] Autoclaim is disabled; claiming is handled natively by Binance. Reconciling closed positions from Binance...")
             await self.sync_historical_closed_positions(limit=30)
+            return {"success": True, "message": "Positions synced from Binance. Settlement/redemption managed natively by Binance.", "claimed_count": 0}
         else:
             # Paper trading simulation
+            claimed_count = 0
             for pos in self._closed_positions:
-                if pos.result in ("WIN", "TIE (50-50)") and pos.token_id and not getattr(pos, "is_claimed", False):
-                    token_ids_to_claim.add(pos.token_id)
-
-        if not token_ids_to_claim:
-            return {"success": True, "message": "No unredeemed winning positions found", "claimed_count": 0}
-
-        return await self.redeem_prediction_tokens(list(token_ids_to_claim))
+                if pos.result in ("WIN", "TAKE_PROFIT", "TIE (50-50)") and not getattr(pos, "is_claimed", False):
+                    pos.is_claimed = True
+                    claimed_count += 1
+            return {"success": True, "message": f"Paper positions marked as claimed ({claimed_count})", "claimed_count": claimed_count}
