@@ -10,6 +10,7 @@ while serving a real-time Telemetry & Control API for the Web Dashboard.
 from __future__ import annotations
 import asyncio
 import logging
+import math
 import signal
 import sys
 import time
@@ -521,14 +522,79 @@ class TradingBotCoordinator:
             # Step 1: AI Evaluation via Jev AI Decision Engine
             decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
 
-            # Step 2: Risk & Execution Guard Validation (Dynamic Gate + Adaptive Sizing)
-            open_positions = len(self.binance_client.get_positions())
-            risk_result: RiskEvaluationResult = self.risk_guard.validate_and_size_order(
-                decision=decision,
-                market=market,
-                current_open_positions_count=open_positions,
-                recent_performance=recent_perf,
-            )
+            pre_flight = None
+            pre_verified_quote = None
+
+            # Step 2: Pre-Flight Binance Verification & Risk Guard Validation
+            if decision.action in ("UP", "DOWN", "BUY_YES", "BUY_NO") and decision.confidence >= self.risk_guard.confidence_threshold:
+                # Estimate preliminary cost for pre-flight quote inquiry
+                est_odds = market.odds_yes if decision.action in ("UP", "BUY_YES") else market.odds_no
+                mult = self.risk_guard.martingale_multiplier ** market.martingale_step if (self.risk_guard.martingale_enabled and market.martingale_step > 0) else 1.0
+                est_contracts = max(1, math.ceil(self.risk_guard.default_order_contracts * mult))
+                est_cost = max(1.5, min(self.risk_guard.max_position_size_usdt, float(est_contracts * est_odds)))
+
+                logger.info(
+                    f"[PRE-FLIGHT GATE] Initiating Binance authoritative pre-order verification for "
+                    f"{market.symbol} {decision.action} on {market.market_id} (Est. Cost: ${est_cost:.2f})..."
+                )
+                pre_flight = await self.binance_client.verify_pre_flight_readiness(
+                    symbol=market.symbol,
+                    market_id=market.market_id,
+                    side=decision.action,
+                    timeframe=market.timeframe,
+                    estimated_cost_usdt=est_cost,
+                    strike_price=market.target_price,
+                    spot_price=market.underlying_price,
+                    max_concurrent_positions=self.risk_guard.max_concurrent_positions,
+                )
+
+                if not pre_flight.verified:
+                    logger.warning(
+                        f"[PRE-FLIGHT BLOCKED] Order NOT dispatched. Binance verification failed: {pre_flight.reason}. "
+                        f"Capital preserved."
+                    )
+                    risk_result = RiskEvaluationResult(
+                        approved=False,
+                        reason=f"BINANCE_PRE_FLIGHT_FAILED: {pre_flight.reason}",
+                        adjusted_contracts=0,
+                        confidence=decision.confidence,
+                        market_id=market.market_id,
+                        action=decision.action,
+                        martingale_step=market.martingale_step,
+                        stage_label=market.martingale_stage,
+                        multiplier=mult,
+                        effective_threshold=market.effective_hurdle,
+                    )
+                else:
+                    # Update market target_price if Binance official oracle strike is available
+                    if pre_flight.official_strike_price > 0:
+                        market.target_price = pre_flight.official_strike_price
+                    # Reconcile Martingale state from authoritative closed positions
+                    self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
+
+                    pre_verified_quote = {
+                        "quote_id": pre_flight.quote_id,
+                        "quoted_price": pre_flight.quoted_price,
+                        "token_id": pre_flight.token_id,
+                    }
+
+                    # Execute RiskGuard sizing using 100% Binance verified balance & quote price
+                    risk_result = self.risk_guard.validate_and_size_order(
+                        decision=decision,
+                        market=market,
+                        current_open_positions_count=pre_flight.active_ongoing_count,
+                        recent_performance=recent_perf,
+                        verified_balance_usdt=pre_flight.live_balance_usdt,
+                        confirmed_quote_price=pre_flight.quoted_price,
+                    )
+            else:
+                open_positions = len(self.binance_client.get_positions())
+                risk_result = self.risk_guard.validate_and_size_order(
+                    decision=decision,
+                    market=market,
+                    current_open_positions_count=open_positions,
+                    recent_performance=recent_perf,
+                )
 
             # Store rich telemetry record
             record = {
@@ -560,6 +626,7 @@ class TradingBotCoordinator:
                 "decision": decision.model_dump(),
                 "risk_validation": risk_result.model_dump(),
                 "recent_performance": recent_perf,
+                "pre_flight": pre_flight.model_dump() if pre_flight else None,
                 "order": None,
             }
 
@@ -581,6 +648,7 @@ class TradingBotCoordinator:
                     martingale_step=risk_result.martingale_step,
                     stage=risk_result.stage_label,
                     timeframe=market.timeframe,
+                    pre_verified_quote=pre_verified_quote,
                 )
                 record["order"] = order_result.model_dump()
                 if order_result.status in ("FILLED", "SIMULATED", "NEW"):

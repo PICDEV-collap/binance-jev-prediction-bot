@@ -305,6 +305,8 @@ class RiskGuard:
         market: MarketContext,
         current_open_positions_count: int = 0,
         recent_performance: Optional[Dict[str, Any]] = None,
+        verified_balance_usdt: Optional[float] = None,
+        confirmed_quote_price: Optional[float] = None,
     ) -> RiskEvaluationResult:
         """
         Evaluate proposed trade against all risk controls and determine safe sizing.
@@ -569,7 +571,10 @@ class RiskGuard:
         # In Binary Prediction Markets, winning payout is $1.00 per contract.
         # Cost = target_price. EV = (Confidence * $1.00) - target_price.
         # Must have a positive edge (EV >= min_ev_edge, e.g. at least +5% edge over market odds).
-        target_price = market.odds_yes if decision.action in ("BUY_YES", "UP") else market.odds_no
+        if confirmed_quote_price is not None and confirmed_quote_price > 0:
+            target_price = confirmed_quote_price
+        else:
+            target_price = market.odds_yes if decision.action in ("BUY_YES", "UP") else market.odds_no
         expected_value = (decision.confidence * 1.00) - target_price
         min_ev_edge = self.min_ev_edge
         if expected_value < min_ev_edge:
@@ -670,12 +675,16 @@ class RiskGuard:
                 effective_threshold=effective_threshold,
             )
 
-        # Formula: Cap position exposure strictly by max_position_size_usdt
-        max_possible_contracts = int(self.max_position_size_usdt / target_price)
+        # Formula: Cap position exposure strictly by max_position_size_usdt and live verified balance
+        effective_budget = self.max_position_size_usdt
+        if verified_balance_usdt is not None and verified_balance_usdt > 0:
+            effective_budget = min(self.max_position_size_usdt, verified_balance_usdt)
+
+        max_possible_contracts = int(effective_budget / target_price)
         if max_possible_contracts < 1:
             self._record_rejection("POSITION_SIZE_EXCEEDED")
             reject_reason = (
-                f"Position size budget (${self.max_position_size_usdt:.2f}) is smaller than "
+                f"Position size budget (${effective_budget:.2f}) is smaller than "
                 f"single contract price (${target_price:.3f}). Order rejected to preserve capital."
             )
             logger.info(f"[RISK FILTER] {reject_reason} for {market.market_id}")
@@ -743,7 +752,7 @@ class RiskGuard:
         else:
             # Base sizing: Scaled dynamically with confidence excess over threshold
             confidence_scaler = 1.0 + max(0.0, (decision.confidence - self.confidence_threshold) * 2.0)
-            budget = min(self.max_position_size_usdt, self.max_position_size_usdt * confidence_scaler)
+            budget = min(effective_budget, effective_budget * confidence_scaler)
             base_limit = int(budget / target_price)
             contracts = max(1, min(self.default_order_contracts, base_limit, max_possible_contracts))
             approval_reason = "Base round order approved"

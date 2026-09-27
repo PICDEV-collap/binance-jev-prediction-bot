@@ -79,6 +79,23 @@ class ClosedPositionInfo(BaseModel):
     settled_at: float = Field(default_factory=time.time)
 
 
+class PreFlightVerificationResult(BaseModel):
+    """
+    Direct authoritative verification result from Binance SAPI before opening an order.
+    Ensures 100% data fidelity for position sizing, EV calculation, and duplicate prevention.
+    """
+    verified: bool = False
+    reason: str = ""
+    live_balance_usdt: float = 0.0
+    active_ongoing_count: int = 0
+    has_duplicate_position: bool = False
+    official_strike_price: float = 0.0
+    token_id: str = ""
+    quote_id: Optional[str] = None
+    quoted_price: Optional[float] = None
+    latency_ms: float = 0.0
+
+
 class BinanceClient:
     """
     High-performance asynchronous client for Binance Prediction API.
@@ -581,6 +598,7 @@ class BinanceClient:
         martingale_step: int = 0,
         stage: str = "ไม้ 1 (Base)",
         timeframe: str = "5m",
+        pre_verified_quote: Optional[Dict[str, Any]] = None,
     ) -> OrderResult:
         """
         Execute an order on Binance Prediction Markets.
@@ -652,75 +670,85 @@ class BinanceClient:
             self._order_history.append(result)
             return result
 
-        def _find_token(topic_list: List[Dict[str, Any]]) -> Optional[str]:
-            import re
-            tf_pattern = rf"\b{clean_tf}\b"
-            candidates = []
-
-            for t in topic_list:
-                t_sym = str(t.get("symbol", "")).upper()
-                t_title = str(t.get("title", ""))
-
-                # Match symbol (e.g. BNBUSDT, BTCUSDT, or base symbol in title)
-                sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
-                if not sym_match:
-                    continue
-
-                # Match timeframe precisely (e.g. 5m, 15m, 1h, 1d)
-                tf_match = bool(re.search(tf_pattern, t_title, re.IGNORECASE))
-                if not tf_match:
-                    continue
-
-                for m in t.get("markets", []):
-                    for out in m.get("outcomes", []):
-                        out_name = str(out.get("name", "")).strip().lower()
-                        is_side_match = (
-                            (prediction_choice == "UP" and out_name in ("up", "yes")) or
-                            (prediction_choice == "DOWN" and out_name in ("down", "no"))
-                        )
-                        tid = str(out.get("tokenId", "")).strip()
-                        if is_side_match and tid:
-                            candidates.append((m, tid))
-
-            if candidates:
-                for m, tid in candidates:
-                    if m.get("status") in ("REGISTERED", "OPEN"):
-                        return tid
-                return candidates[0][1]
-            return None
-
-        token_id = _find_token(topics)
-        if not token_id:
-            topics = await self.fetch_prediction_market_topics(force_refresh=True)
-            token_id = _find_token(topics)
-
-        # 2. Inquire Quote: Binance Market orders require >= ~1.5 USDT in wei (18 decimals)
-        order_cost_usdt = max(1.5, float(contracts * target_price))
-        amount_wei = str(int(order_cost_usdt * 10**18))
-
+        quote_id = None
+        quoted_price: Optional[float] = None
         quote_data = None
-        if token_id:
-            quote_data = await self.get_prediction_quote(
-                token_id=token_id,
-                amount_wei=amount_wei,
-                side="BUY",
-                order_type="MARKET",
-                slippage_bps=self.slippage_bps,
-            )
 
-        quote_id = quote_data.get("quoteId") if quote_data else None
+        # Check if pre-verified quote from pre-flight gate is provided
+        if pre_verified_quote and pre_verified_quote.get("quote_id"):
+            quote_id = pre_verified_quote["quote_id"]
+            quoted_price = pre_verified_quote.get("quoted_price")
+            token_id = pre_verified_quote.get("token_id")
+            quote_data = {"quoteId": quote_id, "price": quoted_price}
+        else:
+            def _find_token(topic_list: List[Dict[str, Any]]) -> Optional[str]:
+                import re
+                tf_pattern = rf"\b{clean_tf}\b"
+                candidates = []
 
-        # Auto-retry with smaller amount if Binance reports liquidity threshold issue
-        if not quote_id and quote_data and quote_data.get("code") == -9000 and "smaller amount" in str(quote_data.get("msg", "")).lower():
-            logger.info("Retrying quote with smaller amount (1.0 USDT) due to thin order book liquidity...")
-            quote_data = await self.get_prediction_quote(
-                token_id=token_id,
-                amount_wei=str(int(1.0 * 10**18)),
-                side="BUY",
-                order_type="MARKET",
-                slippage_bps=self.slippage_bps,
-            )
+                for t in topic_list:
+                    t_sym = str(t.get("symbol", "")).upper()
+                    t_title = str(t.get("title", ""))
+
+                    # Match symbol (e.g. BNBUSDT, BTCUSDT, or base symbol in title)
+                    sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
+                    if not sym_match:
+                        continue
+
+                    # Match timeframe precisely (e.g. 5m, 15m, 1h, 1d)
+                    tf_match = bool(re.search(tf_pattern, t_title, re.IGNORECASE))
+                    if not tf_match:
+                        continue
+
+                    for m in t.get("markets", []):
+                        for out in m.get("outcomes", []):
+                            out_name = str(out.get("name", "")).strip().lower()
+                            is_side_match = (
+                                (prediction_choice == "UP" and out_name in ("up", "yes")) or
+                                (prediction_choice == "DOWN" and out_name in ("down", "no"))
+                            )
+                            tid = str(out.get("tokenId", "")).strip()
+                            if is_side_match and tid:
+                                candidates.append((m, tid))
+
+                if candidates:
+                    for m, tid in candidates:
+                        if m.get("status") in ("REGISTERED", "OPEN"):
+                            return tid
+                    return candidates[0][1]
+                return None
+
+            token_id = _find_token(topics)
+            if not token_id:
+                topics = await self.fetch_prediction_market_topics(force_refresh=True)
+                token_id = _find_token(topics)
+
+            # 2. Inquire Quote: Binance Market orders require >= ~1.5 USDT in wei (18 decimals)
+            order_cost_usdt = max(1.5, float(contracts * target_price))
+            amount_wei = str(int(order_cost_usdt * 10**18))
+
+            if token_id:
+                quote_data = await self.get_prediction_quote(
+                    token_id=token_id,
+                    amount_wei=amount_wei,
+                    side="BUY",
+                    order_type="MARKET",
+                    slippage_bps=self.slippage_bps,
+                )
+
             quote_id = quote_data.get("quoteId") if quote_data else None
+
+            # Auto-retry with smaller amount if Binance reports liquidity threshold issue
+            if not quote_id and quote_data and quote_data.get("code") == -9000 and "smaller amount" in str(quote_data.get("msg", "")).lower():
+                logger.info("Retrying quote with smaller amount (1.0 USDT) due to thin order book liquidity...")
+                quote_data = await self.get_prediction_quote(
+                    token_id=token_id,
+                    amount_wei=str(int(1.0 * 10**18)),
+                    side="BUY",
+                    order_type="MARKET",
+                    slippage_bps=self.slippage_bps,
+                )
+                quote_id = quote_data.get("quoteId") if quote_data else None
 
         if not quote_id:
             err_msg = quote_data.get("msg") if quote_data else f"Token not found for {symbol} {prediction_choice}"
@@ -1709,6 +1737,349 @@ class BinanceClient:
         except Exception as e:
             logger.warning(f"Could not fetch claimable positions from Binance API: {e}")
         return token_ids
+
+    async def fetch_ongoing_prediction_positions(
+        self, limit: int = 20
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        """
+        Fetch official list of active/ongoing prediction positions from Binance.
+        Endpoint: GET /sapi/v1/w3w/wallet/prediction/position/list?tab=ONGOING
+        Returns (positions, summary, counts).
+        """
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            return [], {}, {}
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "tab": "ONGOING",
+            "limit": limit,
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        if self._wallet_address:
+            query_params["walletAddress"] = self._wallet_address
+        if self._wallet_id:
+            query_params["walletId"] = self._wallet_id
+
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/position/list?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    summary = data.get("summary", {})
+                    counts = data.get("counts", {})
+                    if summary and summary.get("walletBalance"):
+                        try:
+                            wb = float(summary.get("walletBalance", 0.0))
+                            if wb > 0:
+                                self._live_balance_usdt = round(wb, 2)
+                                self._live_available_usdt = round(wb, 2)
+                        except (ValueError, TypeError):
+                            pass
+                    return data.get("positions", []), summary, counts
+                else:
+                    data = {}
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        pass
+                    if data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
+                        logger.warning("Detected time drift (-1021) in ongoing positions. Re-syncing time...")
+                        await self.sync_server_time()
+                        query_params["timestamp"] = self._get_timestamp()
+                        signed_query = self._sign_payload(query_params)
+                        retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/position/list?{signed_query}"
+                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=6.0)) as r_resp:
+                            if r_resp.status == 200:
+                                r_data = await r_resp.json()
+                                summary = r_data.get("summary", {})
+                                counts = r_data.get("counts", {})
+                                if summary and summary.get("walletBalance"):
+                                    try:
+                                        wb = float(summary.get("walletBalance", 0.0))
+                                        if wb > 0:
+                                            self._live_balance_usdt = round(wb, 2)
+                                            self._live_available_usdt = round(wb, 2)
+                                    except (ValueError, TypeError):
+                                        pass
+                                return r_data.get("positions", []), summary, counts
+                    logger.debug(f"Failed to fetch ongoing positions: HTTP {resp.status} - {data}")
+        except Exception as e:
+            logger.warning(f"Exception fetching ongoing positions from Binance: {e}")
+        return [], {}, {}
+
+    async def verify_pre_flight_readiness(
+        self,
+        symbol: str,
+        market_id: str,
+        side: str,  # "UP" or "DOWN" / "BUY_YES" or "BUY_NO"
+        timeframe: str = "5m",
+        estimated_cost_usdt: float = 1.5,
+        strike_price: float = 0.0,
+        spot_price: float = 0.0,
+        max_concurrent_positions: int = 5,
+    ) -> PreFlightVerificationResult:
+        """
+        MANDATORY PRE-FLIGHT VERIFICATION PROTOCOL:
+        Authoritatively confirms all required data directly from Binance before opening an order:
+        1. Confirms live balance directly from Binance SAPI.
+        2. Confirms active ongoing positions on Binance to prevent duplicate bets and ensure capacity.
+        3. Confirms authoritative historical settlements to ensure Martingale step & PnL are up-to-date.
+        4. Confirms round trading status (OPEN) and official Chainlink strike price (startPrice).
+        5. Inquires live quote directly from Binance to obtain actual execution price & quoteId.
+        """
+        start_t = time.perf_counter()
+        clean_side = "UP" if ("UP" in side.upper() or "YES" in side.upper()) else "DOWN"
+        clean_sym = symbol.upper().strip()
+
+        # Paper Trading Mode
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            has_dup = any(p.market_id == market_id for p in self._paper_positions.values())
+            if has_dup:
+                return PreFlightVerificationResult(
+                    verified=False,
+                    reason=f"[PAPER] Position already open on {market_id}",
+                    has_duplicate_position=True,
+                    live_balance_usdt=self._paper_balance_usdt,
+                    active_ongoing_count=len(self._paper_positions),
+                    latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+                )
+            if self._paper_balance_usdt < estimated_cost_usdt:
+                return PreFlightVerificationResult(
+                    verified=False,
+                    reason=f"[PAPER] Insufficient balance (${self._paper_balance_usdt:.2f} < ${estimated_cost_usdt:.2f})",
+                    live_balance_usdt=self._paper_balance_usdt,
+                    active_ongoing_count=len(self._paper_positions),
+                    latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+                )
+            return PreFlightVerificationResult(
+                verified=True,
+                reason="Paper trading pre-flight verified",
+                live_balance_usdt=self._paper_balance_usdt,
+                active_ongoing_count=len(self._paper_positions),
+                official_strike_price=strike_price or spot_price,
+                token_id="PAPER_TOKEN",
+                quote_id=f"PAPER_QUOTE_{int(time.time()*1000)}",
+                quoted_price=0.50,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        # Step 1: Query Binance ongoing positions & live balance
+        try:
+            ongoing_positions, summary, counts = await self.fetch_ongoing_prediction_positions(limit=20)
+        except Exception as ex:
+            return PreFlightVerificationResult(
+                verified=False,
+                reason=f"Failed to query Binance ongoing positions: {ex}",
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        wallet_bal = 0.0
+        if summary and summary.get("walletBalance"):
+            try:
+                wallet_bal = float(summary.get("walletBalance", 0.0))
+            except (ValueError, TypeError):
+                pass
+        if wallet_bal <= 0.0:
+            wallet_bal = self._live_balance_usdt
+
+        ongoing_count = int(counts.get("ongoingCount", len(ongoing_positions)))
+
+        # 1.1 Duplicate Position Check on Binance
+        for p in ongoing_positions:
+            p_mid = str(p.get("marketId", "")).strip()
+            if p_mid and (p_mid == str(market_id) or p_mid in str(market_id)):
+                return PreFlightVerificationResult(
+                    verified=False,
+                    reason=f"Active position already open on Binance for market {market_id}",
+                    has_duplicate_position=True,
+                    live_balance_usdt=wallet_bal,
+                    active_ongoing_count=ongoing_count,
+                    latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+                )
+
+        # 1.2 Max Concurrent Positions Check on Binance
+        if ongoing_count >= max_concurrent_positions:
+            return PreFlightVerificationResult(
+                verified=False,
+                reason=f"Max concurrent positions limit reached on Binance ({ongoing_count} >= {max_concurrent_positions})",
+                live_balance_usdt=wallet_bal,
+                active_ongoing_count=ongoing_count,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        # 1.3 Minimum Balance Check on Binance
+        min_required = max(1.5, estimated_cost_usdt)
+        if wallet_bal < min_required:
+            return PreFlightVerificationResult(
+                verified=False,
+                reason=f"Insufficient Binance live balance (${wallet_bal:.2f} < ${min_required:.2f})",
+                live_balance_usdt=wallet_bal,
+                active_ongoing_count=ongoing_count,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        # Step 2: Sync latest historical settlements to guarantee Martingale accuracy
+        try:
+            await self.sync_historical_closed_positions(limit=30)
+        except Exception as sync_ex:
+            logger.debug(f"Pre-flight history sync note: {sync_ex}")
+
+        # Step 3: Binance Market Topic & Official Strike Price Check
+        topics = await self.fetch_prediction_market_topics()
+        clean_tf = str(timeframe).lower().strip()
+        clean_base = clean_sym.replace("USDT", "")
+
+        matched_market = None
+        matched_token_id = None
+        official_strike = strike_price
+
+        for t in topics:
+            t_sym = str(t.get("symbol", "")).upper()
+            t_title = str(t.get("title", ""))
+            sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
+            if not sym_match:
+                continue
+            tf_match = bool(re.search(rf"\b{clean_tf}\b", t_title, re.IGNORECASE))
+            if not tf_match:
+                continue
+
+            variant = t.get("variantData") or {}
+            if variant.get("startPrice"):
+                try:
+                    official_strike = float(variant["startPrice"])
+                except (ValueError, TypeError):
+                    pass
+
+            for m in t.get("markets", []):
+                for out in m.get("outcomes", []):
+                    out_name = str(out.get("name", "")).strip().lower()
+                    is_side = (
+                        (clean_side == "UP" and out_name in ("up", "yes")) or
+                        (clean_side == "DOWN" and out_name in ("down", "no"))
+                    )
+                    tid = str(out.get("tokenId", "")).strip()
+                    if is_side and tid:
+                        matched_market = m
+                        matched_token_id = tid
+                        break
+                if matched_token_id:
+                    break
+            if matched_token_id:
+                break
+
+        if not matched_token_id:
+            return PreFlightVerificationResult(
+                verified=False,
+                reason=f"Binance prediction outcome token not found for {clean_sym} {clean_side} ({timeframe})",
+                live_balance_usdt=wallet_bal,
+                active_ongoing_count=ongoing_count,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        if matched_market:
+            m_trading_status = str(matched_market.get("tradingStatus", "OPEN")).upper()
+            if m_trading_status not in ("OPEN", "REGISTERED"):
+                return PreFlightVerificationResult(
+                    verified=False,
+                    reason=f"Binance market round is not OPEN (tradingStatus: {m_trading_status})",
+                    live_balance_usdt=wallet_bal,
+                    active_ongoing_count=ongoing_count,
+                    official_strike_price=official_strike,
+                    token_id=matched_token_id,
+                    latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+                )
+
+        # Step 4: Binance Live Quote Confirmation
+        quote_amt = max(1.5, estimated_cost_usdt)
+        amount_wei = str(int(quote_amt * 10**18))
+        quote_data = await self.get_prediction_quote(
+            token_id=matched_token_id,
+            amount_wei=amount_wei,
+            side="BUY",
+            order_type="MARKET",
+            slippage_bps=self.slippage_bps,
+        )
+
+        quote_id = quote_data.get("quoteId") if quote_data else None
+        if not quote_id:
+            err_msg = quote_data.get("msg") if quote_data else "Failed to obtain quote from Binance"
+            return PreFlightVerificationResult(
+                verified=False,
+                reason=f"Binance quote inquiry rejected: {err_msg}",
+                live_balance_usdt=wallet_bal,
+                active_ongoing_count=ongoing_count,
+                official_strike_price=official_strike,
+                token_id=matched_token_id,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        quoted_price: Optional[float] = None
+        if "price" in quote_data:
+            try:
+                quoted_price = float(quote_data["price"])
+            except (ValueError, TypeError):
+                pass
+        elif "amountOut" in quote_data and "amountIn" in quote_data:
+            try:
+                amt_in = float(quote_data["amountIn"]) / 10**18
+                amt_out = float(quote_data["amountOut"]) / 10**18
+                if amt_out > 0:
+                    quoted_price = amt_in / amt_out
+            except (ValueError, TypeError, ZeroDivisionError):
+                pass
+
+        if quoted_price is not None:
+            if quoted_price > self.max_odds_cap:
+                return PreFlightVerificationResult(
+                    verified=False,
+                    reason=f"Binance quoted price ${quoted_price:.3f} exceeds max odds cap ${self.max_odds_cap:.2f}",
+                    live_balance_usdt=wallet_bal,
+                    active_ongoing_count=ongoing_count,
+                    official_strike_price=official_strike,
+                    token_id=matched_token_id,
+                    quote_id=quote_id,
+                    quoted_price=quoted_price,
+                    latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+                )
+            if quoted_price < self.min_odds_floor:
+                return PreFlightVerificationResult(
+                    verified=False,
+                    reason=f"Binance quoted price ${quoted_price:.3f} below minimum odds floor ${self.min_odds_floor:.2f}",
+                    live_balance_usdt=wallet_bal,
+                    active_ongoing_count=ongoing_count,
+                    official_strike_price=official_strike,
+                    token_id=matched_token_id,
+                    quote_id=quote_id,
+                    quoted_price=quoted_price,
+                    latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+                )
+
+        elapsed = round((time.perf_counter() - start_t) * 1000.0, 2)
+        logger.info(
+            f"[PRE-FLIGHT VERIFIED] Binance confirmed: Balance: ${wallet_bal:.2f} | Ongoing: {ongoing_count} | "
+            f"Strike: ${official_strike:,.2f} | Quote: ${quoted_price:.3f} (ID: {quote_id[:10]}...) | Latency: {elapsed}ms"
+        )
+        return PreFlightVerificationResult(
+            verified=True,
+            reason="All Binance pre-flight verifications successfully passed",
+            live_balance_usdt=wallet_bal,
+            active_ongoing_count=ongoing_count,
+            has_duplicate_position=False,
+            official_strike_price=official_strike,
+            token_id=matched_token_id,
+            quote_id=quote_id,
+            quoted_price=quoted_price,
+            latency_ms=elapsed,
+        )
 
     async def fetch_ended_prediction_positions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """
