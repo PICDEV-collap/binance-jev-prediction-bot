@@ -54,6 +54,7 @@ class MarketContext(BaseModel):
     expiry_danger_flag: bool = False   # True if < 60s and dangerously close to strike
     btc_correlation_dir: str = "FLAT"  # BULLISH, BEARISH, FLAT
     is_stale: bool = False             # Flagged True if network/data silence exceeds tolerance threshold
+    strike_confirmed: bool = False     # Flagged True ONLY when Price to Beat (startPrice) is confirmed from Binance SAPI
 
     @property
     def odds_up(self) -> float:

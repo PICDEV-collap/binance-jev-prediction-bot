@@ -110,21 +110,36 @@ class BinanceWSListener:
         self._price_history: Dict[str, List[tuple[float, float]]] = {}
         self._round_base_prices: Dict[str, float] = {}
         self._official_strike_prices: Dict[str, float] = {}
+        self._official_strike_details: Dict[str, Dict[str, Any]] = {}
         self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
         self._btc_momentum: float = 0.0
         self._background_tasks: Set[asyncio.Task] = set()
 
-    def update_official_strike_prices(self, strike_map: Dict[str, float]) -> None:
+    def update_official_strike_prices(
+        self,
+        strike_map: Dict[str, float],
+        detailed_strikes: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> None:
         """
         Update cache of official Binance Price to Beat (startPrice) from oracle / marketTopics catalog.
         Immediately synchronizes active rounds to official strike prices.
         """
-        if not strike_map:
+        if not strike_map and not detailed_strikes:
             return
-        self._official_strike_prices.update(strike_map)
-        for key, price in strike_map.items():
+        if strike_map:
+            self._official_strike_prices.update(strike_map)
+        if detailed_strikes:
+            self._official_strike_details.update(detailed_strikes)
+
+        now = time.time()
+        for key, price in (strike_map or {}).items():
             if price > 0:
+                detail = self._official_strike_details.get(key)
                 for round_id in list(self._round_base_prices.keys()):
+                    if detail:
+                        et = detail.get("end_time_sec", 0.0)
+                        if et and now >= et:
+                            continue  # Do not update expired round
                     if key.upper() in round_id.upper():
                         self._round_base_prices[round_id] = price
 
@@ -434,26 +449,48 @@ class BinanceWSListener:
             time_left = round_period - int(now % round_period)
 
             # Determine fixed Price to Beat for this round (prioritizes official Binance oracle startPrice)
-            if round_id not in self._round_base_prices:
-                official_strike = self._official_strike_prices.get(f"{symbol}-{tf}")
-                if official_strike and official_strike > 0:
-                    strike = official_strike
-                else:
-                    if "BTC" in symbol or "ETH" in symbol or "BNB" in symbol or "SOL" in symbol:
-                        strike = round(mark_price, 2)
-                    else:
-                        strike = round(mark_price, 4)
-                self._round_base_prices[round_id] = strike
-            else:
-                official_strike = self._official_strike_prices.get(f"{symbol}-{tf}")
-                if official_strike and official_strike > 0:
-                    self._round_base_prices[round_id] = official_strike
-                strike = self._round_base_prices[round_id]
+            strike_confirmed = False
+            official_strike = 0.0
 
-            price_diff = round(mark_price - strike, 4)
+            # 1. Check detailed strike entry with round time window validation
+            detail = self._official_strike_details.get(f"{symbol}-{tf}")
+            if detail:
+                d_st = detail.get("start_time_sec", 0.0)
+                d_et = detail.get("end_time_sec", 0.0)
+                d_price = float(detail.get("start_price", 0.0))
+                if d_price > 0 and (d_et == 0.0 or (d_st <= now < d_et)):
+                    official_strike = d_price
+
+            # 2. Check round_base_prices cache if already confirmed
+            if official_strike > 0:
+                strike = official_strike
+                strike_confirmed = True
+                self._round_base_prices[round_id] = official_strike
+            elif round_id in self._round_base_prices:
+                strike = self._round_base_prices[round_id]
+                strike_confirmed = True
+            else:
+                # 3. Check flat strike map fallback
+                flat_strike = self._official_strike_prices.get(f"{symbol}-{tf}", 0.0)
+                if flat_strike > 0:
+                    strike = flat_strike
+                    strike_confirmed = True
+                    self._round_base_prices[round_id] = strike
+                elif self.enable_mock_stream:
+                    # Mock stream offline testing mode
+                    strike = round(mark_price, 2)
+                    strike_confirmed = True
+                    self._round_base_prices[round_id] = strike
+                else:
+                    # LIVE mode: DO NOT FABRICATE FAKE STRIKE! Waiting for Binance Oracle
+                    strike = mark_price
+                    strike_confirmed = False
+
+            price_diff = round(mark_price - strike, 4) if strike_confirmed else 0.0
+            target_price = strike if strike_confirmed else 0.0
 
             # Realistic Binance Up/Down implied odds:
-            diff_ratio = (mark_price - strike) / strike
+            diff_ratio = ((mark_price - strike) / strike) if strike > 0 else 0.0
             vol = 0.004 * math.sqrt(max(10, time_left) / max(60, round_period))
             z = (diff_ratio + (momentum_pct * 0.0005)) / max(0.0001, vol)
             prob_up = 1.0 / (1.0 + math.exp(-max(-10.0, min(10.0, 1.8 * z))))
@@ -482,11 +519,11 @@ class BinanceWSListener:
                     volume_24h=volume_24h,
                     time_left_seconds=time_left,
                     underlying_price=mark_price,
-                    target_price=strike,
+                    target_price=target_price,
                     price_diff=price_diff,
                     momentum_pct=momentum_pct,
                     atr_1m=metrics["atr_1m"],
-                    dvr_ratio=metrics["dvr_ratio"],
+                    dvr_ratio=metrics["dvr_ratio"] if strike_confirmed else 0.0,
                     rsi_1m=metrics["rsi_1m"],
                     rsi_5m=metrics["rsi_5m"],
                     ema_trend=metrics["ema_trend"],
@@ -494,6 +531,7 @@ class BinanceWSListener:
                     market_regime=metrics["market_regime"],
                     expiry_danger_flag=metrics["expiry_danger_flag"],
                     btc_correlation_dir=metrics["btc_correlation_dir"],
+                    strike_confirmed=strike_confirmed,
                 )
             )
 

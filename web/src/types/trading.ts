@@ -26,6 +26,7 @@ export interface MarketItem {
   market_regime?: string;
   expiry_danger_flag?: boolean;
   btc_correlation_dir?: string;
+  strike_confirmed?: boolean; // True ONLY when Price to Beat (startPrice) is confirmed from Binance
   timestamp?: number;
 }
 

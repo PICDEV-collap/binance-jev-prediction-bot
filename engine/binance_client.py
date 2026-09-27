@@ -316,9 +316,20 @@ class BinanceClient:
     async def fetch_prediction_market_topics(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         """Fetch full catalog of prediction market topics across all pages with high-speed concurrent fetching."""
         now = time.time()
-        # Return cache if still fresh (valid for 30 seconds)
+        now_ms = now * 1000.0
+        # Return cache if still fresh (valid for 30 seconds), UNLESS any active crypto round in cache has expired
         if not force_refresh and self._prediction_market_cache and (now - self._prediction_cache_timestamp < 30.0):
-            return self._prediction_market_cache.get("marketTopics", [])
+            cached_topics = self._prediction_market_cache.get("marketTopics", [])
+            has_expired = False
+            for t in cached_topics:
+                title = str(t.get("title", ""))
+                if "Up or Down" in title and any(k in title for k in ("5m", "15m")):
+                    end_d = t.get("endDate")
+                    if end_d and end_d <= now_ms:
+                        has_expired = True
+                        break
+            if not has_expired:
+                return cached_topics
 
         if self._session is None or self._session.closed:
             await self.start()
@@ -363,15 +374,25 @@ class BinanceClient:
                         symbols.add(candidate)
         return symbols or {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
 
-    def get_market_start_prices(self) -> Dict[str, float]:
+    def get_market_start_prices(self, now_ts: Optional[float] = None) -> Dict[str, float]:
         """
         Extract official Chainlink Price to Beat (startPrice) for each active binary prediction market
         from the cached marketTopics catalog.
-        Returns mapping of market identifiers/keys to official strike price.
+        Excludes expired rounds to ensure stale strikes from previous rounds are never reused.
         """
         prices: Dict[str, float] = {}
         topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
+        now_ms = (now_ts or time.time()) * 1000.0
+
         for t in topics:
+            # Exclude expired rounds or future rounds
+            end_date = t.get("endDate")
+            if end_date and now_ms >= end_date:
+                continue
+            start_date = t.get("startDate")
+            if start_date and now_ms < start_date:
+                continue
+
             variant = t.get("variantData") or {}
             start_price_str = variant.get("startPrice")
             if not start_price_str:
@@ -400,6 +421,62 @@ class BinanceClient:
                     if m_id:
                         prices[m_id] = start_price
         return prices
+
+    def get_detailed_oracle_strikes(self, now_ts: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Extract detailed official Chainlink Price to Beat (startPrice) with round timing boundaries
+        (startDate, endDate) for active prediction markets.
+        Keyed by f"{symbol}-{tf}" and marketId.
+        """
+        details: Dict[str, Dict[str, Any]] = {}
+        topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
+        now_ms = (now_ts or time.time()) * 1000.0
+
+        for t in topics:
+            end_date = t.get("endDate")
+            if end_date and now_ms >= end_date:
+                continue
+            start_date = t.get("startDate")
+            if start_date and now_ms < start_date:
+                continue
+
+            variant = t.get("variantData") or {}
+            start_price_str = variant.get("startPrice")
+            if not start_price_str:
+                continue
+            try:
+                start_price = float(start_price_str)
+            except (ValueError, TypeError):
+                continue
+            if start_price <= 0:
+                continue
+
+            title = str(t.get("title", ""))
+            sym = str(t.get("symbol", "")).upper()
+            if not sym or "USDT" not in sym:
+                for candidate in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]:
+                    base = candidate.replace("USDT", "")
+                    if base in title.upper():
+                        sym = candidate
+                        break
+
+            tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
+            tf = tf_match.group(1).lower() if tf_match else "5m"
+
+            market_ids = [str(m.get("marketId")) for m in t.get("markets", []) if m.get("marketId")]
+            info = {
+                "symbol": sym,
+                "timeframe": tf,
+                "start_price": start_price,
+                "start_time_sec": (start_date / 1000.0) if start_date else 0.0,
+                "end_time_sec": (end_date / 1000.0) if end_date else 0.0,
+                "market_ids": market_ids,
+            }
+            if sym:
+                details[f"{sym}-{tf}"] = info
+                for m_id in market_ids:
+                    details[m_id] = info
+        return details
 
     async def get_prediction_quote(
         self,
@@ -1937,12 +2014,21 @@ class BinanceClient:
         topics = await self.fetch_prediction_market_topics()
         clean_tf = str(timeframe).lower().strip()
         clean_base = clean_sym.replace("USDT", "")
+        now_ms = time.time() * 1000.0
 
         matched_market = None
         matched_token_id = None
         official_strike = strike_price
 
         for t in topics:
+            # Exclude expired or future rounds
+            end_date = t.get("endDate")
+            if end_date and now_ms >= end_date:
+                continue
+            start_date = t.get("startDate")
+            if start_date and now_ms < start_date:
+                continue
+
             t_sym = str(t.get("symbol", "")).upper()
             t_title = str(t.get("title", ""))
             sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
@@ -1997,6 +2083,17 @@ class BinanceClient:
                     token_id=matched_token_id,
                     latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
                 )
+
+        if official_strike <= 0:
+            return PreFlightVerificationResult(
+                verified=False,
+                reason="Binance Price to Beat (startPrice) not yet confirmed for active round",
+                live_balance_usdt=wallet_bal,
+                active_ongoing_count=ongoing_count,
+                official_strike_price=0.0,
+                token_id=matched_token_id,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
 
         # Step 4: Binance Live Quote Confirmation
         quote_amt = max(1.5, estimated_cost_usdt)

@@ -221,6 +221,25 @@ class TradingBotCoordinator:
         self._eval_in_progress: Set[str] = set()
         self._last_closed_pos_count: int = -1
         self._last_closed_pos_head_id: Optional[str] = None
+        self._last_oracle_log: Dict[str, float] = {}
+        self._last_fast_oracle_sync: float = 0.0
+
+    def _trigger_fast_oracle_sync(self) -> None:
+        """Trigger immediate proactive refresh of Binance prediction topics to obtain startPrice."""
+        now = time.time()
+        if (now - getattr(self, "_last_fast_oracle_sync", 0.0)) < 2.0:
+            return
+        self._last_fast_oracle_sync = now
+        async def _do_sync():
+            try:
+                await self.binance_client.fetch_prediction_market_topics(force_refresh=True)
+                strike_map = self.binance_client.get_market_start_prices()
+                detailed_strikes = self.binance_client.get_detailed_oracle_strikes()
+                if strike_map or detailed_strikes:
+                    self.ws_listener.update_official_strike_prices(strike_map, detailed_strikes)
+            except Exception as ex:
+                logger.debug(f"Fast oracle sync notice: {ex}")
+        self._spawn_task(_do_sync(), name="fast_oracle_sync")
 
     def _should_evaluate_market(self, market: MarketContext) -> bool:
         """Fast non-allocating predicate to reject unselected symbols/timeframes before task spawning."""
@@ -281,8 +300,9 @@ class TradingBotCoordinator:
             supported = self.binance_client.get_supported_prediction_symbols()
             self.risk_guard.set_supported_symbols(supported)
             start_prices = self.binance_client.get_market_start_prices()
-            if start_prices:
-                self.ws_listener.update_official_strike_prices(start_prices)
+            detailed_strikes = self.binance_client.get_detailed_oracle_strikes()
+            if start_prices or detailed_strikes:
+                self.ws_listener.update_official_strike_prices(start_prices, detailed_strikes)
             # Reconcile closed positions history directly with Binance API
             await self.binance_client.sync_historical_closed_positions()
             self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
@@ -339,14 +359,16 @@ class TradingBotCoordinator:
                         self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
                     self._spawn_task(_reconcile_and_sync(), name="periodic_sync_closed")
 
-                # Periodic refresh of official Price to Beat (startPrice) from Binance topics every 15s
-                if heartbeat_ticks % 15 == 0:
+                # Periodic / Proactive refresh of official Price to Beat (startPrice) from Binance topics
+                needs_fast_oracle_sync = any(not getattr(m, "strike_confirmed", False) for m in (markets or []))
+                if (needs_fast_oracle_sync and heartbeat_ticks % 3 == 0) or (heartbeat_ticks % 15 == 0):
                     async def _sync_oracle_strikes():
                         try:
-                            await self.binance_client.fetch_prediction_market_topics()
+                            await self.binance_client.fetch_prediction_market_topics(force_refresh=needs_fast_oracle_sync)
                             strike_map = self.binance_client.get_market_start_prices()
-                            if strike_map:
-                                self.ws_listener.update_official_strike_prices(strike_map)
+                            detailed_strikes = self.binance_client.get_detailed_oracle_strikes()
+                            if strike_map or detailed_strikes:
+                                self.ws_listener.update_official_strike_prices(strike_map, detailed_strikes)
                         except Exception as ex:
                             logger.debug(f"Periodic strike sync notice: {ex}")
                     self._spawn_task(_sync_oracle_strikes(), name="periodic_oracle_strikes")
@@ -474,6 +496,18 @@ class TradingBotCoordinator:
 
         # Skip the first 10 seconds of a brand new round so the strike / spot baseline price stabilizes
         if time_left > (round_period - 10):
+            return
+
+        # Price to Beat Oracle Gate: Ensure strike is officially confirmed by Binance for this round
+        if not getattr(market, "strike_confirmed", False) or getattr(market, "target_price", 0.0) <= 0:
+            now = time.time()
+            if (now - self._last_oracle_log.get(market.market_id, 0.0)) >= 10.0:
+                self._last_oracle_log[market.market_id] = now
+                logger.warning(
+                    f"[WAITING FOR BINANCE ORACLE] Round {market.market_id} ({market.symbol} {market.timeframe}) "
+                    f"has not received official Price to Beat (startPrice) from Binance. Waiting for Chainlink oracle..."
+                )
+            self._trigger_fast_oracle_sync()
             return
 
         # Check if an order has already been executed on this round

@@ -283,9 +283,17 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
                 <div className="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800/80 space-y-1 mb-2.5 text-xs font-mono">
                   <div className="flex items-center justify-between text-slate-400">
                     <span className="text-[11px] text-slate-500">Price to Beat:</span>
-                    <span className="text-cyan-300 font-semibold">
-                      ${market.target_price >= 1 ? market.target_price.toLocaleString('en-US', { minimumFractionDigits: 2 }) : market.target_price.toFixed(4)}
-                    </span>
+                    {market.strike_confirmed !== false && market.target_price > 0 ? (
+                      <span className="text-cyan-300 font-semibold flex items-center gap-1.5">
+                        ${market.target_price >= 1 ? market.target_price.toLocaleString('en-US', { minimumFractionDigits: 2 }) : market.target_price.toFixed(4)}
+                        <span className="text-[9px] px-1 py-0.2 bg-emerald-500/20 text-emerald-400 rounded border border-emerald-500/30">BINANCE</span>
+                      </span>
+                    ) : (
+                      <span className="text-amber-400 font-semibold flex items-center gap-1.5 animate-pulse">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                        Awaiting Binance Oracle...
+                      </span>
+                    )}
                   </div>
 
                   <div className="flex items-center justify-between">
@@ -294,9 +302,11 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
                       <span className="text-white">
                         ${market.underlying_price >= 1 ? market.underlying_price.toLocaleString('en-US', { minimumFractionDigits: 2 }) : market.underlying_price.toFixed(4)}
                       </span>
-                      <span className={`text-[10px] ${isAboveStrike ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        ({diff >= 0 ? `+${diff.toFixed(2)}` : diff.toFixed(2)})
-                      </span>
+                      {market.strike_confirmed !== false && market.target_price > 0 && (
+                        <span className={`text-[10px] ${isAboveStrike ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          ({diff >= 0 ? `+${diff.toFixed(2)}` : diff.toFixed(2)})
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
