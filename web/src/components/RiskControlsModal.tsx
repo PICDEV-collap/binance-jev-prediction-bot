@@ -61,7 +61,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentDefaultOrderContracts = 10,
   currentCooldown,
   currentDailyLossLimit = 200,
-  currentMaxConcurrentPositions = 5,
+  currentMaxConcurrentPositions = 1,
   currentMaxOddsCap = 0.60,
   currentMinOddsFloor = 0.20,
   currentSlippageBps = 50,
@@ -845,8 +845,8 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                   className="w-full accent-amber-400 bg-slate-800 h-2 rounded-lg cursor-pointer"
                 />
                 <div className="flex justify-between text-[10px] font-mono text-slate-500">
-                  <span>1 ไม้</span>
-                  <span className="text-amber-400 font-semibold">5 ไม้ (แนะนำ)</span>
+                  <span className="text-emerald-400 font-semibold">1 ไม้ (ปลอดภัย แนะนำ)</span>
+                  <span>5 ไม้</span>
                   <span>12 ไม้</span>
                 </div>
               </div>

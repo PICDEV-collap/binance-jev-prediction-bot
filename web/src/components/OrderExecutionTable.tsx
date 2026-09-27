@@ -323,16 +323,23 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
                           </span>
                         </td>
 
-                        {/* Contract Status (ITM vs OTM) */}
+                        {/* Contract Status (ITM vs OTM / Settling) */}
                         <td className="py-3 px-3 text-center whitespace-nowrap">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border inline-flex items-center gap-1 ${
-                            isITM
-                              ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
-                              : 'bg-rose-950/60 border-rose-500/50 text-rose-300'
-                          }`}>
-                            <span className={`w-1.5 h-1.5 rounded-full ${isITM ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`}></span>
-                            <span>{isITM ? 'IN THE MONEY' : 'OUT OF MONEY'}</span>
-                          </span>
+                          {pos.is_settling ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border inline-flex items-center gap-1 bg-amber-950/60 border-amber-500/50 text-amber-300 shadow-[0_0_8px_rgba(245,158,11,0.25)]">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping"></span>
+                              <span>SETTLING (รอผลสรุป)</span>
+                            </span>
+                          ) : (
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border inline-flex items-center gap-1 ${
+                              isITM
+                                ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
+                                : 'bg-rose-950/60 border-rose-500/50 text-rose-300'
+                            }`}>
+                              <span className={`w-1.5 h-1.5 rounded-full ${isITM ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`}></span>
+                              <span>{isITM ? 'IN THE MONEY' : 'OUT OF MONEY'}</span>
+                            </span>
+                          )}
                         </td>
 
                         {/* Unrealized PnL */}

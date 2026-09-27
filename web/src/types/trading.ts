@@ -87,6 +87,7 @@ export interface PositionItem {
   martingale_step?: number;
   stage?: string;
   token_id?: string;
+  is_settling?: boolean;
   entry_time: number;
 }
 

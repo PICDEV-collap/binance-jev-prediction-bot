@@ -55,6 +55,7 @@ class PositionInfo(BaseModel):
     martingale_step: int = 0
     stage: str = "ไม้ 1 (Base)"
     token_id: str = ""
+    is_settling: bool = False
     entry_time: float = Field(default_factory=time.time)
 
 
@@ -1218,9 +1219,22 @@ class BinanceClient:
                 p_ended = ended_by_token.get(pos.token_id) if pos.token_id else None
                 if not p_ended and pos.market_id:
                     for mid_key, p_item in ended_by_market.items():
-                        if mid_key and mid_key in pos.market_id:
+                        if mid_key and (mid_key in pos.market_id or str(pos.market_id).endswith(mid_key)):
                             p_ended = p_item
                             break
+
+                if not p_ended and is_round_expired:
+                    # Match by symbol, outcome, and timestamp proximity within 180s
+                    pos_clean_sym = pos.symbol.upper().replace("USDT", "")
+                    pos_clean_side = "UP" if pos.side in ("UP", "BUY_YES") else "DOWN"
+                    for p_item in ended_list:
+                        item_title = str(p_item.get("marketTopicTitle") or p_item.get("marketTitle") or "").upper()
+                        item_side = str(p_item.get("outcomeName", "")).upper()
+                        item_created = float(p_item.get("createdTime", 0)) / 1000.0 if p_item.get("createdTime") else 0
+                        if pos_clean_sym in item_title and item_side == pos_clean_side:
+                            if item_created > 0 and abs(item_created - pos.entry_time) < 180.0:
+                                p_ended = p_item
+                                break
 
                 if p_ended:
                     # Binance has officially settled this contract!
@@ -1582,9 +1596,16 @@ class BinanceClient:
 
     def get_positions(self) -> List[Dict[str, Any]]:
         """Return currently held active open positions based on current trading mode."""
-        if not self.paper_trading:
-            return [p.model_dump() for p in self._live_positions.values()]
-        return [p.model_dump() for p in self._paper_positions.values()]
+        now = time.time()
+        tf_durations = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+        positions = self._live_positions.values() if not self.paper_trading else self._paper_positions.values()
+        res = []
+        for p in positions:
+            p_dict = p.model_dump()
+            max_duration = tf_durations.get(str(p.timeframe).lower(), 300)
+            p_dict["is_settling"] = (now - p.entry_time) >= max_duration
+            res.append(p_dict)
+        return res
 
     def get_closed_positions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return historical settled/closed positions."""
@@ -1980,6 +2001,9 @@ class BinanceClient:
             wallet_bal = self._live_balance_usdt
 
         ongoing_count = int(counts.get("ongoingCount", len(ongoing_positions)))
+        local_active = len(self._live_positions)
+        in_flight = len(self._in_flight_orders)
+        effective_ongoing = max(ongoing_count, local_active) + in_flight
 
         # 1.1 Duplicate Position Check on Binance
         for p in ongoing_positions:
@@ -1990,17 +2014,17 @@ class BinanceClient:
                     reason=f"Active position already open on Binance for market {market_id}",
                     has_duplicate_position=True,
                     live_balance_usdt=wallet_bal,
-                    active_ongoing_count=ongoing_count,
+                    active_ongoing_count=effective_ongoing,
                     latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
                 )
 
         # 1.2 Max Concurrent Positions Check on Binance
-        if ongoing_count >= max_concurrent_positions:
+        if effective_ongoing >= max_concurrent_positions:
             return PreFlightVerificationResult(
                 verified=False,
-                reason=f"Max concurrent positions limit reached on Binance ({ongoing_count} >= {max_concurrent_positions})",
+                reason=f"Max concurrent positions limit reached on Binance ({effective_ongoing} >= {max_concurrent_positions})",
                 live_balance_usdt=wallet_bal,
-                active_ongoing_count=ongoing_count,
+                active_ongoing_count=effective_ongoing,
                 latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
             )
 
@@ -2414,6 +2438,17 @@ class BinanceClient:
         # Replace _closed_positions with the official synced list (sorted oldest to newest)
         synced_closed.sort(key=lambda x: getattr(x, "settled_at", 0))
         self._closed_positions = synced_closed[-100:]
+
+        # CRITICAL FIX: Immediately purge ended/settled tokens from live active positions
+        ended_tokens = {str(item.get("tokenId", "")).strip() for item in ended_list if item.get("tokenId")}
+        ended_mids = {str(item.get("marketId", "")).strip() for item in ended_list if item.get("marketId")}
+        for pid, pos in list(self._live_positions.items()):
+            if pos.token_id and pos.token_id in ended_tokens:
+                logger.info(f"[BINANCE HISTORY SYNC] Purging settled position {pid} ({pos.symbol} {pos.market_id}) from active positions (matched tokenId {pos.token_id}).")
+                self._live_positions.pop(pid, None)
+            elif any(em and em in pos.market_id for em in ended_mids if em):
+                logger.info(f"[BINANCE HISTORY SYNC] Purging settled position {pid} ({pos.symbol} {pos.market_id}) from active positions (matched marketId in ended_list).")
+                self._live_positions.pop(pid, None)
 
         if updated_count > 0:
             logger.info(f"[BINANCE HISTORY SYNC] Successfully reconciled {len(self._closed_positions)} closed position(s) from Binance API.")

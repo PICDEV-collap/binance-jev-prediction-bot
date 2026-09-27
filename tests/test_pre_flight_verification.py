@@ -287,3 +287,46 @@ def test_pre_flight_success_and_risk_guard_integration():
         assert (risk_res.adjusted_contracts * risk_res.target_price) <= res.live_balance_usdt
 
     asyncio.run(_run())
+
+
+def test_pre_flight_blocks_with_in_flight_orders():
+    """
+    Verify that in-flight orders are counted towards max_concurrent_positions
+    so racing async tasks cannot exceed the concurrency limit.
+    """
+    async def _run():
+        client = BinanceClient(api_key="test_key", api_secret="test_secret", paper_trading=False)
+        
+        async def mock_ongoing(limit=20):
+            # API reports 0 ongoing, but we simulate 1 order currently in-flight
+            return ([], {"walletBalance": "100.00"}, {"ongoingCount": 0})
+        client.fetch_ongoing_prediction_positions = mock_ongoing
+
+        # Simulate an order currently in-flight
+        client._in_flight_orders["BTC-5M-INFLIGHT"] = {"created_at": 123456789}
+
+        res: PreFlightVerificationResult = await client.verify_pre_flight_readiness(
+            symbol="ETHUSDT",
+            market_id="ETH-5M-RACE",
+            side="DOWN",
+            timeframe="5m",
+            estimated_cost_usdt=2.0,
+            max_concurrent_positions=1,
+        )
+
+        assert res.verified is False
+        assert "Max concurrent positions limit reached" in res.reason
+        assert res.active_ongoing_count == 1
+
+    asyncio.run(_run())
+
+
+def test_trading_bot_coordinator_order_execution_lock_exists():
+    """
+    Verify TradingBotCoordinator has _order_execution_lock initialized as an asyncio.Lock.
+    """
+    from main import TradingBotCoordinator
+    bot = TradingBotCoordinator()
+    assert hasattr(bot, "_order_execution_lock")
+    assert isinstance(bot._order_execution_lock, asyncio.Lock)
+

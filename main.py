@@ -219,6 +219,7 @@ class TradingBotCoordinator:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._background_tasks: Set[asyncio.Task] = set()
         self._eval_in_progress: Set[str] = set()
+        self._order_execution_lock: asyncio.Lock = asyncio.Lock()
         self._last_closed_pos_count: int = -1
         self._last_closed_pos_head_id: Optional[str] = None
         self._last_oracle_log: Dict[str, float] = {}
@@ -511,8 +512,13 @@ class TradingBotCoordinator:
 
         # Check if we already hold an open position on this market round
         open_positions = self.binance_client.get_positions()
+        in_flight_count = len(getattr(self.binance_client, "_in_flight_orders", {}))
         if any(p.get("market_id") == market.market_id for p in open_positions):
             self.traded_rounds.add(market.market_id)
+            return
+
+        # Pre-check: If max concurrent positions already reached, skip AI evaluation to conserve tokens & prevent churn
+        if (len(open_positions) + in_flight_count) >= self.risk_guard.max_concurrent_positions:
             return
 
         # Check if an evaluation or order dispatch is already in progress for this round
@@ -554,68 +560,141 @@ class TradingBotCoordinator:
             pre_flight = None
             pre_verified_quote = None
 
-            # Step 2: Pre-Flight Binance Verification & Risk Guard Validation
+            order_result: Optional[OrderResult] = None
+
+            # Step 2: Pre-Flight Binance Verification & Risk Guard Validation with Strict Mutual Exclusion Lock
             if decision.action in ("UP", "DOWN", "BUY_YES", "BUY_NO") and decision.confidence >= self.risk_guard.confidence_threshold:
-                # Estimate preliminary cost for pre-flight quote inquiry
-                est_odds = market.odds_yes if decision.action in ("UP", "BUY_YES") else market.odds_no
-                mult = self.risk_guard.martingale_multiplier ** market.martingale_step if (self.risk_guard.martingale_enabled and market.martingale_step > 0) else 1.0
-                est_contracts = max(1, math.ceil(self.risk_guard.default_order_contracts * mult))
-                est_cost = max(1.5, min(self.risk_guard.max_position_size_usdt, float(est_contracts * est_odds)))
+                async with self._order_execution_lock:
+                    # Concurrency Guard inside Mutex: Eliminate cross-asset TOCTOU race conditions
+                    current_open = self.binance_client.get_positions()
+                    in_flight = len(getattr(self.binance_client, "_in_flight_orders", {}))
+                    if (len(current_open) + in_flight) >= self.risk_guard.max_concurrent_positions:
+                        logger.info(
+                            f"[CONCURRENCY LOCK] Max concurrent positions limit ({self.risk_guard.max_concurrent_positions}) "
+                            f"reached (Open: {len(current_open)}, InFlight: {in_flight}). "
+                            f"Order for {market.symbol} {decision.action} on {market.market_id} safely aborted to prevent simultaneous entries."
+                        )
+                        risk_result = RiskEvaluationResult(
+                            approved=False,
+                            reason=f"CONCURRENCY_LIMIT_REACHED: {len(current_open)} open + {in_flight} in-flight >= {self.risk_guard.max_concurrent_positions}",
+                            adjusted_contracts=0,
+                            confidence=decision.confidence,
+                            market_id=market.market_id,
+                            action=decision.action,
+                            martingale_step=market.martingale_step,
+                            stage_label=market.martingale_stage,
+                            multiplier=1.0,
+                            effective_threshold=market.effective_hurdle,
+                        )
+                    elif market.market_id in self.traded_rounds or any(p.get("market_id") == market.market_id for p in current_open):
+                        self.traded_rounds.add(market.market_id)
+                        logger.info(f"[ROUND ALREADY TRADED] Market {market.market_id} already has an entry. Skipping duplicate execution.")
+                        return
+                    else:
+                        # Estimate preliminary cost for pre-flight quote inquiry
+                        est_odds = market.odds_yes if decision.action in ("UP", "BUY_YES") else market.odds_no
+                        mult = self.risk_guard.martingale_multiplier ** market.martingale_step if (self.risk_guard.martingale_enabled and market.martingale_step > 0) else 1.0
+                        est_contracts = max(1, math.ceil(self.risk_guard.default_order_contracts * mult))
+                        est_cost = max(1.5, min(self.risk_guard.max_position_size_usdt, float(est_contracts * est_odds)))
 
-                logger.info(
-                    f"[PRE-FLIGHT GATE] Initiating Binance authoritative pre-order verification for "
-                    f"{market.symbol} {decision.action} on {market.market_id} (Est. Cost: ${est_cost:.2f})..."
-                )
-                pre_flight = await self.binance_client.verify_pre_flight_readiness(
-                    symbol=market.symbol,
-                    market_id=market.market_id,
-                    side=decision.action,
-                    timeframe=market.timeframe,
-                    estimated_cost_usdt=est_cost,
-                    strike_price=market.target_price,
-                    spot_price=market.underlying_price,
-                    max_concurrent_positions=self.risk_guard.max_concurrent_positions,
-                )
+                        logger.info(
+                            f"[PRE-FLIGHT GATE] Initiating Binance authoritative pre-order verification for "
+                            f"{market.symbol} {decision.action} on {market.market_id} (Est. Cost: ${est_cost:.2f})..."
+                        )
+                        pre_flight = await self.binance_client.verify_pre_flight_readiness(
+                            symbol=market.symbol,
+                            market_id=market.market_id,
+                            side=decision.action,
+                            timeframe=market.timeframe,
+                            estimated_cost_usdt=est_cost,
+                            strike_price=market.target_price,
+                            spot_price=market.underlying_price,
+                            max_concurrent_positions=self.risk_guard.max_concurrent_positions,
+                        )
 
-                if not pre_flight.verified:
-                    logger.warning(
-                        f"[PRE-FLIGHT BLOCKED] Order NOT dispatched. Binance verification failed: {pre_flight.reason}. "
-                        f"Capital preserved."
-                    )
-                    risk_result = RiskEvaluationResult(
-                        approved=False,
-                        reason=f"BINANCE_PRE_FLIGHT_FAILED: {pre_flight.reason}",
-                        adjusted_contracts=0,
-                        confidence=decision.confidence,
-                        market_id=market.market_id,
-                        action=decision.action,
-                        martingale_step=market.martingale_step,
-                        stage_label=market.martingale_stage,
-                        multiplier=mult,
-                        effective_threshold=market.effective_hurdle,
-                    )
-                else:
-                    # Update market target_price if Binance official oracle strike is available
-                    if pre_flight.official_strike_price > 0:
-                        market.target_price = pre_flight.official_strike_price
-                    # Reconcile Martingale state from authoritative closed positions
-                    self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
+                        if not pre_flight.verified:
+                            logger.warning(
+                                f"[PRE-FLIGHT BLOCKED] Order NOT dispatched. Binance verification failed: {pre_flight.reason}. "
+                                f"Capital preserved."
+                            )
+                            # If quote price was heavily over cap (>= 0.70 vs cap), back off evaluation on this round
+                            # for 180s to avoid repeatedly hitting Binance quote API & Jev AI every 60s for a runaway round
+                            if "exceeds max odds cap" in str(pre_flight.reason) and pre_flight.quoted_price >= 0.70:
+                                self.last_eval_time[market.market_id] = now + 120.0
+                                logger.info(
+                                    f"[QUOTE CAP BACKOFF] Market {market.market_id} is heavily overpriced (${pre_flight.quoted_price:.3f} >= $0.70). "
+                                    f"Applying 180s evaluation backoff on this round."
+                                )
+                            risk_result = RiskEvaluationResult(
+                                approved=False,
+                                reason=f"BINANCE_PRE_FLIGHT_FAILED: {pre_flight.reason}",
+                                adjusted_contracts=0,
+                                confidence=decision.confidence,
+                                market_id=market.market_id,
+                                action=decision.action,
+                                martingale_step=market.martingale_step,
+                                stage_label=market.martingale_stage,
+                                multiplier=mult,
+                                effective_threshold=market.effective_hurdle,
+                            )
+                        else:
+                            # Update market target_price if Binance official oracle strike is available
+                            if pre_flight.official_strike_price > 0:
+                                market.target_price = pre_flight.official_strike_price
+                            # Reconcile Martingale state from authoritative closed positions
+                            self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
 
-                    pre_verified_quote = {
-                        "quote_id": pre_flight.quote_id,
-                        "quoted_price": pre_flight.quoted_price,
-                        "token_id": pre_flight.token_id,
-                    }
+                            pre_verified_quote = {
+                                "quote_id": pre_flight.quote_id,
+                                "quoted_price": pre_flight.quoted_price,
+                                "token_id": pre_flight.token_id,
+                            }
 
-                    # Execute RiskGuard sizing using 100% Binance verified balance & quote price
-                    risk_result = self.risk_guard.validate_and_size_order(
-                        decision=decision,
-                        market=market,
-                        current_open_positions_count=pre_flight.active_ongoing_count,
-                        recent_performance=recent_perf,
-                        verified_balance_usdt=pre_flight.live_balance_usdt,
-                        confirmed_quote_price=pre_flight.quoted_price,
-                    )
+                            # Execute RiskGuard sizing using 100% Binance verified balance & quote price
+                            risk_result = self.risk_guard.validate_and_size_order(
+                                decision=decision,
+                                market=market,
+                                current_open_positions_count=pre_flight.active_ongoing_count,
+                                recent_performance=recent_perf,
+                                verified_balance_usdt=pre_flight.live_balance_usdt,
+                                confirmed_quote_price=pre_flight.quoted_price,
+                            )
+
+                            # Step 3: Order Execution (Dispatched immediately inside lock to serialize fills)
+                            if risk_result.approved and risk_result.action in ("UP", "DOWN", "BUY_YES", "BUY_NO"):
+                                clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
+                                logger.info(
+                                    f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
+                                    f"on {market.market_id} ({market.timeframe}) [{risk_result.stage_label}] @ {risk_result.target_price:.3f}"
+                                )
+                                order_result = await self.binance_client.place_prediction_order(
+                                    market_id=market.market_id,
+                                    symbol=market.symbol,
+                                    side=clean_action,
+                                    contracts=risk_result.adjusted_contracts,
+                                    target_price=risk_result.target_price,
+                                    strike_price=market.target_price,
+                                    spot_price=market.underlying_price,
+                                    martingale_step=risk_result.martingale_step,
+                                    stage=risk_result.stage_label,
+                                    timeframe=market.timeframe,
+                                    pre_verified_quote=pre_verified_quote,
+                                )
+                                if order_result.status in ("FILLED", "SIMULATED", "NEW"):
+                                    self.traded_rounds.add(market.market_id)
+                                    self.risk_guard.record_market_traded(market.market_id)
+                                    logger.info(
+                                        f"[ORDER ENTERED] Position open on {market.market_id} ({market.symbol} {clean_action}). "
+                                        f"Round entry complete, pausing further evaluations for this round."
+                                    )
+                                else:
+                                    self.risk_guard.rollback_market_traded(market.market_id)
+                                    if order_result.order_id == "REJECTED_QUOTE_CAP" and order_result.price >= 0.70:
+                                        self.last_eval_time[market.market_id] = now + 120.0
+                                        logger.info(
+                                            f"[QUOTE CAP BACKOFF] Market {market.market_id} is heavily overpriced (${order_result.price:.3f} >= $0.70). "
+                                            f"Applying 180s evaluation backoff on this round."
+                                        )
             else:
                 open_positions = len(self.binance_client.get_positions())
                 risk_result = self.risk_guard.validate_and_size_order(
@@ -656,47 +735,8 @@ class TradingBotCoordinator:
                 "risk_validation": risk_result.model_dump(),
                 "recent_performance": recent_perf,
                 "pre_flight": pre_flight.model_dump() if pre_flight else None,
-                "order": None,
+                "order": order_result.model_dump() if order_result else None,
             }
-
-            # Step 3: Order Execution (UP or DOWN if approved by Risk Guard)
-            if risk_result.approved and risk_result.action in ("UP", "DOWN", "BUY_YES", "BUY_NO"):
-                clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
-                logger.info(
-                    f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
-                    f"on {market.market_id} ({market.timeframe}) [{risk_result.stage_label}] @ {risk_result.target_price:.3f}"
-                )
-                order_result: OrderResult = await self.binance_client.place_prediction_order(
-                    market_id=market.market_id,
-                    symbol=market.symbol,
-                    side=clean_action,
-                    contracts=risk_result.adjusted_contracts,
-                    target_price=risk_result.target_price,
-                    strike_price=market.target_price,
-                    spot_price=market.underlying_price,
-                    martingale_step=risk_result.martingale_step,
-                    stage=risk_result.stage_label,
-                    timeframe=market.timeframe,
-                    pre_verified_quote=pre_verified_quote,
-                )
-                record["order"] = order_result.model_dump()
-                if order_result.status in ("FILLED", "SIMULATED", "NEW"):
-                    self.traded_rounds.add(market.market_id)
-                    self.risk_guard.record_market_traded(market.market_id)
-                    logger.info(
-                        f"[ORDER ENTERED] Position open on {market.market_id} ({market.symbol} {clean_action}). "
-                        f"Round entry complete, pausing further evaluations for this round."
-                    )
-                else:
-                    self.risk_guard.rollback_market_traded(market.market_id)
-                    # If quote price was heavily over cap (>= 0.70 vs cap 0.60), back off evaluation on this round
-                    # for 180s to avoid repeatedly hitting Binance quote API every 60s for a runaway round
-                    if order_result.order_id == "REJECTED_QUOTE_CAP" and order_result.price >= 0.70:
-                        self.last_eval_time[market.market_id] = now + 120.0
-                        logger.info(
-                            f"[QUOTE CAP BACKOFF] Market {market.market_id} is heavily overpriced (${order_result.price:.3f} >= $0.70). "
-                            f"Applying 180s evaluation backoff on this round."
-                        )
 
             # Cache last 50 decisions
             self.recent_decisions.append(record)

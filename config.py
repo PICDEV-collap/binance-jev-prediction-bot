@@ -93,7 +93,7 @@ class Settings(BaseSettings):
         alias="MAX_DAILY_LOSS_USDT"
     )
     max_concurrent_positions: int = Field(
-        default=5,
+        default=1,
         gt=0,
         alias="MAX_CONCURRENT_POSITIONS"
     )
