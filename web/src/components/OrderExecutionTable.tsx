@@ -486,12 +486,20 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
 
                         {/* Target Price (Strike) */}
                         <td className="py-3 px-3 text-right text-amber-300 font-mono font-semibold whitespace-nowrap">
-                          ${pos.target_price.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                          {pos.target_price && pos.target_price > 0 ? (
+                            `$${pos.target_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`
+                          ) : (
+                            <span className="text-slate-600 font-normal">-</span>
+                          )}
                         </td>
 
                         {/* Final Settlement Spot */}
                         <td className="py-3 px-3 text-right text-white font-mono font-bold whitespace-nowrap">
-                          ${pos.settlement_price.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                          {pos.settlement_price && pos.settlement_price > 0 ? (
+                            `$${pos.settlement_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`
+                          ) : (
+                            <span className="text-slate-600 font-normal">-</span>
+                          )}
                         </td>
 
                         {/* Outcome Badge */}

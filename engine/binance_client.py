@@ -157,6 +157,8 @@ class BinanceClient:
         self._active_account_type: str = "CeDeFi"
         self._prediction_market_cache: Dict[str, Any] = {}
         self._prediction_cache_timestamp: float = 0.0
+        # Permanent in-memory cache for resolved market oracle strike and settlement prices
+        self._market_oracle_cache: Dict[int, Tuple[float, float]] = {}
         self._background_tasks: Set[asyncio.Task] = set()
 
     def _spawn_task(self, coro) -> Optional[asyncio.Task]:
@@ -1235,6 +1237,16 @@ class BinanceClient:
 
                     total_net_pnl += realized_pnl
 
+                    # Populate official strike/settlement prices from cache if available
+                    m_id_num = None
+                    try:
+                        m_id_num = int(p_ended.get("marketId", 0) or 0)
+                    except (ValueError, TypeError):
+                        pass
+                    cached_strike, cached_spot = self._market_oracle_cache.get(m_id_num, (0.0, 0.0)) if m_id_num else (0.0, 0.0)
+                    final_target_price = cached_strike if cached_strike > 0 else (pos.target_price if pos.target_price > 0 else 0.0)
+                    final_settle_price = cached_spot if cached_spot > 0 else spot
+
                     closed_item = ClosedPositionInfo(
                         position_id=pos.position_id,
                         market_id=pos.market_id,
@@ -1242,8 +1254,8 @@ class BinanceClient:
                         side=pos.side,
                         contracts=int(shares) if shares >= 1 else pos.contracts,
                         entry_price=float(p_ended.get("avgPrice", pos.entry_price)),
-                        target_price=pos.target_price,
-                        settlement_price=spot,
+                        target_price=final_target_price,
+                        settlement_price=final_settle_price,
                         timeframe=pos.timeframe,
                         result=outcome_label,
                         realized_pnl=round(realized_pnl, 2),
@@ -2248,6 +2260,50 @@ class BinanceClient:
             logger.warning(f"Exception fetching ended positions from Binance: {e}")
         return []
 
+    async def fetch_market_oracle_prices(self, market_topic_id: int, market_id: int) -> Tuple[float, float]:
+        """
+        Fetch official Chainlink Oracle strike (startPrice) and settlement (endPrice)
+        for a prediction market from Binance SAPI. Caches resolved prices in-memory (0ms overhead).
+        Endpoint: GET /sapi/v1/w3w/wallet/prediction/market/detail?marketTopicId={topic_id}&marketId={market_id}
+        """
+        if market_id in self._market_oracle_cache:
+            return self._market_oracle_cache[market_id]
+
+        if not market_topic_id or not market_id or self.paper_trading or not (self.api_key and self.api_secret):
+            return 0.0, 0.0
+
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "marketTopicId": market_topic_id,
+            "marketId": market_id,
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/market/detail?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.get(url, headers={"X-MBX-APIKEY": self.api_key}, timeout=aiohttp.ClientTimeout(total=4.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    vd = data.get("variantData", {})
+                    if vd:
+                        sp = float(vd.get("startPrice", 0.0) or 0.0)
+                        ep = float(vd.get("endPrice", 0.0) or 0.0)
+                        if sp > 0 or ep > 0:
+                            self._market_oracle_cache[market_id] = (sp, ep)
+                            return sp, ep
+                elif resp.status != 404:
+                    logger.debug(f"[MARKET DETAIL ORACLE] HTTP {resp.status} for market {market_id} topic {market_topic_id}")
+        except Exception as e:
+            logger.debug(f"[MARKET DETAIL ORACLE] Error fetching oracle prices for market {market_id}: {e}")
+
+        return 0.0, 0.0
+
     async def sync_historical_closed_positions(self, limit: int = 50) -> int:
         """
         Reconcile and synchronize historical settled positions directly from Binance SAPI.
@@ -2260,6 +2316,28 @@ class BinanceClient:
         ended_list = await self.fetch_ended_prediction_positions(limit=limit)
         if not ended_list:
             return 0
+
+        # Concurrently resolve official Oracle strike and settlement prices for unique markets not yet in cache
+        missing_markets = {}
+        for item in ended_list:
+            mid = item.get("marketId")
+            tid = item.get("marketTopicId")
+            if mid and tid:
+                try:
+                    mid_int = int(mid)
+                    tid_int = int(tid)
+                    if mid_int not in self._market_oracle_cache:
+                        missing_markets[mid_int] = tid_int
+                except (ValueError, TypeError):
+                    pass
+
+        if missing_markets:
+            sem = asyncio.Semaphore(5)
+            async def _fetch_with_sem(t_id: int, m_id: int):
+                async with sem:
+                    await self.fetch_market_oracle_prices(t_id, m_id)
+
+            await asyncio.gather(*[_fetch_with_sem(tid, mid) for mid, tid in missing_markets.items()], return_exceptions=True)
 
         existing_by_token: Dict[str, ClosedPositionInfo] = {}
         for p in self._closed_positions:
@@ -2294,12 +2372,19 @@ class BinanceClient:
             tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
             tf = tf_match.group(1).lower() if tf_match else "5m"
 
+            mid_int = int(item.get("marketId", 0) or 0)
+            strike_price, settlement_price = self._market_oracle_cache.get(mid_int, (0.0, 0.0))
+
             orig = existing_by_token.get(token_id)
             if orig is not None:
                 orig.result = outcome_label
                 orig.realized_pnl = pnl_final
                 orig.is_claimed = is_claimed
                 orig.settled_at = settled_at
+                if strike_price > 0:
+                    orig.target_price = strike_price
+                if settlement_price > 0:
+                    orig.settlement_price = settlement_price
                 synced_closed.append(orig)
             else:
                 pos_id = f"POS_BINANCE_{item.get('positionId', uuid.uuid4().hex[:6])}"
@@ -2311,8 +2396,8 @@ class BinanceClient:
                     side=side,
                     contracts=int(shares) if shares >= 1 else 1,
                     entry_price=avg_price,
-                    target_price=0.0,
-                    settlement_price=0.0,
+                    target_price=strike_price,
+                    settlement_price=settlement_price,
                     timeframe=tf,
                     result=outcome_label,
                     realized_pnl=pnl_final,
