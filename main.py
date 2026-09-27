@@ -218,11 +218,16 @@ class TradingBotCoordinator:
         self._heartbeat_task = self._spawn_task(self._dashboard_heartbeat_loop(), name="heartbeat_loop")
 
     async def _init_live_catalog(self) -> None:
-        """Fetch live prediction market catalog and sync supported symbols to RiskGuard."""
+        """Fetch live prediction market catalog, sync supported symbols, Price to Beat strikes, and historical settled trades."""
         try:
             await self.binance_client.fetch_prediction_market_topics(force_refresh=True)
             supported = self.binance_client.get_supported_prediction_symbols()
             self.risk_guard.set_supported_symbols(supported)
+            start_prices = self.binance_client.get_market_start_prices()
+            if start_prices:
+                self.ws_listener.update_official_strike_prices(start_prices)
+            # Reconcile closed positions history directly with Binance API
+            await self.binance_client.sync_historical_closed_positions()
             logger.info(f"[CATALOG SYNC] Live Binance Prediction Pairs discovered: {', '.join(sorted(supported))}")
         except Exception as e:
             logger.debug(f"Catalog init notice: {e}")
@@ -269,6 +274,22 @@ class TradingBotCoordinator:
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
                     self._spawn_task(self.binance_client.sync_server_time(), name="periodic_sync_time")
 
+                # Periodic reconciliation of historical settled positions directly from Binance every 60s
+                if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
+                    self._spawn_task(self.binance_client.sync_historical_closed_positions(), name="periodic_sync_closed")
+
+                # Periodic refresh of official Price to Beat (startPrice) from Binance topics every 15s
+                if heartbeat_ticks % 15 == 0:
+                    async def _sync_oracle_strikes():
+                        try:
+                            await self.binance_client.fetch_prediction_market_topics()
+                            strike_map = self.binance_client.get_market_start_prices()
+                            if strike_map:
+                                self.ws_listener.update_official_strike_prices(strike_map)
+                        except Exception as ex:
+                            logger.debug(f"Periodic strike sync notice: {ex}")
+                    self._spawn_task(_sync_oracle_strikes(), name="periodic_oracle_strikes")
+
                 # Settle prediction positions when a round expires
                 if markets:
                     active_market_ids = {m["market_id"] for m in markets}
@@ -286,7 +307,7 @@ class TradingBotCoordinator:
                                 symbol=tp_rec["symbol"]
                             )
 
-                    pnl, settled_records = self.binance_client.settle_expired_positions(active_market_ids, current_prices)
+                    pnl, settled_records = await self.binance_client.settle_expired_positions(active_market_ids, current_prices)
                     for rec in settled_records:
                         self.risk_guard.record_settlement_result(
                             won=rec["won"],

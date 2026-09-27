@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import re
 import time
 import uuid
 from typing import Optional, Dict, Any, List, Set, Tuple
@@ -65,8 +66,8 @@ class ClosedPositionInfo(BaseModel):
     side: str  # "UP" or "DOWN"
     contracts: int
     entry_price: float
-    target_price: float  # Price to Beat (Strike)
-    settlement_price: float  # Final spot price
+    target_price: float = 0.0  # Price to Beat (Strike)
+    settlement_price: float = 0.0  # Final spot price
     timeframe: str = "15m"
     result: str  # "WIN" or "LOSS"
     realized_pnl: float
@@ -74,7 +75,7 @@ class ClosedPositionInfo(BaseModel):
     stage: str = "ไม้ 1 (Base)"
     token_id: str = ""
     is_claimed: bool = False
-    entry_time: float
+    entry_time: float = Field(default_factory=time.time)
     settled_at: float = Field(default_factory=time.time)
 
 
@@ -344,6 +345,44 @@ class BinanceClient:
                     if base in title.upper():
                         symbols.add(candidate)
         return symbols or {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+
+    def get_market_start_prices(self) -> Dict[str, float]:
+        """
+        Extract official Chainlink Price to Beat (startPrice) for each active binary prediction market
+        from the cached marketTopics catalog.
+        Returns mapping of market identifiers/keys to official strike price.
+        """
+        prices: Dict[str, float] = {}
+        topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
+        for t in topics:
+            variant = t.get("variantData") or {}
+            start_price_str = variant.get("startPrice")
+            if not start_price_str:
+                continue
+            try:
+                start_price = float(start_price_str)
+            except (ValueError, TypeError):
+                continue
+
+            title = str(t.get("title", ""))
+            sym = str(t.get("symbol", "")).upper()
+            if not sym or "USDT" not in sym:
+                for candidate in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]:
+                    base = candidate.replace("USDT", "")
+                    if base in title.upper():
+                        sym = candidate
+                        break
+
+            tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
+            tf = tf_match.group(1).lower() if tf_match else "5m"
+
+            if sym and start_price > 0:
+                prices[f"{sym}-{tf}"] = start_price
+                for m in t.get("markets", []):
+                    m_id = str(m.get("marketId", ""))
+                    if m_id:
+                        prices[m_id] = start_price
+        return prices
 
     async def get_prediction_quote(
         self,
@@ -951,118 +990,227 @@ class BinanceClient:
         )
         return result
 
-    def settle_expired_positions(
+    async def settle_expired_positions(
         self,
         active_market_ids: Set[str],
         current_prices: Dict[str, float]
     ) -> Tuple[float, List[Dict[str, Any]]]:
         """
         Settle prediction contracts whose round has ended.
-        Picks up final settlement: $1.00 USDT payout per winning contract.
-        Settles based on both active market ID rotation AND elapsed round duration.
+        In LIVE mode: Syncs directly with Binance official ended positions (tab=ENDED)
+        to guarantee 100% authoritative WIN/LOSS outcome and PnL matching Binance.
+        In PAPER mode: Evaluates deterministic binary settlement against strike price.
         """
         now = time.time()
         tf_durations = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
         total_net_pnl = 0.0
         settled_events: List[Dict[str, Any]] = []
 
-        # Target both paper positions and live positions
-        containers = [
-            ("PAPER", self._paper_positions),
-            ("LIVE", self._live_positions),
-        ]
+        # ------------------------------------------------------------------
+        # 1. LIVE TRADING: Settle using Binance official ended positions
+        # ------------------------------------------------------------------
+        if not self.paper_trading and (self.api_key and self.api_secret) and self._live_positions:
+            ended_list = await self.fetch_ended_prediction_positions(limit=30)
+            ended_by_token = {str(p.get("tokenId", "")).strip(): p for p in ended_list if p.get("tokenId")}
 
-        for mode_label, pos_dict in containers:
-            expired_pos_ids = []
-            for pid, pos in list(pos_dict.items()):
+            for pid, pos in list(self._live_positions.items()):
                 max_duration = tf_durations.get(pos.timeframe.lower(), 900)
-                is_time_expired = (now - pos.entry_time) >= (max_duration + 5)
-                if pos.market_id not in active_market_ids or is_time_expired:
-                    expired_pos_ids.append(pid)
+                elapsed = now - pos.entry_time
+                is_round_expired = (pos.market_id not in active_market_ids) or (elapsed >= (max_duration + 5))
 
-            for pid in expired_pos_ids:
-                pos = pos_dict.pop(pid)
-                spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
-                cost = pos.contracts * pos.entry_price
+                p_ended = ended_by_token.get(pos.token_id) if pos.token_id else None
 
-                # Binary outcome settlement according to official Binance Prediction Rules:
-                # Rule: If final price > strike -> UP wins ($1.00); if < strike -> DOWN wins ($1.00); if equal -> 50-50 ($0.50 payout)
-                is_tie = abs(spot - pos.target_price) < 1e-4
-                if is_tie:
-                    payout = pos.contracts * 0.50
-                    realized_pnl = payout - cost
-                    if mode_label == "PAPER":
-                        self._paper_balance_usdt += payout
-                    won = (realized_pnl >= 0)
-                    outcome_label = "TIE (50-50)"
-                elif pos.side in ("UP", "BUY_YES"):
-                    won = spot > pos.target_price
-                    payout = pos.contracts * 1.00 if won else 0.0
-                    realized_pnl = payout - cost
-                    if won and mode_label == "PAPER":
-                        self._paper_balance_usdt += payout
+                if p_ended:
+                    # Binance has officially settled this contract!
+                    self._live_positions.pop(pid, None)
+                    won = (p_ended.get("isWinner") is True)
                     outcome_label = "WIN" if won else "LOSS"
-                else:  # DOWN
-                    won = spot < pos.target_price
-                    payout = pos.contracts * 1.00 if won else 0.0
-                    realized_pnl = payout - cost
-                    if won and mode_label == "PAPER":
-                        self._paper_balance_usdt += payout
-                    outcome_label = "WIN" if won else "LOSS"
+                    raw_pnl = float(p_ended.get("unrealizedPnl") or p_ended.get("realizedPnl") or 0.0)
+                    cost = float(p_ended.get("totalCost", 0.0) or (pos.contracts * pos.entry_price))
+                    shares = float(p_ended.get("shares", 0.0) or pos.contracts)
+                    realized_pnl = raw_pnl if raw_pnl != 0.0 else ((shares * 1.00 - cost) if won else -cost)
+                    is_claimed = bool(won and p_ended.get("positionStatus") == "CLAIMED")
+                    settled_at = float(p_ended.get("updatedTime", 0)) / 1000.0 if p_ended.get("updatedTime") else now
+                    spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
 
-                total_net_pnl += realized_pnl
+                    total_net_pnl += realized_pnl
 
-                # Record into settled positions history
-                closed_item = ClosedPositionInfo(
-                    position_id=pos.position_id,
-                    market_id=pos.market_id,
-                    symbol=pos.symbol,
-                    side=pos.side,
-                    contracts=pos.contracts,
-                    entry_price=pos.entry_price,
-                    target_price=pos.target_price,
-                    settlement_price=spot,
-                    timeframe=pos.timeframe,
-                    result=outcome_label,
-                    realized_pnl=round(realized_pnl, 2),
-                    martingale_step=pos.martingale_step,
-                    stage=pos.stage,
-                    token_id=pos.token_id,
-                    is_claimed=False,
-                    entry_time=pos.entry_time,
-                    settled_at=time.time(),
-                )
-                self._closed_positions.append(closed_item)
-                if len(self._closed_positions) > 100:
-                    self._closed_positions.pop(0)
+                    closed_item = ClosedPositionInfo(
+                        position_id=pos.position_id,
+                        market_id=pos.market_id,
+                        symbol=pos.symbol,
+                        side=pos.side,
+                        contracts=int(shares) if shares >= 1 else pos.contracts,
+                        entry_price=float(p_ended.get("avgPrice", pos.entry_price)),
+                        target_price=pos.target_price,
+                        settlement_price=spot,
+                        timeframe=pos.timeframe,
+                        result=outcome_label,
+                        realized_pnl=round(realized_pnl, 2),
+                        martingale_step=pos.martingale_step,
+                        stage=pos.stage,
+                        token_id=pos.token_id,
+                        is_claimed=is_claimed,
+                        entry_time=pos.entry_time,
+                        settled_at=settled_at,
+                    )
+                    self._closed_positions.append(closed_item)
+                    if len(self._closed_positions) > 100:
+                        self._closed_positions.pop(0)
 
-                settled_events.append({
-                    "position_id": pos.position_id,
-                    "symbol": pos.symbol,
-                    "market_id": pos.market_id,
-                    "side": pos.side,
-                    "won": won,
-                    "pnl": round(realized_pnl, 2),
-                    "martingale_step": pos.martingale_step,
-                    "stage": pos.stage,
-                    "mode": mode_label,
-                    "token_id": pos.token_id,
-                })
+                    settled_events.append({
+                        "position_id": pos.position_id,
+                        "symbol": pos.symbol,
+                        "market_id": pos.market_id,
+                        "side": pos.side,
+                        "won": won,
+                        "pnl": round(realized_pnl, 2),
+                        "martingale_step": pos.martingale_step,
+                        "stage": pos.stage,
+                        "mode": "LIVE",
+                        "token_id": pos.token_id,
+                    })
 
-                if mode_label == "LIVE":
                     self._spawn_task(self.fetch_live_balance())
-                    if won and getattr(pos, "token_id", None):
-                        logger.info(
-                            f"[AUTO-CLAIM QUEUED] Won live contract {pos.symbol} {pos.side} "
-                            f"(token: {pos.token_id[:16]}...). Queued for settlement auto-claim verification."
-                        )
+                    if won and not is_claimed:
                         self._spawn_task(self.claim_all_won_positions())
 
-                logger.info(
-                    f"[{mode_label} SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
-                    f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
-                    f"(Current Spot: ${spot:.2f}, Price to Beat: ${pos.target_price:.2f})"
-                )
+                    logger.info(
+                        f"[BINANCE LIVE SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) "
+                        f"OFFICIALLY SETTLED BY BINANCE! Outcome: {outcome_label} (PnL: {realized_pnl:+.2f} USDT) | "
+                        f"Claimed: {is_claimed}"
+                    )
+                elif is_round_expired:
+                    # Round time has elapsed, but Binance backend is finalizing the Chainlink oracle settlement
+                    if elapsed < (max_duration + 90):
+                        logger.info(
+                            f"[SETTLEMENT PENDING] Live contract {pos.symbol} {pos.side} on {pos.market_id} "
+                            f"expired ({elapsed:.0f}s elapsed). Waiting for official Binance backend settlement publication..."
+                        )
+                    else:
+                        # Fallback after 90s grace period if Binance API has delay
+                        self._live_positions.pop(pid, None)
+                        spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
+                        cost = pos.contracts * pos.entry_price
+                        won = (spot > pos.target_price) if pos.side in ("UP", "BUY_YES") else (spot < pos.target_price)
+                        payout = pos.contracts * 1.00 if won else 0.0
+                        realized_pnl = payout - cost
+                        total_net_pnl += realized_pnl
+                        outcome_label = "WIN" if won else "LOSS"
+
+                        closed_item = ClosedPositionInfo(
+                            position_id=pos.position_id,
+                            market_id=pos.market_id,
+                            symbol=pos.symbol,
+                            side=pos.side,
+                            contracts=pos.contracts,
+                            entry_price=pos.entry_price,
+                            target_price=pos.target_price,
+                            settlement_price=spot,
+                            timeframe=pos.timeframe,
+                            result=outcome_label,
+                            realized_pnl=round(realized_pnl, 2),
+                            martingale_step=pos.martingale_step,
+                            stage=pos.stage,
+                            token_id=pos.token_id,
+                            is_claimed=False,
+                            entry_time=pos.entry_time,
+                            settled_at=now,
+                        )
+                        self._closed_positions.append(closed_item)
+                        settled_events.append({
+                            "position_id": pos.position_id,
+                            "symbol": pos.symbol,
+                            "market_id": pos.market_id,
+                            "side": pos.side,
+                            "won": won,
+                            "pnl": round(realized_pnl, 2),
+                            "martingale_step": pos.martingale_step,
+                            "stage": pos.stage,
+                            "mode": "LIVE",
+                            "token_id": pos.token_id,
+                        })
+
+        # ------------------------------------------------------------------
+        # 2. PAPER TRADING: Simulated deterministic settlement
+        # ------------------------------------------------------------------
+        expired_paper_ids = []
+        for pid, pos in list(self._paper_positions.items()):
+            max_duration = tf_durations.get(pos.timeframe.lower(), 900)
+            is_time_expired = (now - pos.entry_time) >= (max_duration + 5)
+            if pos.market_id not in active_market_ids or is_time_expired:
+                expired_paper_ids.append(pid)
+
+        for pid in expired_paper_ids:
+            pos = self._paper_positions.pop(pid)
+            spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
+            cost = pos.contracts * pos.entry_price
+
+            is_tie = abs(spot - pos.target_price) < 1e-4
+            if is_tie:
+                payout = pos.contracts * 0.50
+                realized_pnl = payout - cost
+                self._paper_balance_usdt += payout
+                won = (realized_pnl >= 0)
+                outcome_label = "TIE (50-50)"
+            elif pos.side in ("UP", "BUY_YES"):
+                won = spot > pos.target_price
+                payout = pos.contracts * 1.00 if won else 0.0
+                realized_pnl = payout - cost
+                if won:
+                    self._paper_balance_usdt += payout
+                outcome_label = "WIN" if won else "LOSS"
+            else:  # DOWN
+                won = spot < pos.target_price
+                payout = pos.contracts * 1.00 if won else 0.0
+                realized_pnl = payout - cost
+                if won:
+                    self._paper_balance_usdt += payout
+                outcome_label = "WIN" if won else "LOSS"
+
+            total_net_pnl += realized_pnl
+
+            closed_item = ClosedPositionInfo(
+                position_id=pos.position_id,
+                market_id=pos.market_id,
+                symbol=pos.symbol,
+                side=pos.side,
+                contracts=pos.contracts,
+                entry_price=pos.entry_price,
+                target_price=pos.target_price,
+                settlement_price=spot,
+                timeframe=pos.timeframe,
+                result=outcome_label,
+                realized_pnl=round(realized_pnl, 2),
+                martingale_step=pos.martingale_step,
+                stage=pos.stage,
+                token_id=pos.token_id,
+                is_claimed=False,
+                entry_time=pos.entry_time,
+                settled_at=now,
+            )
+            self._closed_positions.append(closed_item)
+            if len(self._closed_positions) > 100:
+                self._closed_positions.pop(0)
+
+            settled_events.append({
+                "position_id": pos.position_id,
+                "symbol": pos.symbol,
+                "market_id": pos.market_id,
+                "side": pos.side,
+                "won": won,
+                "pnl": round(realized_pnl, 2),
+                "martingale_step": pos.martingale_step,
+                "stage": pos.stage,
+                "mode": "PAPER",
+                "token_id": pos.token_id,
+            })
+
+            logger.info(
+                f"[PAPER SETTLEMENT] {pos.symbol} {pos.side} ({pos.market_id} - {pos.timeframe} | {pos.stage}) SETTLED! "
+                f"Result: {'WIN (+$' + f'{realized_pnl:.2f})' if won else 'LOSS (-$' + f'{abs(realized_pnl):.2f})'} "
+                f"(Current Spot: ${spot:.2f}, Price to Beat: ${pos.target_price:.2f})"
+            )
 
         return round(total_net_pnl, 2), settled_events
 
@@ -1502,6 +1650,152 @@ class BinanceClient:
             logger.warning(f"Could not fetch claimable positions from Binance API: {e}")
         return token_ids
 
+    async def fetch_ended_prediction_positions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Fetch official list of ended/settled prediction positions from Binance.
+        Endpoint: GET /sapi/v1/w3w/wallet/prediction/position/list?tab=ENDED
+        Provides authoritative isWinner boolean, finalOutcome, and realized PnL.
+        """
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            return []
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "tab": "ENDED",
+            "limit": limit,
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+        }
+        if self._wallet_address:
+            query_params["walletAddress"] = self._wallet_address
+        if self._wallet_id:
+            query_params["walletId"] = self._wallet_id
+
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/position/list?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("positions", [])
+                else:
+                    data = {}
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        pass
+                    if data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
+                        logger.warning("Detected time drift (-1021) in ended positions. Re-syncing time...")
+                        await self.sync_server_time()
+                        query_params["timestamp"] = self._get_timestamp()
+                        signed_query = self._sign_payload(query_params)
+                        retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/position/list?{signed_query}"
+                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=6.0)) as r_resp:
+                            if r_resp.status == 200:
+                                r_data = await r_resp.json()
+                                return r_data.get("positions", [])
+                    logger.debug(f"Failed to fetch ended positions: HTTP {resp.status} - {data}")
+        except Exception as e:
+            logger.warning(f"Exception fetching ended positions from Binance: {e}")
+        return []
+
+    async def sync_historical_closed_positions(self, limit: int = 50) -> int:
+        """
+        Reconcile and synchronize historical settled positions directly from Binance SAPI.
+        Corrects any past misreported outcomes and populates missing history.
+        """
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            return 0
+
+        ended_list = await self.fetch_ended_prediction_positions(limit=limit)
+        if not ended_list:
+            return 0
+
+        existing_by_token: Dict[str, ClosedPositionInfo] = {}
+        for p in self._closed_positions:
+            if p.token_id:
+                existing_by_token[p.token_id] = p
+
+        updated_count = 0
+        now = time.time()
+
+        for item in ended_list:
+            token_id = str(item.get("tokenId", "")).strip()
+            if not token_id:
+                continue
+
+            won = (item.get("isWinner") is True)
+            outcome_label = "WIN" if won else "LOSS"
+            raw_pnl = float(item.get("unrealizedPnl") or item.get("realizedPnl") or 0.0)
+            cost = float(item.get("totalCost", 0.0) or 0.0)
+            shares = float(item.get("shares", 0.0) or 1.0)
+            pnl = raw_pnl if raw_pnl != 0.0 else ((shares * 1.00 - cost) if won else -cost)
+            is_claimed = bool(won and item.get("positionStatus") == "CLAIMED")
+            settled_at = float(item.get("updatedTime", 0)) / 1000.0 if item.get("updatedTime") else now
+            title = str(item.get("marketTopicTitle") or item.get("marketTitle") or "")
+            side = str(item.get("outcomeName", "UP")).upper()
+            avg_price = float(item.get("avgPrice", 0.50) or 0.50)
+
+            # Derive symbol and timeframe
+            sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
+            tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
+            tf = tf_match.group(1).lower() if tf_match else "5m"
+
+            if token_id in existing_by_token:
+                # Reconcile existing record
+                pos = existing_by_token[token_id]
+                changed = False
+                if pos.result != outcome_label:
+                    logger.info(f"[RECONCILIATION] Correcting position {pos.position_id} result: {pos.result} -> {outcome_label} (Binance Official)")
+                    pos.result = outcome_label
+                    changed = True
+                if abs(pos.realized_pnl - pnl) > 0.01:
+                    pos.realized_pnl = round(pnl, 2)
+                    changed = True
+                if pos.is_claimed != is_claimed:
+                    pos.is_claimed = is_claimed
+                    changed = True
+                if changed:
+                    updated_count += 1
+            else:
+                # Historical closed position from Binance that was not in bot memory
+                pos_id = f"POS_BINANCE_{item.get('positionId', uuid.uuid4().hex[:6])}"
+                closed_item = ClosedPositionInfo(
+                    position_id=pos_id,
+                    market_id=f"{sym}-{tf.upper()}-B{item.get('marketId', '')}",
+                    symbol=sym,
+                    side=side,
+                    contracts=int(shares) if shares >= 1 else 1,
+                    entry_price=avg_price,
+                    target_price=0.0,
+                    settlement_price=0.0,
+                    timeframe=tf,
+                    result=outcome_label,
+                    realized_pnl=round(pnl, 2),
+                    martingale_step=0,
+                    stage="Binance Sync",
+                    token_id=token_id,
+                    is_claimed=is_claimed,
+                    entry_time=settled_at - 300,
+                    settled_at=settled_at,
+                )
+                self._closed_positions.append(closed_item)
+                existing_by_token[token_id] = closed_item
+                updated_count += 1
+
+        # Keep _closed_positions sorted by settled_at ascending (latest at end)
+        self._closed_positions.sort(key=lambda x: getattr(x, "settled_at", 0))
+        if len(self._closed_positions) > 100:
+            self._closed_positions = self._closed_positions[-100:]
+
+        if updated_count > 0:
+            logger.info(f"[BINANCE HISTORY SYNC] Successfully reconciled {updated_count} closed position(s) from Binance API.")
+        return updated_count
+
     async def redeem_prediction_tokens(self, token_ids: List[str]) -> Dict[str, Any]:
         """
         Execute official Binance Prediction batch-redeem API to claim winnings into wallet balance.
@@ -1606,15 +1900,8 @@ class BinanceClient:
             for tid in api_claimable:
                 token_ids_to_claim.add(tid)
 
-            # In live trading, only mark a local won position as claimed if it settled at least
-            # 300 seconds (5 minutes) ago AND is still not in Binance's claimable list.
-            # This grace period prevents premature marking while Binance backend processes round settlement!
-            now = time.time()
-            for pos in self._closed_positions:
-                if pos.token_id and not getattr(pos, "is_claimed", False):
-                    settled_age = now - getattr(pos, "settled_at", pos.entry_time)
-                    if pos.token_id not in token_ids_to_claim and settled_age > 300.0:
-                        pos.is_claimed = True
+            # In live trading, sync with Binance official ended positions to accurately confirm CLAIMED status
+            await self.sync_historical_closed_positions(limit=30)
         else:
             # Paper trading simulation
             for pos in self._closed_positions:

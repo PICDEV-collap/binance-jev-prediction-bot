@@ -107,9 +107,24 @@ class BinanceWSListener:
         self._active_markets: Dict[str, MarketContext] = {}
         self._price_history: Dict[str, List[tuple[float, float]]] = {}
         self._round_base_prices: Dict[str, float] = {}
+        self._official_strike_prices: Dict[str, float] = {}
         self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
         self._btc_momentum: float = 0.0
         self._background_tasks: Set[asyncio.Task] = set()
+
+    def update_official_strike_prices(self, strike_map: Dict[str, float]) -> None:
+        """
+        Update cache of official Binance Price to Beat (startPrice) from oracle / marketTopics catalog.
+        Immediately synchronizes active rounds to official strike prices.
+        """
+        if not strike_map:
+            return
+        self._official_strike_prices.update(strike_map)
+        for key, price in strike_map.items():
+            if price > 0:
+                for round_id in list(self._round_base_prices.keys()):
+                    if key.upper() in round_id.upper():
+                        self._round_base_prices[round_id] = price
 
     def _spawn_task(self, coro) -> asyncio.Task:
         """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
@@ -405,21 +420,21 @@ class BinanceWSListener:
             round_id = f"{symbol}-{tf.upper()}-R{round_idx}"
             time_left = round_period - int(now % round_period)
 
-            # Determine fixed Price to Beat for this round
+            # Determine fixed Price to Beat for this round (prioritizes official Binance oracle startPrice)
             if round_id not in self._round_base_prices:
-                h = int(hashlib.md5(round_id.encode()).hexdigest()[:6], 16)
-                pct_offset = ((h % 100) - 50) / 100.0 * (
-                    0.0008 if tf == "5m" else 0.0020 if tf == "15m" else 0.0050 if tf == "1h" else 0.0120
-                )
-                seed_price = mark_price * (1.0 + pct_offset)
-                if "BTC" in symbol or "ETH" in symbol or "BNB" in symbol:
-                    strike = round(seed_price, 2)
-                elif "SOL" in symbol:
-                    strike = round(seed_price, 2)
+                official_strike = self._official_strike_prices.get(f"{symbol}-{tf}")
+                if official_strike and official_strike > 0:
+                    strike = official_strike
                 else:
-                    strike = round(seed_price, 4)
+                    if "BTC" in symbol or "ETH" in symbol or "BNB" in symbol or "SOL" in symbol:
+                        strike = round(mark_price, 2)
+                    else:
+                        strike = round(mark_price, 4)
                 self._round_base_prices[round_id] = strike
             else:
+                official_strike = self._official_strike_prices.get(f"{symbol}-{tf}")
+                if official_strike and official_strike > 0:
+                    self._round_base_prices[round_id] = official_strike
                 strike = self._round_base_prices[round_id]
 
             price_diff = round(mark_price - strike, 4)

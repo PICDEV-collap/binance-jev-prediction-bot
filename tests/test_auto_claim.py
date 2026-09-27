@@ -35,7 +35,7 @@ def test_token_id_and_settlement_claim_flow():
     active_market_ids = set()  # Market no longer active -> triggers settlement
     current_prices = {"BTCUSDT": 84050.0}  # Below 84100 -> DOWN wins!
     
-    pnl, settled = client.settle_expired_positions(active_market_ids, current_prices)
+    pnl, settled = asyncio.run(client.settle_expired_positions(active_market_ids, current_prices))
     assert len(settled) == 1
     assert settled[0]["won"] is True
     assert settled[0]["token_id"] == token_id

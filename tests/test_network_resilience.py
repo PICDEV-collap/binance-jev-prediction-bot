@@ -161,7 +161,7 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
                 spot_price=84000.0,
             )
             # Simulate round ending where spot is exactly equal to strike (84000.0)
-            pnl, events = client.settle_expired_positions(
+            pnl, events = await client.settle_expired_positions(
                 active_market_ids={"NEW_ROUND"},
                 current_prices={"BTCUSDT": 84000.0}
             )
