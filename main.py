@@ -205,6 +205,7 @@ class TradingBotCoordinator:
         self.ws_listener = BinanceWSListener(
             stream_url=settings.binance_prediction_ws_url,
             on_market_event=self.on_market_tick,
+            event_filter=self._should_evaluate_market,
             ping_interval=20,
             ping_timeout=10,
             enable_mock_stream=use_mock_stream,
@@ -217,6 +218,22 @@ class TradingBotCoordinator:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._background_tasks: Set[asyncio.Task] = set()
         self._eval_in_progress: Set[str] = set()
+        self._last_closed_pos_count: int = -1
+        self._last_closed_pos_head_id: Optional[str] = None
+
+    def _should_evaluate_market(self, market: MarketContext) -> bool:
+        """Fast non-allocating predicate to reject unselected symbols/timeframes before task spawning."""
+        if self.bot_status != "RUNNING" or self.is_paused:
+            return False
+        if not self.binance_client.paper_trading:
+            supported_syms = self.binance_client.get_supported_prediction_symbols()
+            if market.symbol.upper() not in supported_syms:
+                return False
+        if self.target_symbol != "ALL" and market.symbol.upper() != self.target_symbol.upper():
+            return False
+        if self.target_timeframe != "ALL" and market.timeframe.lower() != self.target_timeframe.lower():
+            return False
+        return True
 
     def _spawn_task(self, coro, name: Optional[str] = None) -> Optional[asyncio.Task]:
         """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
@@ -363,15 +380,23 @@ class TradingBotCoordinator:
                 if self.ws_clients:
                     status = self.get_system_status()
                     open_pos = self.binance_client.get_positions()
-                    closed_pos = self.binance_client.get_closed_positions()
-                    msg = {
+                    msg: Dict[str, Any] = {
                         "type": "HEARTBEAT",
                         "system_status": status,
                         "active_markets": markets,
                         "open_positions": open_pos,
-                        "closed_positions": closed_pos,
-                        "positions": open_pos,
                     }
+                    # Only include heavy closed_positions history if it changed or every 30s
+                    closed_pos = self.binance_client.get_closed_positions()
+                    current_head_id = closed_pos[0].get("position_id") if closed_pos else None
+                    if (
+                        len(closed_pos) != self._last_closed_pos_count
+                        or current_head_id != self._last_closed_pos_head_id
+                        or (heartbeat_ticks % 30 == 0)
+                    ):
+                        msg["closed_positions"] = closed_pos
+                        self._last_closed_pos_count = len(closed_pos)
+                        self._last_closed_pos_head_id = current_head_id
                     disconnected: List[WebSocket] = []
                     for client in list(self.ws_clients):
                         try:

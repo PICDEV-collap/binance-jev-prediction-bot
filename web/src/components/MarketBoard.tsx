@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { 
   Timer, 
   TrendingUp, 
@@ -40,7 +40,7 @@ const ASSETS: { label: string; value: string }[] = [
   { label: 'XRP', value: 'XRP' },
 ];
 
-export const MarketBoard: React.FC<MarketBoardProps> = ({
+const MarketBoardComponent: React.FC<MarketBoardProps> = ({
   markets,
   selectedMarketId,
   onSelectMarket,
@@ -52,13 +52,15 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
   const [selectedTf, setSelectedTf] = useState<TimeFrameType>('all');
   const [selectedAsset, setSelectedAsset] = useState<string>('all');
 
-  // Filter markets by timeframe and asset
-  const filteredMarkets = markets.filter((m) => {
-    const cleanSym = m.symbol.replace('USDT', '');
-    const tfMatch = selectedTf === 'all' || m.timeframe === selectedTf || m.market_id.includes(`-${selectedTf.toUpperCase()}-`);
-    const assetMatch = selectedAsset === 'all' || cleanSym === selectedAsset;
-    return tfMatch && assetMatch;
-  });
+  // Filter markets by timeframe and asset (memoized to avoid re-calculating on every tick)
+  const filteredMarkets = useMemo(() => {
+    return markets.filter((m) => {
+      const cleanSym = m.symbol.replace('USDT', '');
+      const tfMatch = selectedTf === 'all' || m.timeframe === selectedTf || m.market_id.includes(`-${selectedTf.toUpperCase()}-`);
+      const assetMatch = selectedAsset === 'all' || cleanSym === selectedAsset;
+      return tfMatch && assetMatch;
+    });
+  }, [markets, selectedTf, selectedAsset]);
 
   return (
     <div className="glass-panel rounded-2xl p-5 border border-slate-800/80">
@@ -342,3 +344,5 @@ export const MarketBoard: React.FC<MarketBoardProps> = ({
     </div>
   );
 };
+
+export const MarketBoard = React.memo(MarketBoardComponent);

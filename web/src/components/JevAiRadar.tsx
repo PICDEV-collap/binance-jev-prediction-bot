@@ -22,7 +22,7 @@ interface JevAiRadarProps {
   confidenceThreshold: number;
 }
 
-export const JevAiRadar: React.FC<JevAiRadarProps> = ({
+const JevAiRadarComponent: React.FC<JevAiRadarProps> = ({
   latestRecord,
   confidenceThreshold,
 }) => {
@@ -354,3 +354,5 @@ export const JevAiRadar: React.FC<JevAiRadarProps> = ({
     </div>
   );
 };
+
+export const JevAiRadar = React.memo(JevAiRadarComponent);

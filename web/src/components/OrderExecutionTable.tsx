@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { 
   Receipt, 
   Layers,
@@ -30,7 +30,7 @@ interface OrderExecutionTableProps {
 type MainTab = 'OPEN_POSITIONS' | 'CLOSED_POSITIONS' | 'ORDER_LOG';
 type OrderFilter = 'ALL' | 'FILLED' | 'SIMULATED' | 'REJECTED';
 
-export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({ 
+const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({ 
   orders = [], 
   openPositions = [], 
   closedPositions = [],
@@ -40,19 +40,28 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
   const [orderFilter, setOrderFilter] = useState<OrderFilter>('ALL');
   const [isClaiming, setIsClaiming] = useState(false);
 
-  // Filtered Orders
-  const filteredOrders = orders.filter((order) => {
-    if (orderFilter === 'ALL') return true;
-    return order.status === orderFilter;
-  });
+  // Filtered Orders (memoized to avoid re-filtering 50+ items every second)
+  const filteredOrders = useMemo(() => {
+    return orders.filter((order) => {
+      if (orderFilter === 'ALL') return true;
+      return order.status === orderFilter;
+    });
+  }, [orders, orderFilter]);
 
-  // Calculate Net Unrealized PnL for Open Positions
-  const totalUnrealizedPnL = openPositions.reduce((acc, p) => acc + (p.unrealized_pnl || 0), 0);
+  // Calculate Net Unrealized PnL for Open Positions (memoized)
+  const totalUnrealizedPnL = useMemo(() => {
+    return openPositions.reduce((acc, p) => acc + (p.unrealized_pnl || 0), 0);
+  }, [openPositions]);
 
-  // Calculate Total Realized PnL & Win Rate for Closed Positions
-  const totalRealizedPnL = closedPositions.reduce((acc, p) => acc + (p.realized_pnl || 0), 0);
-  const winCount = closedPositions.filter((p) => p.result === 'WIN' || p.result === 'TAKE_PROFIT' || (p.realized_pnl && p.realized_pnl > 0)).length;
-  const winRate = closedPositions.length > 0 ? (winCount / closedPositions.length) * 100 : 0;
+  // Calculate Total Realized PnL & Win Rate for Closed Positions (memoized)
+  const { totalRealizedPnL, winCount, winRate } = useMemo(() => {
+    const totalPnl = closedPositions.reduce((acc, p) => acc + (p.realized_pnl || 0), 0);
+    const wins = closedPositions.filter(
+      (p) => p.result === 'WIN' || p.result === 'TAKE_PROFIT' || (p.realized_pnl && p.realized_pnl > 0)
+    ).length;
+    const rate = closedPositions.length > 0 ? (wins / closedPositions.length) * 100 : 0;
+    return { totalRealizedPnL: totalPnl, winCount: wins, winRate: rate };
+  }, [closedPositions]);
 
   return (
     <div className="glass-panel rounded-2xl p-5 border border-slate-800/80 shadow-2xl">
@@ -692,3 +701,5 @@ export const OrderExecutionTable: React.FC<OrderExecutionTableProps> = ({
     </div>
   );
 };
+
+export const OrderExecutionTable = React.memo(OrderExecutionTableComponent);

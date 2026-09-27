@@ -17,7 +17,7 @@ interface MetricsBarProps {
   openPositions?: PositionItem[];
 }
 
-export const MetricsBar: React.FC<MetricsBarProps> = ({ status, openPositions = [] }) => {
+const MetricsBarComponent: React.FC<MetricsBarProps> = ({ status, openPositions = [] }) => {
   // Live Position & Margin Analytics
   const livePositionsCount = openPositions.length > 0 
     ? openPositions.length 
@@ -219,3 +219,5 @@ export const MetricsBar: React.FC<MetricsBarProps> = ({ status, openPositions = 
     </div>
   );
 };
+
+export const MetricsBar = React.memo(MetricsBarComponent);

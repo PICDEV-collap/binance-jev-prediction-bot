@@ -62,6 +62,7 @@ class BinanceWSListener:
         self,
         stream_url: str = SPOT_COMBINED_STREAM_URL,
         on_market_event: Optional[MarketEventCallback] = None,
+        event_filter: Optional[Callable[[MarketContext], bool]] = None,
         ping_interval: int = 20,
         ping_timeout: int = 10,
         enable_mock_stream: bool = False,
@@ -75,6 +76,7 @@ class BinanceWSListener:
             self._fallback_stream_url = SPOT_COMBINED_STREAM_URL
 
         self.on_market_event = on_market_event
+        self.event_filter = event_filter
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.enable_mock_stream = enable_mock_stream
@@ -329,6 +331,8 @@ class BinanceWSListener:
 
                     # Non-blocking distribution to trading core
                     if self.on_market_event:
+                        if self.event_filter and not self.event_filter(market_context):
+                            continue
                         self._events_dispatched += 1
                         self._spawn_task(self._safe_dispatch_event(market_context))
         except Exception as err:
@@ -415,6 +419,15 @@ class BinanceWSListener:
         clean_symbol = symbol.replace("USDT", "")
         results: List[MarketContext] = []
 
+        # Ultra-low latency quantitative metrics: Compute symbol-level features once per tick
+        base_features = self.candle_aggregator.compute_base_features(
+            symbol=symbol,
+            spot_price=mark_price,
+            bid_qty=bid_qty,
+            ask_qty=ask_qty,
+            btc_momentum_pct=self._btc_momentum,
+        )
+
         for tf, round_period in TIMEFRAMES:
             round_idx = int(now // round_period)
             round_id = f"{symbol}-{tf.upper()}-R{round_idx}"
@@ -449,15 +462,12 @@ class BinanceWSListener:
 
             question = f"{clean_symbol} Up or Down {tf}"
 
-            # Calculate ultra-low latency quantitative metrics (< 0.5ms)
-            metrics = self.candle_aggregator.compute_all_metrics(
-                symbol=symbol,
+            # Calculate timeframe/round specific metrics (~0.01ms)
+            metrics = self.candle_aggregator.compute_round_metrics(
+                base_features=base_features,
                 spot_price=mark_price,
                 strike_price=strike,
                 time_left_seconds=time_left,
-                bid_qty=bid_qty,
-                ask_qty=ask_qty,
-                btc_momentum_pct=self._btc_momentum,
             )
 
             results.append(

@@ -342,18 +342,17 @@ class RollingCandleAggregator:
             candles.append(curr)
         return candles
 
-    def compute_all_metrics(
+    def compute_base_features(
         self,
         symbol: str,
         spot_price: float,
-        strike_price: float,
-        time_left_seconds: int,
         bid_qty: float = 0.0,
         ask_qty: float = 0.0,
         btc_momentum_pct: float = 0.0,
     ) -> Dict[str, Any]:
         """
-        Compute full quantitative feature suite for a symbol in under 1 millisecond.
+        Compute symbol-level quantitative features (candles, ATR, RSI, EMA, OBI, momentum).
+        Can be computed once per tick and reused across multiple timeframes.
         """
         c1m = self.get_1m_candles(symbol)
         c5m = self.get_5m_candles(symbol)
@@ -365,9 +364,6 @@ class RollingCandleAggregator:
         atr_1m = compute_atr(c1m, period=14)
         if atr_1m <= 0.0001:
             atr_1m = max(0.01, spot_price * 0.0008)
-
-        # Distance-to-Volatility Ratio (DVR)
-        dvr = compute_dvr(spot_price, strike_price, atr_1m, time_left_seconds)
 
         # RSI 1m & 5m
         rsi_1m = compute_rsi(closes_1m, period=14) if len(closes_1m) >= 5 else 50.0
@@ -382,19 +378,10 @@ class RollingCandleAggregator:
         # Order Book Imbalance (OBI)
         obi = compute_order_book_imbalance(bid_qty, ask_qty)
 
-        # Price diff
-        price_diff = round(spot_price - strike_price, 4)
-
-        # Expiry Danger Zone
-        expiry_danger = check_expiry_danger(time_left_seconds, price_diff, atr_1m)
-
         # Market Momentum (recent 5m)
         momentum_pct = 0.0
         if len(closes_1m) >= 5 and closes_1m[-5] > 0:
             momentum_pct = round(((spot_price - closes_1m[-5]) / closes_1m[-5]) * 100.0, 3)
-
-        # Market Regime
-        regime = classify_market_regime(ema_trend, rsi_5m, dvr, momentum_pct)
 
         # BTC correlation direction
         btc_dir = "FLAT"
@@ -405,15 +392,78 @@ class RollingCandleAggregator:
 
         return {
             "atr_1m": atr_1m,
-            "dvr_ratio": dvr,
             "rsi_1m": rsi_1m,
             "rsi_5m": rsi_5m,
             "ema_trend": ema_trend,
             "order_book_imbalance": obi,
-            "market_regime": regime,
-            "expiry_danger_flag": expiry_danger,
+            "momentum_pct": momentum_pct,
             "btc_correlation_dir": btc_dir,
             "ema_9": round(ema_9, 2),
             "ema_21": round(ema_21, 2),
             "ema_50": round(ema_50, 2),
         }
+
+    def compute_round_metrics(
+        self,
+        base_features: Dict[str, Any],
+        spot_price: float,
+        strike_price: float,
+        time_left_seconds: int,
+    ) -> Dict[str, Any]:
+        """
+        Combine base symbol features with timeframe-specific strike and expiry metrics.
+        Ultra-fast arithmetic only (~0.01ms).
+        """
+        atr_1m = base_features["atr_1m"]
+        dvr = compute_dvr(spot_price, strike_price, atr_1m, time_left_seconds)
+        price_diff = round(spot_price - strike_price, 4)
+        expiry_danger = check_expiry_danger(time_left_seconds, price_diff, atr_1m)
+        regime = classify_market_regime(
+            base_features["ema_trend"],
+            base_features["rsi_5m"],
+            dvr,
+            base_features["momentum_pct"],
+        )
+
+        return {
+            "atr_1m": atr_1m,
+            "dvr_ratio": dvr,
+            "rsi_1m": base_features["rsi_1m"],
+            "rsi_5m": base_features["rsi_5m"],
+            "ema_trend": base_features["ema_trend"],
+            "order_book_imbalance": base_features["order_book_imbalance"],
+            "market_regime": regime,
+            "expiry_danger_flag": expiry_danger,
+            "btc_correlation_dir": base_features["btc_correlation_dir"],
+            "ema_9": base_features["ema_9"],
+            "ema_21": base_features["ema_21"],
+            "ema_50": base_features["ema_50"],
+        }
+
+    def compute_all_metrics(
+        self,
+        symbol: str,
+        spot_price: float,
+        strike_price: float,
+        time_left_seconds: int,
+        bid_qty: float = 0.0,
+        ask_qty: float = 0.0,
+        btc_momentum_pct: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Compute full quantitative feature suite for a symbol in under 1 millisecond.
+        """
+        base = self.compute_base_features(
+            symbol=symbol,
+            spot_price=spot_price,
+            bid_qty=bid_qty,
+            ask_qty=ask_qty,
+            btc_momentum_pct=btc_momentum_pct,
+        )
+        return self.compute_round_metrics(
+            base_features=base,
+            spot_price=spot_price,
+            strike_price=strike_price,
+            time_left_seconds=time_left_seconds,
+        )
+

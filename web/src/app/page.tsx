@@ -349,17 +349,34 @@ export default function DashboardPage() {
               }
             }
             if (message.open_positions) {
-              setOpenPositions(message.open_positions);
+              setOpenPositions((prev) => {
+                if (prev.length === 0 && message.open_positions.length === 0) return prev;
+                return message.open_positions;
+              });
             } else if (message.positions) {
-              setOpenPositions(message.positions);
+              setOpenPositions((prev) => {
+                if (prev.length === 0 && message.positions.length === 0) return prev;
+                return message.positions;
+              });
             }
             if (message.closed_positions) {
-              setClosedPositions(message.closed_positions);
+              setClosedPositions((prev) => {
+                if (
+                  prev.length === message.closed_positions.length &&
+                  prev.length > 0 &&
+                  prev[0]?.position_id === message.closed_positions[0]?.position_id &&
+                  prev[0]?.realized_pnl === message.closed_positions[0]?.realized_pnl
+                ) {
+                  return prev;
+                }
+                return message.closed_positions;
+              });
             }
             if (message.active_markets?.length > 0) {
               setMarkets(message.active_markets);
               setSelectedMarketId((curr) => {
-                if (curr && !message.active_markets.some((m: MarketItem) => m.market_id === curr)) {
+                if (!curr) return message.active_markets[0].market_id;
+                if (!message.active_markets.some((m: MarketItem) => m.market_id === curr)) {
                   const currSym = curr.split('-')[0];
                   const sameSym = message.active_markets.find((m: MarketItem) => m.symbol === currSym);
                   return sameSym ? sameSym.market_id : message.active_markets[0].market_id;
@@ -377,12 +394,28 @@ export default function DashboardPage() {
             }
             if (message.active_markets?.length > 0) setMarkets(message.active_markets);
             if (message.open_positions) {
-              setOpenPositions(message.open_positions);
+              setOpenPositions((prev) => {
+                if (prev.length === 0 && message.open_positions.length === 0) return prev;
+                return message.open_positions;
+              });
             } else if (message.positions) {
-              setOpenPositions(message.positions);
+              setOpenPositions((prev) => {
+                if (prev.length === 0 && message.positions.length === 0) return prev;
+                return message.positions;
+              });
             }
             if (message.closed_positions) {
-              setClosedPositions(message.closed_positions);
+              setClosedPositions((prev) => {
+                if (
+                  prev.length === message.closed_positions.length &&
+                  prev.length > 0 &&
+                  prev[0]?.position_id === message.closed_positions[0]?.position_id &&
+                  prev[0]?.realized_pnl === message.closed_positions[0]?.realized_pnl
+                ) {
+                  return prev;
+                }
+                return message.closed_positions;
+              });
             }
 
             setRecords((prev) => {
