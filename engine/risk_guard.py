@@ -243,6 +243,62 @@ class RiskGuard:
             self.consecutive_wins = 0
             self.last_settled_result = "LOSS"
 
+    def reconcile_from_closed_positions(self, closed_positions: List[Any]) -> None:
+        """
+        Reconcile Martingale recovery steps, streak counters, and accumulated losses
+        directly from authoritative closed positions (e.g. from Binance SAPI).
+        Ensures RiskGuard accurately reflects reality.
+        """
+        if not closed_positions:
+            return
+
+        by_symbol: Dict[str, List[Any]] = {}
+        for p in closed_positions:
+            sym = p.get("symbol", "") if isinstance(p, dict) else getattr(p, "symbol", "")
+            if sym:
+                by_symbol.setdefault(sym.upper(), []).append(p)
+
+        for sym, p_list in by_symbol.items():
+            # Sort chronologically ascending by settled_at
+            def _get_settled_at(item: Any) -> float:
+                return float(item.get("settled_at", 0) if isinstance(item, dict) else getattr(item, "settled_at", 0))
+
+            p_list.sort(key=_get_settled_at)
+
+            accum_loss = 0.0
+            consec_losses = 0
+            consec_wins = 0
+            last_res = "LOSS"
+
+            # Traverse backwards from the latest closed trade
+            for p in reversed(p_list):
+                res = str(p.get("result", "") if isinstance(p, dict) else getattr(p, "result", "")).upper()
+                pnl = float(p.get("realized_pnl", 0.0) if isinstance(p, dict) else getattr(p, "realized_pnl", 0.0))
+                if res in ("WIN", "TAKE_PROFIT"):
+                    if consec_losses == 0:
+                        consec_wins += 1
+                        last_res = "WIN"
+                    break
+                else:
+                    consec_losses += 1
+                    accum_loss += abs(pnl)
+                    last_res = "LOSS"
+
+            step = min(self.martingale_max_steps, consec_losses) if self.martingale_enabled else 0
+            self._symbol_martingale_step[sym] = step
+            self._symbol_accumulated_loss[sym] = round(accum_loss, 2)
+            self._symbol_consecutive_losses[sym] = consec_losses
+            self._symbol_consecutive_wins[sym] = consec_wins
+            self._symbol_last_result[sym] = last_res
+            logger.info(
+                f"[RISK GUARD RECONCILE] {sym}: Martingale Step: {step} | "
+                f"Accumulated Loss: -${accum_loss:.2f} | Consecutive Losses: {consec_losses} | Last Result: {last_res}"
+            )
+
+        if self._symbol_martingale_step:
+            self.current_martingale_step = max(self._symbol_martingale_step.values(), default=0)
+            self.last_settled_result = "LOSS" if self.current_martingale_step > 0 else "WIN"
+
     def validate_and_size_order(
         self,
         decision: JevEvaluationResult,

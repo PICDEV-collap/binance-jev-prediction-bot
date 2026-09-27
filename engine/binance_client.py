@@ -435,6 +435,140 @@ class BinanceClient:
             logger.error(f"Exception requesting prediction quote: {e}")
             return None
 
+    async def _verify_live_order_status(self, order_id: str, timeout_seconds: float = 3.5) -> Dict[str, Any]:
+        """
+        Poll Binance Prediction order history to verify if an order was actually FILLED or FAILED.
+        Prevents ghost positions when FOK orders fail during matching engine processing.
+        """
+        if self.paper_trading or not order_id:
+            return {"status": "FILLED", "order": None}
+
+        deadline = time.time() + timeout_seconds
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+
+        while time.time() < deadline:
+            params = {
+                "recvWindow": self.recv_window,
+                "timestamp": self._get_timestamp(),
+                "limit": 10,
+            }
+            if self._wallet_address:
+                params["walletAddress"] = self._wallet_address
+            if self._wallet_id:
+                params["walletId"] = self._wallet_id
+            sq = self._sign_payload(params)
+            url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/order/history?{sq}"
+            try:
+                assert self._session is not None
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
+                    if resp.status == 200:
+                        d = await resp.json()
+                        for o in d.get("orders", []):
+                            if str(o.get("orderId")) == str(order_id):
+                                st = str(o.get("status", "")).upper()
+                                if st in ("FILLED", "FAILED", "CANCELED", "REJECTED"):
+                                    return {"status": st, "order": o, "errorMessage": o.get("errorMessage", "")}
+            except Exception as e:
+                logger.debug(f"Exception verifying order status {order_id}: {e}")
+            await asyncio.sleep(0.5)
+
+        return {"status": "UNKNOWN", "order": None}
+
+    async def _process_dispatched_live_order(
+        self,
+        order_id: str,
+        client_order_id: str,
+        market_id: str,
+        symbol: str,
+        side: str,
+        clean_side: str,
+        contracts: int,
+        target_price: float,
+        strike_price: float,
+        spot_price: float,
+        timeframe: str,
+        martingale_step: int,
+        stage: str,
+        token_id: Optional[str],
+        elapsed_ms: float,
+    ) -> OrderResult:
+        """
+        Verify order execution status on Binance matching engine before opening position.
+        Prevents ghost positions when Binance FOK orders are killed/rejected.
+        """
+        order_check = await self._verify_live_order_status(order_id)
+        check_status = order_check.get("status")
+
+        if check_status in ("FAILED", "CANCELED", "REJECTED"):
+            err_msg = order_check.get("errorMessage") or "Order failed on Binance matching engine"
+            logger.error(
+                f"[BINANCE LIVE REJECTION] Order {order_id} ({client_order_id}) on {market_id} FAILED: {err_msg}. "
+                f"Position NOT opened."
+            )
+            result = OrderResult(
+                order_id=order_id,
+                client_order_id=client_order_id,
+                market_id=market_id,
+                symbol=symbol,
+                side=side,
+                contracts=contracts,
+                price=target_price,
+                status="REJECTED",
+                latency_ms=round(elapsed_ms, 2),
+                martingale_step=martingale_step,
+                stage=stage,
+                error_message=err_msg,
+            )
+            self._total_orders_dispatched += 1
+            self._order_history.append(result)
+            self._in_flight_orders.pop(client_order_id, None)
+            return result
+
+        o_data = order_check.get("order") or {}
+        filled_shares = float(o_data.get("filledShareQty", 0.0) or contracts)
+        actual_price = float(o_data.get("price", 0.0) or target_price)
+
+        result = OrderResult(
+            order_id=order_id,
+            client_order_id=client_order_id,
+            market_id=market_id,
+            symbol=symbol,
+            side=side,
+            contracts=int(filled_shares) if filled_shares >= 1 else contracts,
+            price=actual_price,
+            status="FILLED",
+            latency_ms=round(elapsed_ms, 2),
+            martingale_step=martingale_step,
+            stage=stage,
+        )
+        self._total_orders_dispatched += 1
+        self._total_fills += 1
+        self._order_history.append(result)
+        self._in_flight_orders.pop(client_order_id, None)
+
+        pos_id = f"POS_LIVE_{market_id}_{clean_side}_{uuid.uuid4().hex[:4]}"
+        self._live_positions[pos_id] = PositionInfo(
+            position_id=pos_id,
+            market_id=market_id,
+            symbol=symbol,
+            side=clean_side,
+            contracts=int(filled_shares) if filled_shares >= 1 else contracts,
+            entry_price=actual_price,
+            current_price=spot_price if spot_price > 0 else actual_price,
+            target_price=strike_price if strike_price > 0 else actual_price,
+            timeframe=timeframe,
+            unrealized_pnl=0.0,
+            martingale_step=martingale_step,
+            stage=stage,
+            token_id=str(token_id or ""),
+        )
+
+        logger.info(
+            f"LIVE PREDICTION ORDER CONFIRMED FILLED: {side} {result.contracts}x on {market_id} [{stage}] "
+            f"@ {actual_price:.3f} (Latency: {elapsed_ms:.1f}ms)"
+        )
+        return result
+
     async def place_prediction_order(
         self,
         market_id: str,
@@ -716,46 +850,23 @@ class BinanceClient:
 
                 if resp.status in (200, 201):
                     order_id = str(response_data.get("orderId", client_order_id))
-                    result = OrderResult(
+                    return await self._process_dispatched_live_order(
                         order_id=order_id,
                         client_order_id=client_order_id,
                         market_id=market_id,
                         symbol=symbol,
                         side=side,
+                        clean_side=clean_side,
                         contracts=contracts,
-                        price=target_price,
-                        status="FILLED",
-                        latency_ms=round(elapsed_ms, 2),
-                        martingale_step=martingale_step,
-                        stage=stage,
-                    )
-                    self._total_orders_dispatched += 1
-                    self._total_fills += 1
-                    self._order_history.append(result)
-                    self._in_flight_orders.pop(client_order_id, None)
-
-                    pos_id = f"POS_LIVE_{market_id}_{clean_side}_{uuid.uuid4().hex[:4]}"
-                    self._live_positions[pos_id] = PositionInfo(
-                        position_id=pos_id,
-                        market_id=market_id,
-                        symbol=symbol,
-                        side=clean_side,
-                        contracts=contracts,
-                        entry_price=target_price,
-                        current_price=spot_price if spot_price > 0 else target_price,
-                        target_price=strike_price if strike_price > 0 else target_price,
+                        target_price=target_price,
+                        strike_price=strike_price,
+                        spot_price=spot_price,
                         timeframe=timeframe,
-                        unrealized_pnl=0.0,
                         martingale_step=martingale_step,
                         stage=stage,
-                        token_id=str(token_id or ""),
+                        token_id=token_id,
+                        elapsed_ms=elapsed_ms,
                     )
-
-                    logger.info(
-                        f"LIVE PREDICTION ORDER EXECUTED: {side} {contracts}x on {market_id} [{stage}] "
-                        f"@ {target_price:.3f} (Latency: {elapsed_ms:.1f}ms)"
-                    )
-                    return result
                 else:
                     err_code = response_data.get("code")
                     err_msg = response_data.get("msg", f"HTTP {resp.status}")
@@ -773,45 +884,23 @@ class BinanceClient:
                                 r_data = {}
                             if r_resp.status in (200, 201):
                                 order_id = str(r_data.get("orderId", client_order_id))
-                                result = OrderResult(
+                                return await self._process_dispatched_live_order(
                                     order_id=order_id,
                                     client_order_id=client_order_id,
                                     market_id=market_id,
                                     symbol=symbol,
                                     side=side,
+                                    clean_side=clean_side,
                                     contracts=contracts,
-                                    price=target_price,
-                                    status="FILLED",
-                                    latency_ms=round(r_elapsed, 2),
-                                    martingale_step=martingale_step,
-                                    stage=stage,
-                                )
-                                self._total_orders_dispatched += 1
-                                self._total_fills += 1
-                                self._order_history.append(result)
-                                self._in_flight_orders.pop(client_order_id, None)
-
-                                pos_id = f"POS_LIVE_{market_id}_{clean_side}_{uuid.uuid4().hex[:4]}"
-                                self._live_positions[pos_id] = PositionInfo(
-                                    position_id=pos_id,
-                                    market_id=market_id,
-                                    symbol=symbol,
-                                    side=clean_side,
-                                    contracts=contracts,
-                                    entry_price=target_price,
-                                    current_price=spot_price if spot_price > 0 else target_price,
-                                    target_price=strike_price if strike_price > 0 else target_price,
+                                    target_price=target_price,
+                                    strike_price=strike_price,
+                                    spot_price=spot_price,
                                     timeframe=timeframe,
-                                    unrealized_pnl=0.0,
                                     martingale_step=martingale_step,
                                     stage=stage,
-                                    token_id=str(token_id or ""),
+                                    token_id=token_id,
+                                    elapsed_ms=r_elapsed,
                                 )
-                                logger.info(
-                                    f"LIVE PREDICTION ORDER EXECUTED (TIME RESYNC RETRY): {side} {contracts}x on {market_id} [{stage}] "
-                                    f"@ {target_price:.3f} (Latency: {r_elapsed:.1f}ms)"
-                                )
-                                return result
                             else:
                                 response_data = r_data
                                 err_code = response_data.get("code")
@@ -1010,8 +1099,9 @@ class BinanceClient:
         # 1. LIVE TRADING: Settle using Binance official ended positions
         # ------------------------------------------------------------------
         if not self.paper_trading and (self.api_key and self.api_secret) and self._live_positions:
-            ended_list = await self.fetch_ended_prediction_positions(limit=30)
+            ended_list = await self.fetch_ended_prediction_positions(limit=50)
             ended_by_token = {str(p.get("tokenId", "")).strip(): p for p in ended_list if p.get("tokenId")}
+            ended_by_market = {str(p.get("marketId", "")).strip(): p for p in ended_list if p.get("marketId")}
 
             for pid, pos in list(self._live_positions.items()):
                 max_duration = tf_durations.get(pos.timeframe.lower(), 900)
@@ -1019,6 +1109,11 @@ class BinanceClient:
                 is_round_expired = (pos.market_id not in active_market_ids) or (elapsed >= (max_duration + 5))
 
                 p_ended = ended_by_token.get(pos.token_id) if pos.token_id else None
+                if not p_ended and pos.market_id:
+                    for mid_key, p_item in ended_by_market.items():
+                        if mid_key and mid_key in pos.market_id:
+                            p_ended = p_item
+                            break
 
                 if p_ended:
                     # Binance has officially settled this contract!
@@ -1082,54 +1177,19 @@ class BinanceClient:
                     )
                 elif is_round_expired:
                     # Round time has elapsed, but Binance backend is finalizing the Chainlink oracle settlement
-                    if elapsed < (max_duration + 90):
+                    if elapsed < (max_duration + 300):
                         logger.info(
                             f"[SETTLEMENT PENDING] Live contract {pos.symbol} {pos.side} on {pos.market_id} "
                             f"expired ({elapsed:.0f}s elapsed). Waiting for official Binance backend settlement publication..."
                         )
                     else:
-                        # Fallback after 90s grace period if Binance API has delay
-                        self._live_positions.pop(pid, None)
-                        spot = current_prices.get(pos.symbol, pos.current_price if pos.current_price > 0 else pos.entry_price)
-                        cost = pos.contracts * pos.entry_price
-                        won = (spot > pos.target_price) if pos.side in ("UP", "BUY_YES") else (spot < pos.target_price)
-                        payout = pos.contracts * 1.00 if won else 0.0
-                        realized_pnl = payout - cost
-                        total_net_pnl += realized_pnl
-                        outcome_label = "WIN" if won else "LOSS"
-
-                        closed_item = ClosedPositionInfo(
-                            position_id=pos.position_id,
-                            market_id=pos.market_id,
-                            symbol=pos.symbol,
-                            side=pos.side,
-                            contracts=pos.contracts,
-                            entry_price=pos.entry_price,
-                            target_price=pos.target_price,
-                            settlement_price=spot,
-                            timeframe=pos.timeframe,
-                            result=outcome_label,
-                            realized_pnl=round(realized_pnl, 2),
-                            martingale_step=pos.martingale_step,
-                            stage=pos.stage,
-                            token_id=pos.token_id,
-                            is_claimed=False,
-                            entry_time=pos.entry_time,
-                            settled_at=now,
+                        # Clean up if not found after 5+ mins past expiry without guessing
+                        # In live trading, NEVER fabricate WIN/LOSS or fake PnL! Discard cleanly.
+                        logger.warning(
+                            f"[SETTLEMENT TIMEOUT] Live contract {pos.symbol} on {pos.market_id} has no Binance settlement "
+                            f"after {elapsed:.0f}s. Discarding unconfirmed/voided position without fabricating PnL."
                         )
-                        self._closed_positions.append(closed_item)
-                        settled_events.append({
-                            "position_id": pos.position_id,
-                            "symbol": pos.symbol,
-                            "market_id": pos.market_id,
-                            "side": pos.side,
-                            "won": won,
-                            "pnl": round(realized_pnl, 2),
-                            "martingale_step": pos.martingale_step,
-                            "stage": pos.stage,
-                            "mode": "LIVE",
-                            "token_id": pos.token_id,
-                        })
+                        self._live_positions.pop(pid, None)
 
         # ------------------------------------------------------------------
         # 2. PAPER TRADING: Simulated deterministic settlement
@@ -1681,6 +1741,15 @@ class BinanceClient:
             async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    summary = data.get("summary", {})
+                    if summary and summary.get("walletBalance"):
+                        try:
+                            wb = float(summary.get("walletBalance", 0.0))
+                            if wb > 0:
+                                self._live_balance_usdt = round(wb, 2)
+                                self._live_available_usdt = round(wb, 2)
+                        except (ValueError, TypeError):
+                            pass
                     return data.get("positions", [])
                 else:
                     data = {}
@@ -1697,6 +1766,15 @@ class BinanceClient:
                         async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=6.0)) as r_resp:
                             if r_resp.status == 200:
                                 r_data = await r_resp.json()
+                                summary = r_data.get("summary", {})
+                                if summary and summary.get("walletBalance"):
+                                    try:
+                                        wb = float(summary.get("walletBalance", 0.0))
+                                        if wb > 0:
+                                            self._live_balance_usdt = round(wb, 2)
+                                            self._live_available_usdt = round(wb, 2)
+                                    except (ValueError, TypeError):
+                                        pass
                                 return r_data.get("positions", [])
                     logger.debug(f"Failed to fetch ended positions: HTTP {resp.status} - {data}")
         except Exception as e:
@@ -1706,7 +1784,8 @@ class BinanceClient:
     async def sync_historical_closed_positions(self, limit: int = 50) -> int:
         """
         Reconcile and synchronize historical settled positions directly from Binance SAPI.
-        Corrects any past misreported outcomes and populates missing history.
+        Strictly reconstructs closed positions from Binance official ended positions
+        to purge any ghost positions and guarantee 100% data parity.
         """
         if self.paper_trading or not (self.api_key and self.api_secret):
             return 0
@@ -1720,6 +1799,7 @@ class BinanceClient:
             if p.token_id:
                 existing_by_token[p.token_id] = p
 
+        synced_closed: List[ClosedPositionInfo] = []
         updated_count = 0
         now = time.time()
 
@@ -1745,28 +1825,19 @@ class BinanceClient:
             tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
             tf = tf_match.group(1).lower() if tf_match else "5m"
 
-            if token_id in existing_by_token:
-                # Reconcile existing record
-                pos = existing_by_token[token_id]
-                changed = False
-                if pos.result != outcome_label:
-                    logger.info(f"[RECONCILIATION] Correcting position {pos.position_id} result: {pos.result} -> {outcome_label} (Binance Official)")
-                    pos.result = outcome_label
-                    changed = True
-                if abs(pos.realized_pnl - pnl) > 0.01:
-                    pos.realized_pnl = round(pnl, 2)
-                    changed = True
-                if pos.is_claimed != is_claimed:
-                    pos.is_claimed = is_claimed
-                    changed = True
-                if changed:
-                    updated_count += 1
+            orig = existing_by_token.get(token_id)
+            if orig is not None:
+                orig.result = outcome_label
+                orig.realized_pnl = round(pnl, 2)
+                orig.is_claimed = is_claimed
+                orig.settled_at = settled_at
+                synced_closed.append(orig)
             else:
-                # Historical closed position from Binance that was not in bot memory
                 pos_id = f"POS_BINANCE_{item.get('positionId', uuid.uuid4().hex[:6])}"
+                m_id = f"{sym}-{tf.upper()}-B{item.get('marketId', '')}"
                 closed_item = ClosedPositionInfo(
                     position_id=pos_id,
-                    market_id=f"{sym}-{tf.upper()}-B{item.get('marketId', '')}",
+                    market_id=m_id,
                     symbol=sym,
                     side=side,
                     contracts=int(shares) if shares >= 1 else 1,
@@ -1777,23 +1848,21 @@ class BinanceClient:
                     result=outcome_label,
                     realized_pnl=round(pnl, 2),
                     martingale_step=0,
-                    stage="Binance Sync",
+                    stage="Binance Official",
                     token_id=token_id,
                     is_claimed=is_claimed,
                     entry_time=settled_at - 300,
                     settled_at=settled_at,
                 )
-                self._closed_positions.append(closed_item)
-                existing_by_token[token_id] = closed_item
-                updated_count += 1
+                synced_closed.append(closed_item)
+            updated_count += 1
 
-        # Keep _closed_positions sorted by settled_at ascending (latest at end)
-        self._closed_positions.sort(key=lambda x: getattr(x, "settled_at", 0))
-        if len(self._closed_positions) > 100:
-            self._closed_positions = self._closed_positions[-100:]
+        # Replace _closed_positions with the official synced list (sorted oldest to newest)
+        synced_closed.sort(key=lambda x: getattr(x, "settled_at", 0))
+        self._closed_positions = synced_closed[-100:]
 
         if updated_count > 0:
-            logger.info(f"[BINANCE HISTORY SYNC] Successfully reconciled {updated_count} closed position(s) from Binance API.")
+            logger.info(f"[BINANCE HISTORY SYNC] Successfully reconciled {len(self._closed_positions)} closed position(s) from Binance API.")
         return updated_count
 
     async def redeem_prediction_tokens(self, token_ids: List[str]) -> Dict[str, Any]:

@@ -284,6 +284,7 @@ class TradingBotCoordinator:
                 self.ws_listener.update_official_strike_prices(start_prices)
             # Reconcile closed positions history directly with Binance API
             await self.binance_client.sync_historical_closed_positions()
+            self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
             logger.info(f"[CATALOG SYNC] Live Binance Prediction Pairs discovered: {', '.join(sorted(supported))}")
         except Exception as e:
             logger.debug(f"Catalog init notice: {e}")
@@ -332,7 +333,10 @@ class TradingBotCoordinator:
 
                 # Periodic reconciliation of historical settled positions directly from Binance every 60s
                 if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
-                    self._spawn_task(self.binance_client.sync_historical_closed_positions(), name="periodic_sync_closed")
+                    async def _reconcile_and_sync():
+                        await self.binance_client.sync_historical_closed_positions()
+                        self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
+                    self._spawn_task(_reconcile_and_sync(), name="periodic_sync_closed")
 
                 # Periodic refresh of official Price to Beat (startPrice) from Binance topics every 15s
                 if heartbeat_ticks % 15 == 0:
@@ -370,6 +374,8 @@ class TradingBotCoordinator:
                             pnl=rec["pnl"],
                             symbol=rec["symbol"]
                         )
+                    if settled_records:
+                        self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
                     if any(rec.get("won") for rec in settled_records):
                         self._spawn_task(self.binance_client.claim_all_won_positions(), name="settle_claim")
                     # Prune expired rounds from memory sets
