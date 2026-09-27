@@ -106,6 +106,31 @@ class LoginRequest(BaseModel):
     password: str
 
 
+def persist_env_key(key: str, value: str) -> None:
+    """Helper to update or append a key=value pair to the local .env file."""
+    env_path = Path(".env")
+    lines: List[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    updated = False
+    new_lines: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k, _ = stripped.split("=", 1)
+            if k.strip() == key:
+                new_lines.append(f"{key}={value}")
+                updated = True
+                continue
+        new_lines.append(line)
+
+    if not updated:
+        new_lines.append(f"{key}={value}")
+
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
 class TradingBotCoordinator:
     """
     Master coordinator orchestrating the event-driven trading lifecycle.
@@ -115,8 +140,13 @@ class TradingBotCoordinator:
 
     def __init__(self) -> None:
         self.start_time = time.time()
-        self.is_paused: bool = False
-        self.bot_status: str = "RUNNING"  # "RUNNING" or "STOPPED"
+        persisted_status = getattr(settings, "bot_status", "RUNNING").upper()
+        self.bot_status: str = "STOPPED" if persisted_status == "STOPPED" else "RUNNING"
+        self.is_paused: bool = (self.bot_status == "STOPPED")
+        if self.is_paused:
+            logger.info("[BOOT] Restored bot state from disk: STOPPED (trading paused)")
+        else:
+            logger.info("[BOOT] Restored bot state from disk: RUNNING (trading active)")
 
         # User-selected Target Pair & Timeframe for AI evaluation
         self.target_symbol: str = getattr(settings, "target_symbol", "BTCUSDT").upper()
@@ -188,9 +218,15 @@ class TradingBotCoordinator:
         self._background_tasks: Set[asyncio.Task] = set()
         self._eval_in_progress: Set[str] = set()
 
-    def _spawn_task(self, coro, name: Optional[str] = None) -> asyncio.Task:
+    def _spawn_task(self, coro, name: Optional[str] = None) -> Optional[asyncio.Task]:
         """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
-        task = asyncio.create_task(coro, name=name)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            if hasattr(coro, "close"):
+                coro.close()
+            return None
+        task = loop.create_task(coro, name=name)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
@@ -353,13 +389,23 @@ class TradingBotCoordinator:
         """Start or resume trading execution."""
         self.bot_status = "RUNNING"
         self.is_paused = False
+        try:
+            persist_env_key("BOT_STATUS", "RUNNING")
+        except Exception as e:
+            logger.warning(f"Failed to persist BOT_STATUS to .env: {e}")
         logger.info("[OPERATOR COMMAND] Bot status changed to: RUNNING")
+        self._spawn_task(self.broadcast_status(), name="broadcast_start")
 
     def stop_bot(self) -> None:
         """Halt or freeze trading execution."""
         self.bot_status = "STOPPED"
         self.is_paused = True
+        try:
+            persist_env_key("BOT_STATUS", "STOPPED")
+        except Exception as e:
+            logger.warning(f"Failed to persist BOT_STATUS to .env: {e}")
         logger.info("[OPERATOR COMMAND] Bot status changed to: STOPPED")
+        self._spawn_task(self.broadcast_status(), name="broadcast_stop")
 
     async def on_market_tick(self, market: MarketContext) -> None:
         """
@@ -560,6 +606,29 @@ class TradingBotCoordinator:
 
         for dead_client in disconnected:
             self.ws_clients.discard(dead_client)
+
+    async def broadcast_status(self) -> None:
+        """Broadcast updated system status immediately to all connected dashboard websockets."""
+        if not self.ws_clients:
+            return
+        open_pos = self.binance_client.get_positions()
+        closed_pos = self.binance_client.get_closed_positions()
+        msg = {
+            "type": "HEARTBEAT",
+            "system_status": self.get_system_status(),
+            "active_markets": self.ws_listener.get_active_markets(),
+            "open_positions": open_pos,
+            "closed_positions": closed_pos,
+            "positions": open_pos,
+        }
+        disconnected: List[WebSocket] = []
+        for client in list(self.ws_clients):
+            try:
+                await asyncio.wait_for(client.send_json(msg), timeout=0.8)
+            except Exception:
+                disconnected.append(client)
+        for dead in disconnected:
+            self.ws_clients.discard(dead)
 
     def get_system_status(self) -> Dict[str, Any]:
         """Aggregate system telemetry for dashboard inspection."""
@@ -933,7 +1002,12 @@ async def toggle_pause() -> Dict[str, Any]:
     """Pause or resume trading execution."""
     bot.is_paused = not bot.is_paused
     bot.bot_status = "STOPPED" if bot.is_paused else "RUNNING"
+    try:
+        persist_env_key("BOT_STATUS", bot.bot_status)
+    except Exception as e:
+        logger.warning(f"Failed to persist BOT_STATUS to .env: {e}")
     logger.info(f"Trading bot state changed: {bot.bot_status} (paused={bot.is_paused})")
+    bot._spawn_task(bot.broadcast_status(), name="broadcast_toggle_pause")
     return {"bot_status": bot.bot_status, "is_paused": bot.is_paused}
 
 

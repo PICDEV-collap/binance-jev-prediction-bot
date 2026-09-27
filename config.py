@@ -181,6 +181,7 @@ class Settings(BaseSettings):
     )
 
     # --- Operating Modes ---
+    bot_status: str = Field(default="RUNNING", alias="BOT_STATUS")
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
     enable_mock_stream: bool = Field(default=False, alias="ENABLE_MOCK_STREAM")
 

@@ -10,6 +10,7 @@ Multi-tier risk validation firewall:
 
 from __future__ import annotations
 import logging
+import math
 import time
 from typing import Dict, Optional, Tuple, Any, Set
 from pydantic import BaseModel, Field
@@ -652,11 +653,13 @@ class RiskGuard:
                 target_gain = accum_loss + base_target_profit
 
                 # 5. Exact mathematical contracts needed
-                import math
                 pnl_contracts = math.ceil(target_gain / profit_per_contract)
 
                 # 6. Upper Multiplier Ceiling (Shield 2): Capped by multiplier power
-                multiplier_cap_contracts = int(self.default_order_contracts * multiplier)
+                multiplier_cap_contracts = max(
+                    self.default_order_contracts + step,
+                    math.ceil(self.default_order_contracts * multiplier)
+                )
 
                 # 7. Apply smart bounds: at least default_order_contracts, capped by multiplier ceiling
                 hybrid_contracts = max(self.default_order_contracts, min(pnl_contracts, multiplier_cap_contracts))
@@ -671,12 +674,15 @@ class RiskGuard:
                     f"Exposure: ${contracts * target_price:.2f} | Max Budget: ${self.max_position_size_usdt:.2f}"
                 )
             else:
-                raw_contracts = int(self.default_order_contracts * multiplier)
+                raw_contracts = max(
+                    self.default_order_contracts + step,
+                    math.ceil(self.default_order_contracts * multiplier)
+                )
                 contracts = max(1, min(raw_contracts, max_possible_contracts))
                 approval_reason = f"Martingale Fixed Recovery Order ({stage_label}) approved for {sym}"
                 logger.info(
                     f"[MARTINGALE FIXED SIZING] {sym} {stage_label}: {contracts} contracts "
-                    f"({multiplier:.0f}x base {self.default_order_contracts}) | Exposure: ${contracts * target_price:.2f}"
+                    f"({multiplier:.1f}x base {self.default_order_contracts}) | Exposure: ${contracts * target_price:.2f}"
                 )
         else:
             # Base sizing: Scaled dynamically with confidence excess over threshold

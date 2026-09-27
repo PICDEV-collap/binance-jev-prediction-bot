@@ -302,7 +302,12 @@ export default function DashboardPage() {
           const message = JSON.parse(event.data);
 
           if (message.type === 'INITIAL_SNAPSHOT') {
-            if (message.system_status) setStatus(message.system_status);
+            if (message.system_status) {
+              setStatus(message.system_status);
+              if (message.system_status.bot_status) {
+                setBotStatus(message.system_status.bot_status === 'STOPPED' ? 'STOPPED' : 'RUNNING');
+              }
+            }
             if (message.active_markets?.length > 0) {
               setMarkets(message.active_markets);
               setSelectedMarketId((curr) => {
@@ -337,7 +342,12 @@ export default function DashboardPage() {
               setClosedPositions(message.closed_positions);
             }
           } else if (message.type === 'HEARTBEAT') {
-            if (message.system_status) setStatus(message.system_status);
+            if (message.system_status) {
+              setStatus(message.system_status);
+              if (message.system_status.bot_status) {
+                setBotStatus(message.system_status.bot_status === 'STOPPED' ? 'STOPPED' : 'RUNNING');
+              }
+            }
             if (message.open_positions) {
               setOpenPositions(message.open_positions);
             } else if (message.positions) {
@@ -359,7 +369,12 @@ export default function DashboardPage() {
             }
           } else if (message.type === 'MARKET_EVALUATION') {
             const newRecord: TelemetryRecord = message.data;
-            if (message.system_status) setStatus(message.system_status);
+            if (message.system_status) {
+              setStatus(message.system_status);
+              if (message.system_status.bot_status) {
+                setBotStatus(message.system_status.bot_status === 'STOPPED' ? 'STOPPED' : 'RUNNING');
+              }
+            }
             if (message.active_markets?.length > 0) setMarkets(message.active_markets);
             if (message.open_positions) {
               setOpenPositions(message.open_positions);
@@ -521,26 +536,40 @@ export default function DashboardPage() {
   // Bot Start & Stop Actions
   const handleStartBot = async () => {
     try {
+      if (typeof window !== 'undefined' && window.location.protocol === 'https:' && serverUrl.startsWith('http://')) {
+        console.warn('Mixed Content Warning: Calling HTTP API from HTTPS origin may be blocked by browser.');
+      }
       const res = await fetch(getApiUrl('/api/bot/start'), { method: 'POST' });
       if (res.ok) {
-        setBotStatus('RUNNING');
+        const data = await res.json().catch(() => null);
+        const newStatus = data?.bot_status === 'STOPPED' ? 'STOPPED' : 'RUNNING';
+        setBotStatus(newStatus);
+        setStatus((prev) => (prev ? { ...prev, is_paused: false, bot_status: newStatus } : null));
+      } else {
+        console.error('Failed to start bot: Server responded with HTTP', res.status);
       }
-    } catch {
-      setBotStatus('RUNNING');
+    } catch (err) {
+      console.error('Network error starting bot:', err);
     }
-    setStatus((prev) => (prev ? { ...prev, is_paused: false } : null));
   };
 
   const handleStopBot = async () => {
     try {
+      if (typeof window !== 'undefined' && window.location.protocol === 'https:' && serverUrl.startsWith('http://')) {
+        console.warn('Mixed Content Warning: Calling HTTP API from HTTPS origin may be blocked by browser.');
+      }
       const res = await fetch(getApiUrl('/api/bot/stop'), { method: 'POST' });
       if (res.ok) {
-        setBotStatus('STOPPED');
+        const data = await res.json().catch(() => null);
+        const newStatus = data?.bot_status === 'RUNNING' ? 'RUNNING' : 'STOPPED';
+        setBotStatus(newStatus);
+        setStatus((prev) => (prev ? { ...prev, is_paused: true, bot_status: newStatus } : null));
+      } else {
+        console.error('Failed to stop bot: Server responded with HTTP', res.status);
       }
-    } catch {
-      setBotStatus('STOPPED');
+    } catch (err) {
+      console.error('Network error stopping bot:', err);
     }
-    setStatus((prev) => (prev ? { ...prev, is_paused: true } : null));
   };
 
   const handleResetCircuitBreaker = async () => {
