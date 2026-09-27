@@ -42,6 +42,7 @@ interface RiskControlsModalProps {
   currentEvalIntervalSeconds?: number;
   currentPaperTrading: boolean;
   currentMartingaleEnabled?: boolean;
+  currentMartingaleMode?: "SMART_HYBRID" | "FIXED_MULTIPLIER";
   currentMartingaleMultiplier?: number;
   currentMartingaleMaxSteps?: number;
   currentMartingaleConfidenceStep?: number;
@@ -69,6 +70,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentEvalIntervalSeconds = 60,
   currentPaperTrading,
   currentMartingaleEnabled = true,
+  currentMartingaleMode = 'SMART_HYBRID',
   currentMartingaleMultiplier = 2.0,
   currentMartingaleMaxSteps = 4,
   currentMartingaleConfidenceStep = 0.04,
@@ -87,6 +89,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   const [minOddsFloor, setMinOddsFloor] = useState<number>(currentMinOddsFloor);
   const [slippageBps, setSlippageBps] = useState<number>(currentSlippageBps);
   const [martingaleEnabled, setMartingaleEnabled] = useState<boolean>(currentMartingaleEnabled);
+  const [martingaleMode, setMartingaleMode] = useState<"SMART_HYBRID" | "FIXED_MULTIPLIER">(currentMartingaleMode || 'SMART_HYBRID');
   const [martingaleMultiplier, setMartingaleMultiplier] = useState<number>(currentMartingaleMultiplier);
   const [martingaleMaxSteps, setMartingaleMaxSteps] = useState<number>(currentMartingaleMaxSteps);
   const [martingaleConfidenceStep, setMartingaleConfidenceStep] = useState<number>(currentMartingaleConfidenceStep * 100);
@@ -132,6 +135,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     setMinOddsFloor(currentMinOddsFloor);
     setSlippageBps(currentSlippageBps);
     setMartingaleEnabled(currentMartingaleEnabled);
+    setMartingaleMode(currentMartingaleMode || 'SMART_HYBRID');
     setMartingaleMultiplier(currentMartingaleMultiplier);
     setMartingaleMaxSteps(currentMartingaleMaxSteps);
     setMartingaleConfidenceStep(currentMartingaleConfidenceStep * 100);
@@ -162,6 +166,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         if (c.min_odds_floor !== undefined) setMinOddsFloor(c.min_odds_floor);
         if (c.slippage_bps !== undefined) setSlippageBps(c.slippage_bps);
         if (c.martingale_enabled !== undefined) setMartingaleEnabled(c.martingale_enabled);
+        if (c.martingale_mode !== undefined) setMartingaleMode(c.martingale_mode);
         if (c.martingale_multiplier !== undefined) setMartingaleMultiplier(c.martingale_multiplier);
         if (c.martingale_max_steps !== undefined) setMartingaleMaxSteps(c.martingale_max_steps);
         if (c.martingale_confidence_step !== undefined) setMartingaleConfidenceStep(c.martingale_confidence_step * 100);
@@ -196,6 +201,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     currentMinOddsFloor,
     currentSlippageBps,
     currentMartingaleEnabled,
+    currentMartingaleMode,
     currentMartingaleMultiplier,
     currentMartingaleMaxSteps,
     currentMartingaleConfidenceStep,
@@ -226,6 +232,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         min_odds_floor: minOddsFloor,
         slippage_bps: slippageBps,
         martingale_enabled: martingaleEnabled,
+        martingale_mode: martingaleMode,
         martingale_multiplier: martingaleMultiplier,
         martingale_max_steps: martingaleMaxSteps,
         martingale_confidence_step: martingaleConfidenceStep / 100,
@@ -549,6 +556,52 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
 
                 {martingaleEnabled && (
                   <div className="space-y-3.5 pt-1">
+                    {/* Martingale Mode Selection */}
+                    <div className="space-y-1.5 pb-1">
+                      <div className="flex items-center justify-between text-xs font-mono">
+                        <span className="text-slate-300 font-medium">รูปแบบการแก้ไม้ (Martingale Strategy Mode)</span>
+                        <span className="px-2 py-0.5 rounded text-[11px] font-bold border border-cyan-500/40 bg-cyan-500/20 text-cyan-300">
+                          {martingaleMode === 'SMART_HYBRID' ? 'Smart Hybrid (PnL)' : 'Fixed Multiplier'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setMartingaleMode('SMART_HYBRID')}
+                          className={`p-2 rounded-lg border text-left transition-all ${
+                            martingaleMode === 'SMART_HYBRID'
+                              ? 'border-cyan-400 bg-cyan-950/50 text-white shadow-sm shadow-cyan-500/20'
+                              : 'border-slate-800 bg-slate-900/60 text-slate-400 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 text-xs font-bold font-mono">
+                            <span className="inline-block w-2 h-2 rounded-full bg-cyan-400" />
+                            Smart Hybrid (PnL)
+                          </div>
+                          <p className="text-[10px] text-slate-400 mt-1 leading-tight">
+                            คำนวณสัญญาตามยอดขาดทุนสะสมจริง + ราคา Odds เพื่อคืนทุน 100% ประหยัดทุนสูงสุด (แนะนำ 🏆)
+                          </p>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setMartingaleMode('FIXED_MULTIPLIER')}
+                          className={`p-2 rounded-lg border text-left transition-all ${
+                            martingaleMode === 'FIXED_MULTIPLIER'
+                              ? 'border-amber-400 bg-amber-950/50 text-white shadow-sm shadow-amber-500/20'
+                              : 'border-slate-800 bg-slate-900/60 text-slate-400 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5 text-xs font-bold font-mono">
+                            <span className="inline-block w-2 h-2 rounded-full bg-amber-400" />
+                            Fixed Multiplier
+                          </div>
+                          <p className="text-[10px] text-slate-400 mt-1 leading-tight">
+                            คูณสัญญาตามขั้นคงที่ ({martingaleMultiplier.toFixed(1)}x, 4x, 8x) โดยไม่สนใจเงินที่เสียจริง
+                          </p>
+                        </button>
+                      </div>
+                    </div>
+
                     {/* Multiplier Slider */}
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between text-xs font-mono">

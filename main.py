@@ -55,6 +55,7 @@ class ConfigUpdateRequest(BaseModel):
     confidence_threshold: float | None = None
     default_order_contracts: int | None = None
     martingale_enabled: bool | None = None
+    martingale_mode: str | None = None
     martingale_multiplier: float | None = None
     martingale_max_steps: int | None = None
     martingale_confidence_step: float | None = None
@@ -161,6 +162,7 @@ class TradingBotCoordinator:
             min_time_left_seconds=getattr(settings, "min_time_left_seconds", 180),
             max_time_left_seconds=getattr(settings, "max_time_left_seconds", 850),
             martingale_enabled=getattr(settings, "martingale_enabled", True),
+            martingale_mode=getattr(settings, "martingale_mode", "SMART_HYBRID"),
             martingale_multiplier=getattr(settings, "martingale_multiplier", 2.0),
             martingale_max_steps=getattr(settings, "martingale_max_steps", 4),
             martingale_confidence_step=getattr(settings, "martingale_confidence_step", 0.04),
@@ -203,7 +205,8 @@ class TradingBotCoordinator:
         logger.info(f"Cooldown Period: {self.risk_guard.cooldown_seconds}s")
         logger.info(
             f"Martingale Recovery: {'ENABLED' if self.risk_guard.martingale_enabled else 'DISABLED'} "
-            f"(Multiplier: {self.risk_guard.martingale_multiplier}x, Max Steps: {self.risk_guard.martingale_max_steps}, "
+            f"(Mode: {self.risk_guard.martingale_mode}, Multiplier: {self.risk_guard.martingale_multiplier}x, "
+            f"Max Steps: {self.risk_guard.martingale_max_steps}, "
             f"Confidence Step: +{self.risk_guard.martingale_confidence_step*100:.0f}%, "
             f"Max Conviction: {self.risk_guard.martingale_max_confidence*100:.0f}%)"
         )
@@ -684,6 +687,8 @@ def _persist_config_to_env(req: ConfigUpdateRequest) -> None:
         mapping["MAX_CONCURRENT_POSITIONS"] = str(req.max_concurrent_positions)
     if req.martingale_enabled is not None:
         mapping["MARTINGALE_ENABLED"] = "true" if req.martingale_enabled else "false"
+    if req.martingale_mode is not None:
+        mapping["MARTINGALE_MODE"] = req.martingale_mode.upper()
     if req.martingale_multiplier is not None:
         mapping["MARTINGALE_MULTIPLIER"] = f"{req.martingale_multiplier:.1f}"
     if req.martingale_max_steps is not None:
@@ -766,6 +771,7 @@ async def get_config_endpoint() -> Dict[str, Any]:
             "confidence_threshold": rg.confidence_threshold,
             "default_order_contracts": rg.default_order_contracts,
             "martingale_enabled": rg.martingale_enabled,
+            "martingale_mode": getattr(rg, "martingale_mode", "SMART_HYBRID"),
             "martingale_multiplier": rg.martingale_multiplier,
             "martingale_max_steps": rg.martingale_max_steps,
             "martingale_confidence_step": rg.martingale_confidence_step,
@@ -808,6 +814,7 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         max_daily_loss_usdt=req.max_daily_loss_usdt,
         max_concurrent_positions=req.max_concurrent_positions,
         martingale_enabled=req.martingale_enabled,
+        martingale_mode=req.martingale_mode,
         martingale_multiplier=req.martingale_multiplier,
         martingale_max_steps=req.martingale_max_steps,
         martingale_confidence_step=req.martingale_confidence_step,

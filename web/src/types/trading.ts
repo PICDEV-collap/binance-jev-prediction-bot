@@ -150,6 +150,7 @@ export interface SystemStatus {
     rejections_breakdown: Record<string, number>;
     martingale?: {
       enabled: boolean;
+      mode?: "SMART_HYBRID" | "FIXED_MULTIPLIER" | string;
       current_step: number;
       max_steps: number;
       multiplier: number;
@@ -158,6 +159,7 @@ export interface SystemStatus {
       max_confidence: number;
       effective_threshold: number;
       stage_label: string;
+      accumulated_losses?: Record<string, number>;
       consecutive_losses: number;
       consecutive_wins: number;
       last_settled_result: string;
@@ -235,6 +237,7 @@ export interface BotConfig {
   confidence_threshold: number;
   default_order_contracts: number;
   martingale_enabled: boolean;
+  martingale_mode?: "SMART_HYBRID" | "FIXED_MULTIPLIER";
   martingale_multiplier: number;
   martingale_max_steps: number;
   martingale_confidence_step: number;

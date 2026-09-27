@@ -806,6 +806,7 @@ export default function DashboardPage() {
         currentEvalIntervalSeconds={status?.target_market?.eval_interval_seconds ?? 60}
         currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
         currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}
+        currentMartingaleMode={(status?.risk_guard?.martingale?.mode as "SMART_HYBRID" | "FIXED_MULTIPLIER") ?? 'SMART_HYBRID'}
         currentMartingaleMultiplier={status?.risk_guard?.martingale?.multiplier ?? 2.0}
         currentMartingaleMaxSteps={status?.risk_guard?.martingale?.max_steps ?? 4}
         currentMartingaleConfidenceStep={status?.risk_guard?.martingale?.confidence_step ?? 0.04}

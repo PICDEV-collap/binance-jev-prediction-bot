@@ -81,7 +81,8 @@ def test_live_settlement_reconciliation_loss():
         guard.record_settlement_result(won=event["won"], pnl=event["pnl"], symbol=event["symbol"])
         assert guard.consecutive_losses == 1
         assert guard.get_symbol_martingale_step("ETHUSDT") == 1
-        assert guard.get_stage_label("ETHUSDT") == "ไม้แก้ 1 (2x)"
+        assert "ไม้แก้ 1" in guard.get_stage_label("ETHUSDT")
+        assert guard.get_symbol_accumulated_loss("ETHUSDT") == 1.50
 
     asyncio.run(_run())
 

@@ -30,6 +30,8 @@ class RiskEvaluationResult(BaseModel):
     action: str
     target_price: float = 0.0
     martingale_step: int = 0
+    martingale_mode: str = "SMART_HYBRID"
+    accumulated_loss: float = 0.0
     stage_label: str = "ไม้ 1 (Base)"
     multiplier: float = 1.0
     effective_threshold: float = 0.80
@@ -56,6 +58,7 @@ class RiskGuard:
         min_time_left_seconds: int = 120,
         max_time_left_seconds: int = 850,
         martingale_enabled: bool = True,
+        martingale_mode: str = "SMART_HYBRID",
         martingale_multiplier: float = 2.0,
         martingale_max_steps: int = 4,
         martingale_confidence_step: float = 0.04,
@@ -75,6 +78,7 @@ class RiskGuard:
 
         # Martingale Recovery State
         self.martingale_enabled: bool = martingale_enabled
+        self.martingale_mode: str = martingale_mode.upper() if martingale_mode else "SMART_HYBRID"
         self.martingale_multiplier: float = martingale_multiplier
         self.martingale_max_steps: int = martingale_max_steps
         self.martingale_confidence_step: float = martingale_confidence_step
@@ -88,6 +92,7 @@ class RiskGuard:
 
         # Per-Symbol Martingale State (Asset-Specific Isolation)
         self._symbol_martingale_step: Dict[str, int] = {}
+        self._symbol_accumulated_loss: Dict[str, float] = {}
         self._symbol_consecutive_losses: Dict[str, int] = {}
         self._symbol_consecutive_wins: Dict[str, int] = {}
         self._symbol_last_result: Dict[str, str] = {}
@@ -153,20 +158,30 @@ class RiskGuard:
         step_boost = step * self.martingale_confidence_step
         return min(self.martingale_max_confidence, self.confidence_threshold + step_boost)
 
+    def get_symbol_accumulated_loss(self, symbol: Optional[str] = None) -> float:
+        """Get accumulated USD loss for active Martingale recovery cycle for a symbol."""
+        if not symbol:
+            return round(sum(self._symbol_accumulated_loss.values()), 4)
+        return round(self._symbol_accumulated_loss.get(symbol.upper(), 0.0), 4)
+
     def get_stage_label(self, symbol: Optional[str] = None) -> str:
         """Human-readable Martingale stage label."""
         step = self.get_symbol_martingale_step(symbol)
         if not self.martingale_enabled or step == 0:
             return "ไม้ 1 (Base)"
         mult = self.martingale_multiplier ** step
+        if self.martingale_mode == "SMART_HYBRID":
+            accum_loss = self.get_symbol_accumulated_loss(symbol)
+            if accum_loss > 0:
+                return f"ไม้แก้ {step} (PnL: -${accum_loss:.2f})"
         return f"ไม้แก้ {step} ({mult:.0f}x)"
 
     def record_settlement_result(self, won: bool, pnl: float, symbol: str = "") -> None:
         """
         Feedback from settled round.
         Tracks Martingale recovery step independently per symbol and updates global counters.
-        When LOSS: Advance Martingale recovery step, increase multiplier & raise AI conviction hurdle.
-        When WIN: Reset Martingale step to 0 (Base Round) and restore base AI hurdle!
+        When LOSS: Advance Martingale recovery step, accumulate USD loss, increase multiplier & raise AI conviction hurdle.
+        When WIN: Reset Martingale step to 0 (Base Round), reset accumulated USD loss to 0, and restore base AI hurdle!
         """
         clean_sym = symbol.upper() if symbol else ""
         self.record_pnl(pnl)
@@ -175,16 +190,18 @@ class RiskGuard:
             # Per-symbol state update
             if clean_sym:
                 old_sym_step = self._symbol_martingale_step.get(clean_sym, 0)
+                old_loss = self._symbol_accumulated_loss.get(clean_sym, 0.0)
                 if old_sym_step > 0:
                     self._symbol_recovery_cycles[clean_sym] = self._symbol_recovery_cycles.get(clean_sym, 0) + 1
                     logger.info(
                         f"🎉 [{clean_sym} MARTINGALE RECOVERY SUCCESS!] Won at Step {old_sym_step} "
-                        f"(PnL: +${pnl:.2f}). Total recoveries completed for {clean_sym}: "
+                        f"(PnL: +${pnl:.2f}, Recovered: ${old_loss:.2f}). Total recoveries completed for {clean_sym}: "
                         f"{self._symbol_recovery_cycles[clean_sym]}. RESETTING TO BASE ROUND (ไม้ 1)!"
                     )
                 else:
                     logger.info(f"✅ [{clean_sym} WIN] Base round won (+${pnl:.2f}). Starting fresh base round.")
                 self._symbol_martingale_step[clean_sym] = 0
+                self._symbol_accumulated_loss[clean_sym] = 0.0
                 self._symbol_consecutive_wins[clean_sym] = self._symbol_consecutive_wins.get(clean_sym, 0) + 1
                 self._symbol_consecutive_losses[clean_sym] = 0
                 self._symbol_last_result[clean_sym] = "WIN"
@@ -201,15 +218,20 @@ class RiskGuard:
             # Per-symbol state update
             if clean_sym:
                 old_sym_step = self._symbol_martingale_step.get(clean_sym, 0)
+                loss_amt = abs(pnl) if pnl < 0 else 0.0
+                current_loss = self._symbol_accumulated_loss.get(clean_sym, 0.0)
+                self._symbol_accumulated_loss[clean_sym] = round(current_loss + loss_amt, 4)
+
                 if self.martingale_enabled:
                     new_sym_step = min(self.martingale_max_steps, old_sym_step + 1)
                     self._symbol_martingale_step[clean_sym] = new_sym_step
                     new_sym_hurdle = self.get_effective_confidence_threshold(clean_sym)
                     mult = self.martingale_multiplier ** new_sym_step
                     logger.warning(
-                        f"⚠️ [{clean_sym} MARTINGALE LOSS ESCALATION] Round lost (-${abs(pnl):.2f}). "
+                        f"⚠️ [{clean_sym} MARTINGALE LOSS ESCALATION] Round lost (-${loss_amt:.2f} | "
+                        f"Cycle Loss Total: -${self._symbol_accumulated_loss[clean_sym]:.2f}). "
                         f"Advancing from Step {old_sym_step} -> Step {new_sym_step} (ไม้แก้ {new_sym_step}). "
-                        f"Next trade size for {clean_sym}: {mult:.0f}x | Next AI Hurdle: {new_sym_hurdle*100:.0f}%"
+                        f"Mode: {self.martingale_mode} | Next Multiplier Cap: {mult:.0f}x | Next AI Hurdle: {new_sym_hurdle*100:.0f}%"
                     )
                 self._symbol_consecutive_losses[clean_sym] = self._symbol_consecutive_losses.get(clean_sym, 0) + 1
                 self._symbol_consecutive_wins[clean_sym] = 0
@@ -615,13 +637,47 @@ class RiskGuard:
             )
 
         if self.martingale_enabled and step > 0:
-            raw_contracts = int(self.default_order_contracts * multiplier)
-            contracts = max(1, min(raw_contracts, max_possible_contracts))
-            approval_reason = f"Martingale Recovery Order ({stage_label}) approved for {sym}"
-            logger.info(
-                f"[MARTINGALE ORDER SIZING] {sym} {stage_label}: {contracts} contracts "
-                f"({multiplier:.0f}x base {self.default_order_contracts}) | Exposure: ${contracts * target_price:.2f}"
-            )
+            if self.martingale_mode == "SMART_HYBRID":
+                # Smart Hybrid PnL Recovery Sizing:
+                # 1. Profit per winning contract at entry target_price
+                profit_per_contract = max(0.01, 1.00 - target_price)
+
+                # 2. Accumulated loss to recover in current cycle
+                accum_loss = self.get_symbol_accumulated_loss(sym)
+
+                # 3. Base target profit from standard trade
+                base_target_profit = self.default_order_contracts * profit_per_contract
+
+                # 4. Total return required to break even on past losses + yield base profit
+                target_gain = accum_loss + base_target_profit
+
+                # 5. Exact mathematical contracts needed
+                import math
+                pnl_contracts = math.ceil(target_gain / profit_per_contract)
+
+                # 6. Upper Multiplier Ceiling (Shield 2): Capped by multiplier power
+                multiplier_cap_contracts = int(self.default_order_contracts * multiplier)
+
+                # 7. Apply smart bounds: at least default_order_contracts, capped by multiplier ceiling
+                hybrid_contracts = max(self.default_order_contracts, min(pnl_contracts, multiplier_cap_contracts))
+                contracts = max(1, min(hybrid_contracts, max_possible_contracts))
+                approval_reason = (
+                    f"Martingale Smart Hybrid Recovery ({stage_label}) approved for {sym}: "
+                    f"Targeting +${target_gain:.2f} to cover -${accum_loss:.2f} loss (Odds: {target_price:.3f})"
+                )
+                logger.info(
+                    f"[MARTINGALE SMART HYBRID SIZING] {sym} {stage_label}: {contracts} contracts "
+                    f"(PnL target: +${target_gain:.2f} covering -${accum_loss:.2f} loss | Cap: {multiplier_cap_contracts}) | "
+                    f"Exposure: ${contracts * target_price:.2f} | Max Budget: ${self.max_position_size_usdt:.2f}"
+                )
+            else:
+                raw_contracts = int(self.default_order_contracts * multiplier)
+                contracts = max(1, min(raw_contracts, max_possible_contracts))
+                approval_reason = f"Martingale Fixed Recovery Order ({stage_label}) approved for {sym}"
+                logger.info(
+                    f"[MARTINGALE FIXED SIZING] {sym} {stage_label}: {contracts} contracts "
+                    f"({multiplier:.0f}x base {self.default_order_contracts}) | Exposure: ${contracts * target_price:.2f}"
+                )
         else:
             # Base sizing: Scaled dynamically with confidence excess over threshold
             confidence_scaler = 1.0 + max(0.0, (decision.confidence - self.confidence_threshold) * 2.0)
@@ -651,6 +707,8 @@ class RiskGuard:
             action=decision.action,
             target_price=target_price,
             martingale_step=step,
+            martingale_mode=self.martingale_mode,
+            accumulated_loss=self.get_symbol_accumulated_loss(sym),
             stage_label=stage_label,
             multiplier=multiplier,
             effective_threshold=effective_threshold,
@@ -707,6 +765,7 @@ class RiskGuard:
         max_daily_loss_usdt: Optional[float] = None,
         max_concurrent_positions: Optional[int] = None,
         martingale_enabled: Optional[bool] = None,
+        martingale_mode: Optional[str] = None,
         martingale_multiplier: Optional[float] = None,
         martingale_max_steps: Optional[int] = None,
         martingale_confidence_step: Optional[float] = None,
@@ -742,6 +801,10 @@ class RiskGuard:
             self.max_time_left_seconds = max(60, max_time_left_seconds)
         if martingale_enabled is not None:
             self.martingale_enabled = bool(martingale_enabled)
+        if martingale_mode is not None:
+            clean_mode = str(martingale_mode).upper().strip()
+            if clean_mode in ("SMART_HYBRID", "FIXED_MULTIPLIER"):
+                self.martingale_mode = clean_mode
         if martingale_multiplier is not None:
             self.martingale_multiplier = max(1.1, min(5.0, martingale_multiplier))
         if martingale_max_steps is not None:
@@ -758,7 +821,7 @@ class RiskGuard:
             f"BaseContracts={self.default_order_contracts}, Size=${self.max_position_size_usdt:.1f}, "
             f"DailyLossLimit=${self.max_daily_loss_usdt:.1f}, MaxPos={self.max_concurrent_positions}, "
             f"Cooldown={self.cooldown_seconds}s, Martingale={self.martingale_enabled} "
-            f"(Mult={self.martingale_multiplier}x, MaxSteps={self.martingale_max_steps})"
+            f"(Mode={self.martingale_mode}, Mult={self.martingale_multiplier}x, MaxSteps={self.martingale_max_steps})"
         )
 
     def _record_rejection(self, reason_code: str) -> None:
@@ -800,6 +863,7 @@ class RiskGuard:
             "rejections_breakdown": self._rejection_counts,
             "martingale": {
                 "enabled": self.martingale_enabled,
+                "mode": self.martingale_mode,
                 "current_step": self.current_martingale_step,
                 "max_steps": self.martingale_max_steps,
                 "multiplier": self.martingale_multiplier,
@@ -808,6 +872,7 @@ class RiskGuard:
                 "max_confidence": self.martingale_max_confidence,
                 "effective_threshold": round(self.get_effective_confidence_threshold(), 3),
                 "stage_label": self.get_stage_label(),
+                "accumulated_losses": dict(self._symbol_accumulated_loss),
                 "consecutive_losses": self.consecutive_losses,
                 "consecutive_wins": self.consecutive_wins,
                 "last_settled_result": self.last_settled_result,

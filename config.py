@@ -154,6 +154,7 @@ class Settings(BaseSettings):
 
     # --- Martingale Recovery Engine Configuration ---
     martingale_enabled: bool = Field(default=True, alias="MARTINGALE_ENABLED")
+    martingale_mode: str = Field(default="SMART_HYBRID", alias="MARTINGALE_MODE")
     martingale_multiplier: float = Field(
         default=2.0,
         ge=1.0,
