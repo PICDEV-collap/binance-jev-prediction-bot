@@ -540,7 +540,7 @@ class BinanceClient:
         if self.paper_trading or not order_id:
             return {"status": "FILLED", "order": None}
 
-        deadline = time.time() + timeout_seconds
+        deadline = time.time() + max(timeout_seconds, 8.0)
         sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
 
         while time.time() < deadline:
@@ -557,7 +557,7 @@ class BinanceClient:
             url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/order/history?{sq}"
             try:
                 assert self._session is not None
-                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
                     if resp.status == 200:
                         d = await resp.json()
                         for o in d.get("orders", []):
@@ -567,7 +567,7 @@ class BinanceClient:
                                     return {"status": st, "order": o, "errorMessage": o.get("errorMessage", "")}
             except Exception as e:
                 logger.debug(f"Exception verifying order status {order_id}: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.6)
 
         return {"status": "UNKNOWN", "order": None}
 
@@ -597,7 +597,7 @@ class BinanceClient:
         check_status = order_check.get("status")
 
         if check_status in ("FAILED", "CANCELED", "REJECTED"):
-            err_msg = order_check.get("errorMessage") or "Order failed on Binance matching engine"
+            err_msg = order_check.get("errorMessage") or f"Order failed on Binance matching engine ({check_status})"
             logger.error(
                 f"[BINANCE LIVE REJECTION] Order {order_id} ({client_order_id}) on {market_id} FAILED: {err_msg}. "
                 f"Position NOT opened."
@@ -621,9 +621,49 @@ class BinanceClient:
             self._in_flight_orders.pop(client_order_id, None)
             return result
 
-        o_data = order_check.get("order") or {}
-        filled_shares = float(o_data.get("filledShareQty", 0.0) or contracts)
-        actual_price = float(o_data.get("price", 0.0) or target_price)
+        # Strict FILLED-only validation: If status is not explicitly FILLED, verify against ongoing positions
+        if check_status != "FILLED":
+            ongoing_positions, _, _ = await self.fetch_ongoing_prediction_positions(limit=10)
+            matched_ongoing = None
+            if token_id:
+                for op in ongoing_positions:
+                    if str(op.get("tokenId", "")).strip() == str(token_id).strip():
+                        matched_ongoing = op
+                        break
+
+            if not matched_ongoing:
+                err_msg = order_check.get("errorMessage") or f"Order {order_id} unconfirmed on Binance matching engine (status: {check_status})"
+                logger.error(
+                    f"[BINANCE UNCONFIRMED ORDER] Order {order_id} ({client_order_id}) on {market_id} was not confirmed as FILLED on Binance. "
+                    f"Position NOT opened. Ghost position prevented."
+                )
+                result = OrderResult(
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    market_id=market_id,
+                    symbol=symbol,
+                    side=side,
+                    contracts=contracts,
+                    price=target_price,
+                    status="REJECTED",
+                    latency_ms=round(elapsed_ms, 2),
+                    martingale_step=martingale_step,
+                    stage=stage,
+                    error_message=err_msg,
+                )
+                self._total_orders_dispatched += 1
+                self._order_history.append(result)
+                self._in_flight_orders.pop(client_order_id, None)
+                return result
+
+            # Confirmed present in Binance ongoing positions!
+            o_data = matched_ongoing
+            filled_shares = float(matched_ongoing.get("shares", 0.0) or contracts)
+            actual_price = float(matched_ongoing.get("avgPrice", 0.0) or target_price)
+        else:
+            o_data = order_check.get("order") or {}
+            filled_shares = float(o_data.get("filledShareQty", 0.0) or contracts)
+            actual_price = float(o_data.get("price", 0.0) or target_price)
 
         result = OrderResult(
             order_id=order_id,
@@ -1510,6 +1550,14 @@ class BinanceClient:
                             slippage_bps=self.slippage_bps,
                         )
                         quote_id = quote_data.get("quoteId") if quote_data else None
+                        if not quote_id and quote_data and quote_data.get("code") == -9000 and "exceeded your available shares" in str(quote_data.get("msg", "")).lower():
+                            logger.warning(
+                                f"[GHOST POSITION PURGED] 0 shares available on Binance for {pos.symbol} {pos.market_id}. "
+                                f"Purging phantom position from active desk."
+                            )
+                            target_positions.pop(pid, None)
+                            continue
+
                         if quote_id:
                             query_params = {
                                 "accountType": "SPOT",
@@ -2338,30 +2386,31 @@ class BinanceClient:
             return 0
 
         ended_list = await self.fetch_ended_prediction_positions(limit=limit)
-        if not ended_list:
-            return 0
+        if ended_list is None:
+            ended_list = []
 
-        # Concurrently resolve official Oracle strike and settlement prices for unique markets not yet in cache
-        missing_markets = {}
-        for item in ended_list:
-            mid = item.get("marketId")
-            tid = item.get("marketTopicId")
-            if mid and tid:
-                try:
-                    mid_int = int(mid)
-                    tid_int = int(tid)
-                    if mid_int not in self._market_oracle_cache:
-                        missing_markets[mid_int] = tid_int
-                except (ValueError, TypeError):
-                    pass
+        if ended_list:
+            # Concurrently resolve official Oracle strike and settlement prices for unique markets not yet in cache
+            missing_markets = {}
+            for item in ended_list:
+                mid = item.get("marketId")
+                tid = item.get("marketTopicId")
+                if mid and tid:
+                    try:
+                        mid_int = int(mid)
+                        tid_int = int(tid)
+                        if mid_int not in self._market_oracle_cache:
+                            missing_markets[mid_int] = tid_int
+                    except (ValueError, TypeError):
+                        pass
 
-        if missing_markets:
-            sem = asyncio.Semaphore(5)
-            async def _fetch_with_sem(t_id: int, m_id: int):
-                async with sem:
-                    await self.fetch_market_oracle_prices(t_id, m_id)
+            if missing_markets:
+                sem = asyncio.Semaphore(5)
+                async def _fetch_with_sem(t_id: int, m_id: int):
+                    async with sem:
+                        await self.fetch_market_oracle_prices(t_id, m_id)
 
-            await asyncio.gather(*[_fetch_with_sem(tid, mid) for mid, tid in missing_markets.items()], return_exceptions=True)
+                await asyncio.gather(*[_fetch_with_sem(tid, mid) for mid, tid in missing_markets.items()], return_exceptions=True)
 
         existing_by_token: Dict[str, ClosedPositionInfo] = {}
         for p in self._closed_positions:
@@ -2449,6 +2498,30 @@ class BinanceClient:
             elif any(em and em in pos.market_id for em in ended_mids if em):
                 logger.info(f"[BINANCE HISTORY SYNC] Purging settled position {pid} ({pos.symbol} {pos.market_id}) from active positions (matched marketId in ended_list).")
                 self._live_positions.pop(pid, None)
+
+        # Cross-reconcile live active positions against Binance ONGOING list
+        try:
+            ongoing_positions, _, _ = await self.fetch_ongoing_prediction_positions(limit=20)
+            ongoing_tokens = {str(item.get("tokenId", "")).strip() for item in ongoing_positions if item.get("tokenId")}
+            ongoing_mids = {str(item.get("marketId", "")).strip() for item in ongoing_positions if item.get("marketId")}
+            now_ts = time.time()
+
+            for pid, pos in list(self._live_positions.items()):
+                # Give position 25 seconds grace period after entry before declaring ghost
+                if (now_ts - getattr(pos, "entry_time", 0)) > 25.0:
+                    token_matched = bool(pos.token_id and pos.token_id in ongoing_tokens)
+                    mid_matched = any(om and om in pos.market_id for om in ongoing_mids if om)
+                    ended_token_matched = bool(pos.token_id and pos.token_id in ended_tokens)
+                    ended_mid_matched = any(em and em in pos.market_id for em in ended_mids if em)
+
+                    if not (token_matched or mid_matched or ended_token_matched or ended_mid_matched):
+                        logger.warning(
+                            f"[GHOST POSITION PURGED] Position {pid} ({pos.symbol} {pos.market_id}) "
+                            f"not found in Binance ongoing or ended positions after 25s. Purging phantom position."
+                        )
+                        self._live_positions.pop(pid, None)
+        except Exception as e:
+            logger.debug(f"Exception cross-reconciling ongoing positions: {e}")
 
         if updated_count > 0:
             logger.info(f"[BINANCE HISTORY SYNC] Successfully reconciled {len(self._closed_positions)} closed position(s) from Binance API.")
