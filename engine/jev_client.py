@@ -46,6 +46,10 @@ class MarketContext(BaseModel):
     # --- Enriched Quantitative & Volatility Features ---
     atr_1m: float = 0.0
     dvr_ratio: float = 0.0             # Distance-to-Volatility Ratio in sigma
+    strike_diff_bps: float = 0.0       # Normalized distance to strike in basis points ((spot - strike) / strike * 10000)
+    strike_diff_pct: float = 0.0       # Normalized distance to strike in percentage ((spot - strike) / strike * 100)
+    recent_candles_summary: str = "[]" # Sequence of recent 3 completed 1m candles (e.g. [+0.08% Bull, -0.02% Bear])
+    macro_trend_15m: str = "NEUTRAL"   # Macro trend direction on higher timeframe (BULLISH, BEARISH, NEUTRAL)
     rsi_1m: float = 50.0               # 1m Fast RSI
     rsi_5m: float = 50.0               # 5m Trend RSI
     ema_trend: str = "NEUTRAL_CHOP"    # STRONG_UPTREND, STRONG_DOWNTREND, etc.
@@ -173,7 +177,12 @@ class JevClient:
         if "systemone" in self.endpoint:
             clean_sym = context.symbol.replace("USDT", "")
             diff_str = f"{context.price_diff:+,.2f}" if context.price_diff else f"{context.underlying_price - context.target_price:+,.2f}"
-            dvr_line = f"Volatility / Distance: ATR(1m) = ${context.atr_1m:.2f} | DVR (Distance-to-Volatility): {context.dvr_ratio:+.2f}sigma\n" if context.atr_1m > 0 else ""
+            bps_str = f"{context.strike_diff_bps:+.1f} bps ({context.strike_diff_pct:+.2f}%)"
+            tf_secs = 300 if "5m" in context.timeframe else (900 if "15m" in context.timeframe else (3600 if "1h" in context.timeframe else 86400))
+            elapsed_pct = max(0, min(100, int(((tf_secs - context.time_left_seconds) / tf_secs) * 100)))
+
+            dvr_line = f"Volatility & Strike Distance: ATR(1m) = ${context.atr_1m:.2f} | Strike Diff = {bps_str} | DVR = {context.dvr_ratio:+.2f}sigma\n" if context.atr_1m > 0 else f"Strike Distance: {bps_str}\n"
+            pa_line = f"Price Action & Macro Trend: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend (5m/15m) = {context.macro_trend_15m}\n"
             micro_line = f"Order Flow / Microstructure: Order Book Imbalance (OBI) = {context.order_book_imbalance:+.2f} | BTC Trend: {context.btc_correlation_dir}\n"
             tech_line = f"Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f} | Regime = {context.market_regime}\n"
             danger_line = "⚠️ EXPIRY DANGER ZONE ACTIVE: Under 60s remaining and price is inside volatility noise buffer. Exercise extreme caution.\n" if context.expiry_danger_flag else ""
@@ -182,12 +191,13 @@ class JevClient:
                 f"Binance Up or Down Prediction Market Analysis:\n"
                 f"Market: {clean_sym} Up or Down {context.timeframe} (ID: {context.market_id})\n"
                 f"Symbol: {context.symbol} | Timeframe: {context.timeframe}\n"
-                f"Current Price: ${context.underlying_price:,.2f} | Price to Beat: ${context.target_price:,.2f} (Diff: {diff_str})\n"
+                f"Current Price: ${context.underlying_price:,.2f} | Price to Beat: ${context.target_price:,.2f} (Diff: {diff_str} | {bps_str})\n"
                 f"Current Market Odds: UP {context.odds_yes:.3f} ({context.odds_yes*100:.1f}%) | "
                 f"DOWN {context.odds_no:.3f} ({context.odds_no*100:.1f}%)\n"
                 f"Spread: {context.spread:.3f} | 24h Volume: ${context.volume_24h:,.0f}\n"
                 f"Momentum: {context.momentum_pct:+.3f}%\n"
                 f"{dvr_line}"
+                f"{pa_line}"
                 f"{micro_line}"
                 f"{tech_line}"
                 f"{danger_line}"
@@ -195,7 +205,7 @@ class JevClient:
                 f"{martingale_directive}"
                 f"{tf_directive}"
                 f"{ev_directive}\n"
-                f"Time Remaining to Expiration: {context.time_left_seconds} seconds."
+                f"Round Progress: {elapsed_pct}% elapsed ({context.time_left_seconds} seconds remaining to expiration)."
             )
             payload = {
                 "model": self.model or "jev-latest",
@@ -216,6 +226,11 @@ class JevClient:
                 }
             }
         else:
+            diff_str = f"{context.price_diff:+,.2f}" if context.price_diff else f"{context.underlying_price - context.target_price:+,.2f}"
+            bps_str = f"{context.strike_diff_bps:+.1f} bps ({context.strike_diff_pct:+.2f}%)"
+            tf_secs = 300 if "5m" in context.timeframe else (900 if "15m" in context.timeframe else (3600 if "1h" in context.timeframe else 86400))
+            elapsed_pct = max(0, min(100, int(((tf_secs - context.time_left_seconds) / tf_secs) * 100)))
+
             payload = {
                 "model": self.model,
                 "response_format": {
@@ -270,10 +285,11 @@ class JevClient:
                             f"Symbol: {context.symbol} | Timeframe: {context.timeframe}\n"
                             f"Current Odds - UP: {context.odds_yes:.3f} | DOWN: {context.odds_no:.3f}\n"
                             f"Spread: {context.spread:.4f} | 24h Volume: ${context.volume_24h:,.0f}\n"
-                            f"Time Remaining: {context.time_left_seconds}s\n"
-                            f"Underlying Spot: ${context.underlying_price:,.2f} | Target (Strike): ${context.target_price:,.2f}\n"
+                            f"Round Progress: {elapsed_pct}% elapsed ({context.time_left_seconds}s remaining)\n"
+                            f"Underlying Spot: ${context.underlying_price:,.2f} | Target (Strike): ${context.target_price:,.2f} (Diff: {diff_str} | {bps_str})\n"
                             f"Quantitative Signals:\n"
-                            f"- Volatility & Distance: ATR(1m) = ${context.atr_1m:.2f} | DVR = {context.dvr_ratio:+.2f}sigma\n"
+                            f"- Strike Distance: {bps_str} | DVR = {context.dvr_ratio:+.2f}sigma | ATR(1m) = ${context.atr_1m:.2f}\n"
+                            f"- Price Action & Macro: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend = {context.macro_trend_15m}\n"
                             f"- Microstructure: OBI (Order Book Imbalance) = {context.order_book_imbalance:+.2f} | BTC Trend = {context.btc_correlation_dir}\n"
                             f"- Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f}\n"
                             f"- 5m Momentum: {context.momentum_pct:+.2f}%\n"

@@ -106,7 +106,7 @@ class Settings(BaseSettings):
 
     # --- Strict Odds, Timing & Value Gates ---
     max_odds_cap: float = Field(
-        default=0.60,
+        default=0.58,
         ge=0.30,
         le=0.90,
         alias="MAX_ODDS_CAP"
@@ -168,7 +168,7 @@ class Settings(BaseSettings):
         alias="MARTINGALE_MAX_STEPS"
     )
     martingale_confidence_step: float = Field(
-        default=0.04,
+        default=0.03,
         ge=0.01,
         le=0.10,
         alias="MARTINGALE_CONFIDENCE_STEP"

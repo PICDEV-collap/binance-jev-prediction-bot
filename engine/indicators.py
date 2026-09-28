@@ -326,6 +326,26 @@ class RollingCandleAggregator:
             curr_5m.close = price
             curr_5m.volume += volume
 
+    def seed_candles(
+        self,
+        symbol: str,
+        candles_1m: List[Candle],
+        candles_5m: Optional[List[Candle]] = None
+    ) -> None:
+        """
+        Bootstrap historical candle history from REST API on startup.
+        Eliminates the 30-minute cold-start indicator lag.
+        """
+        if candles_1m:
+            sorted_1m = sorted(candles_1m, key=lambda c: c.timestamp)
+            self._history_1m[symbol] = sorted_1m[-self.max_history:]
+            self._current_1m.pop(symbol, None)
+
+        if candles_5m:
+            sorted_5m = sorted(candles_5m, key=lambda c: c.timestamp)
+            self._history_5m[symbol] = sorted_5m[-self.max_history:]
+            self._current_5m.pop(symbol, None)
+
     def get_1m_candles(self, symbol: str) -> List[Candle]:
         """Return history + active 1m candle."""
         candles = list(self._history_1m.get(symbol, []))
@@ -375,6 +395,29 @@ class RollingCandleAggregator:
         ema_50 = compute_ema(closes_1m, 50) if closes_1m else spot_price
         ema_trend = determine_ema_trend(spot_price, ema_9, ema_21, ema_50)
 
+        # Macro Trend (5m EMA trend alignment)
+        macro_trend = "NEUTRAL"
+        if len(closes_5m) >= 5:
+            ema_5m_fast = compute_ema(closes_5m, 5)
+            ema_5m_slow = compute_ema(closes_5m, 15)
+            if spot_price > ema_5m_fast > ema_5m_slow:
+                macro_trend = "BULLISH"
+            elif spot_price < ema_5m_fast < ema_5m_slow:
+                macro_trend = "BEARISH"
+            else:
+                macro_trend = "NEUTRAL"
+
+        # Recent 3 completed 1m candles summary for price action trajectory
+        recent_summary: List[str] = []
+        hist_1m = self._history_1m.get(symbol, [])
+        for c in hist_1m[-3:]:
+            if c.open > 0:
+                ret_pct = round(((c.close - c.open) / c.open) * 100.0, 2)
+                direction = "Bull" if c.close >= c.open else "Bear"
+                sign = "+" if ret_pct >= 0 else ""
+                recent_summary.append(f"{sign}{ret_pct:.2f}% {direction}")
+        recent_candles_summary = "[" + ", ".join(recent_summary) + "]" if recent_summary else "[]"
+
         # Order Book Imbalance (OBI)
         obi = compute_order_book_imbalance(bid_qty, ask_qty)
 
@@ -395,6 +438,8 @@ class RollingCandleAggregator:
             "rsi_1m": rsi_1m,
             "rsi_5m": rsi_5m,
             "ema_trend": ema_trend,
+            "macro_trend_15m": macro_trend,
+            "recent_candles_summary": recent_candles_summary,
             "order_book_imbalance": obi,
             "momentum_pct": momentum_pct,
             "btc_correlation_dir": btc_dir,
@@ -417,6 +462,15 @@ class RollingCandleAggregator:
         atr_1m = base_features["atr_1m"]
         dvr = compute_dvr(spot_price, strike_price, atr_1m, time_left_seconds)
         price_diff = round(spot_price - strike_price, 4)
+
+        # Scale-invariant strike distance
+        if strike_price > 0:
+            strike_diff_pct = round(((spot_price - strike_price) / strike_price) * 100.0, 4)
+            strike_diff_bps = round(((spot_price - strike_price) / strike_price) * 10000.0, 2)
+        else:
+            strike_diff_pct = 0.0
+            strike_diff_bps = 0.0
+
         expiry_danger = check_expiry_danger(time_left_seconds, price_diff, atr_1m)
         regime = classify_market_regime(
             base_features["ema_trend"],
@@ -428,6 +482,10 @@ class RollingCandleAggregator:
         return {
             "atr_1m": atr_1m,
             "dvr_ratio": dvr,
+            "strike_diff_bps": strike_diff_bps,
+            "strike_diff_pct": strike_diff_pct,
+            "recent_candles_summary": base_features.get("recent_candles_summary", "[]"),
+            "macro_trend_15m": base_features.get("macro_trend_15m", "NEUTRAL"),
             "rsi_1m": base_features["rsi_1m"],
             "rsi_5m": base_features["rsi_5m"],
             "ema_trend": base_features["ema_trend"],

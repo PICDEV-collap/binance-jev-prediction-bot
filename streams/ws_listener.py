@@ -24,7 +24,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from engine.jev_client import MarketContext
-from engine.indicators import RollingCandleAggregator
+from engine.indicators import RollingCandleAggregator, Candle
 
 logger = logging.getLogger("ws_listener")
 
@@ -165,6 +165,7 @@ class BinanceWSListener:
             self._http_session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=4.0)
             )
+            self._spawn_task(self._bootstrap_kline_history())
             self._listener_task = self._spawn_task(self._connection_supervisor())
             self._watchdog_task = self._spawn_task(self._watchdog_rest_poller())
             self._network_liveness_task = self._spawn_task(self._network_liveness_prober())
@@ -524,6 +525,10 @@ class BinanceWSListener:
                     momentum_pct=momentum_pct,
                     atr_1m=metrics["atr_1m"],
                     dvr_ratio=metrics["dvr_ratio"] if strike_confirmed else 0.0,
+                    strike_diff_bps=metrics["strike_diff_bps"],
+                    strike_diff_pct=metrics["strike_diff_pct"],
+                    recent_candles_summary=metrics["recent_candles_summary"],
+                    macro_trend_15m=metrics["macro_trend_15m"],
                     rsi_1m=metrics["rsi_1m"],
                     rsi_5m=metrics["rsi_5m"],
                     ema_trend=metrics["ema_trend"],
@@ -536,6 +541,71 @@ class BinanceWSListener:
             )
 
         return results
+
+    async def _bootstrap_kline_history(self) -> None:
+        """
+        Bootstrap historical 1m and 5m klines from Binance REST API on startup.
+        Pre-seeds RollingCandleAggregator to eliminate the 30-minute cold-start indicator lag.
+        """
+        logger.info("[KLINE BOOTSTRAP] Pre-fetching historical klines from Binance REST API...")
+        base_url = "https://api.binance.com/api/v3/klines"
+        symbols_to_fetch = list(SUPPORTED_SYMBOLS)
+
+        for sym in symbols_to_fetch:
+            if not self._running:
+                break
+            try:
+                session = self._http_session
+                if session is None or session.closed:
+                    continue
+
+                candles_1m: List[Candle] = []
+                candles_5m: List[Candle] = []
+
+                # Fetch 1m klines (30 candles)
+                async with session.get(f"{base_url}?symbol={sym}&interval=1m&limit=30") as resp_1m:
+                    if resp_1m.status == 200:
+                        raw_1m = await resp_1m.json()
+                        for k in raw_1m:
+                            candles_1m.append(
+                                Candle(
+                                    timestamp=float(k[0]) / 1000.0,
+                                    open=float(k[1]),
+                                    high=float(k[2]),
+                                    low=float(k[3]),
+                                    close=float(k[4]),
+                                    volume=float(k[5]),
+                                )
+                            )
+
+                # Fetch 5m klines (20 candles)
+                async with session.get(f"{base_url}?symbol={sym}&interval=5m&limit=20") as resp_5m:
+                    if resp_5m.status == 200:
+                        raw_5m = await resp_5m.json()
+                        for k in raw_5m:
+                            candles_5m.append(
+                                Candle(
+                                    timestamp=float(k[0]) / 1000.0,
+                                    open=float(k[1]),
+                                    high=float(k[2]),
+                                    low=float(k[3]),
+                                    close=float(k[4]),
+                                    volume=float(k[5]),
+                                )
+                            )
+
+                if candles_1m or candles_5m:
+                    self.candle_aggregator.seed_candles(
+                        symbol=sym,
+                        candles_1m=candles_1m,
+                        candles_5m=candles_5m if candles_5m else None,
+                    )
+                    logger.info(
+                        f"[KLINE BOOTSTRAP] Successfully seeded {len(candles_1m)} 1m candles "
+                        f"and {len(candles_5m)} 5m candles for {sym}."
+                    )
+            except Exception as e:
+                logger.warning(f"[KLINE BOOTSTRAP] Failed to bootstrap klines for {sym}: {e}")
 
     async def _watchdog_rest_poller(self) -> None:
         """

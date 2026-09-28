@@ -100,7 +100,53 @@ def test_rolling_candle_aggregator():
     assert metrics["ema_trend"] == "STRONG_UPTREND"
     assert metrics["order_book_imbalance"] > 0
     assert metrics["btc_correlation_dir"] == "BULLISH"
+    assert "strike_diff_bps" in metrics
+    assert "recent_candles_summary" in metrics
+    assert "macro_trend_15m" in metrics
     print("      -> RollingCandleAggregator verified successfully.")
+
+
+def test_kline_seeding_and_enriched_features():
+    print("[2.5/5] Testing Candle Seeding and Scale-Invariant Strike Features...")
+    agg = RollingCandleAggregator(max_history=60)
+    now = time.time()
+
+    # Pre-seed 30 1m candles and 20 5m candles
+    c1m = [
+        Candle(timestamp=now - (30 - i) * 60, open=84000 + i * 2, high=84005 + i * 2, low=83995 + i * 2, close=84002 + i * 2, volume=10.0)
+        for i in range(30)
+    ]
+    c5m = [
+        Candle(timestamp=now - (20 - i) * 300, open=83950 + i * 5, high=83960 + i * 5, low=83940 + i * 5, close=83955 + i * 5, volume=50.0)
+        for i in range(20)
+    ]
+
+    agg.seed_candles("BTCUSDT", candles_1m=c1m, candles_5m=c5m)
+
+    # Verify history is immediately ready (no 30-min cold-start lag)
+    assert len(agg.get_1m_candles("BTCUSDT")) == 30
+    assert len(agg.get_5m_candles("BTCUSDT")) == 20
+
+    spot = 84060.0
+    strike = 84000.0  # +60 USDT diff
+    base_feat = agg.compute_base_features("BTCUSDT", spot_price=spot)
+
+    assert base_feat["rsi_1m"] != 50.0  # Not stuck at default 50.0
+    assert base_feat["recent_candles_summary"].startswith("[")
+    assert "Bull" in base_feat["recent_candles_summary"] or "Bear" in base_feat["recent_candles_summary"]
+
+    round_metrics = agg.compute_round_metrics(
+        base_features=base_feat,
+        spot_price=spot,
+        strike_price=strike,
+        time_left_seconds=180
+    )
+
+    # 60 / 84000 * 10000 = +7.14 bps
+    assert round_metrics["strike_diff_bps"] == 7.14
+    assert round_metrics["strike_diff_pct"] == 0.0714
+    assert round_metrics["macro_trend_15m"] in ("BULLISH", "BEARISH", "NEUTRAL")
+    print(f"      -> Seeding & Scale-invariant Strike Diff ({round_metrics['strike_diff_bps']} bps) verified.")
 
 
 def test_jev_client_decision_engine():
@@ -217,6 +263,7 @@ def test_app_import_sanity():
 if __name__ == "__main__":
     test_indicator_calculations()
     test_rolling_candle_aggregator()
+    test_kline_seeding_and_enriched_features()
     asyncio.run(test_jev_client_decision_engine())
     test_risk_guard_gates()
     test_app_import_sanity()
