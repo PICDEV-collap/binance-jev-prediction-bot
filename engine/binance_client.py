@@ -2376,6 +2376,59 @@ class BinanceClient:
 
         return 0.0, 0.0
 
+    async def fetch_prediction_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Fetch authoritative prediction order history directly from Binance SAPI.
+        Used to accurately reconstruct filled contracts and detect early take-profit sales.
+        Endpoint: GET /sapi/v1/w3w/wallet/prediction/order/history
+        """
+        if self.paper_trading or not (self.api_key and self.api_secret):
+            return []
+
+        if self._session is None or self._session.closed:
+            await self.start()
+
+        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        query_params = {
+            "recvWindow": self.recv_window,
+            "timestamp": self._get_timestamp(),
+            "limit": limit,
+        }
+        if self._wallet_address:
+            query_params["walletAddress"] = self._wallet_address
+        if self._wallet_id:
+            query_params["walletId"] = self._wallet_id
+
+        signed_query = self._sign_payload(query_params)
+        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/order/history?{signed_query}"
+
+        try:
+            assert self._session is not None
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("orders", [])
+                else:
+                    data = {}
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        pass
+                    if data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
+                        logger.warning("Detected time drift (-1021) in order history. Re-syncing time...")
+                        await self.sync_server_time()
+                        query_params["timestamp"] = self._get_timestamp()
+                        signed_query = self._sign_payload(query_params)
+                        retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/order/history?{signed_query}"
+                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=5.0)) as r_resp:
+                            if r_resp.status == 200:
+                                r_data = await r_resp.json()
+                                return r_data.get("orders", [])
+                    logger.debug(f"Failed to fetch prediction order history: HTTP {resp.status} - {data}")
+        except Exception as e:
+            logger.debug(f"Exception fetching prediction order history: {e}")
+        return []
+
     async def sync_historical_closed_positions(self, limit: int = 50) -> int:
         """
         Reconcile and synchronize historical settled positions directly from Binance SAPI.
@@ -2385,9 +2438,24 @@ class BinanceClient:
         if self.paper_trading or not (self.api_key and self.api_secret):
             return 0
 
-        ended_list = await self.fetch_ended_prediction_positions(limit=limit)
-        if ended_list is None:
-            ended_list = []
+        # Concurrently fetch ended positions and order history for full fidelity
+        ended_res, orders_res = await asyncio.gather(
+            self.fetch_ended_prediction_positions(limit=limit),
+            self.fetch_prediction_order_history(limit=limit),
+            return_exceptions=True,
+        )
+        ended_list = ended_res if isinstance(ended_res, list) else []
+        raw_orders = orders_res if isinstance(orders_res, list) else []
+
+        # Index filled orders by marketId to reconstruct exact bought shares & early take-profit sales
+        orders_by_market: Dict[int, List[Dict[str, Any]]] = {}
+        for o in raw_orders:
+            mid = o.get("marketId")
+            if mid:
+                try:
+                    orders_by_market.setdefault(int(mid), []).append(o)
+                except (ValueError, TypeError):
+                    pass
 
         if ended_list:
             # Concurrently resolve official Oracle strike and settlement prices for unique markets not yet in cache
@@ -2426,12 +2494,41 @@ class BinanceClient:
             if not token_id:
                 continue
 
+            mid_int = int(item.get("marketId", 0) or 0)
+            strike_price, settlement_price = self._market_oracle_cache.get(mid_int, (0.0, 0.0))
+
+            # Correlate filled buy & sell orders from order history
+            m_orders = orders_by_market.get(mid_int, [])
+            buys = [o for o in m_orders if o.get("side") == "BUY" and o.get("status") == "FILLED"]
+            sells = [o for o in m_orders if o.get("side") == "SELL" and o.get("status") == "FILLED"]
+
+            bought_shares = sum(float(o.get("filledShareQty", 0.0) or 0.0) for o in buys)
+            sold_shares = sum(float(o.get("filledShareQty", 0.0) or 0.0) for o in sells)
+
             won = (item.get("isWinner") is True)
-            outcome_label = "WIN" if won else "LOSS"
-            raw_pnl = float(item.get("unrealizedPnl") or item.get("realizedPnl") or 0.0)
+            realized_raw = float(item.get("realizedPnl") or 0.0)
+            unrealized_raw = float(item.get("unrealizedPnl") or 0.0)
             cost = float(item.get("totalCost", 0.0) or 0.0)
             shares = float(item.get("shares", 0.0) or 1.0)
-            pnl = raw_pnl if raw_pnl != 0.0 else ((shares * 1.00 - cost) if won else -cost)
+
+            # Prioritize Binance official realizedPnl for winning / take-profit rounds
+            if won:
+                if realized_raw > 0:
+                    pnl = realized_raw
+                elif unrealized_raw > 0:
+                    pnl = unrealized_raw
+                else:
+                    pnl = (shares * 1.00 - cost) if cost > 0 else 0.0
+            else:
+                if unrealized_raw < 0:
+                    pnl = unrealized_raw
+                elif cost > 0:
+                    pnl = -cost
+                elif realized_raw < 0:
+                    pnl = realized_raw
+                else:
+                    pnl = 0.0
+
             # High precision PnL for sub-cent values (e.g. 0.0048) to avoid $0.00 truncation
             pnl_final = round(pnl, 4) if abs(pnl) < 0.05 else round(pnl, 2)
             is_claimed = bool(won and item.get("positionStatus") == "CLAIMED")
@@ -2445,13 +2542,20 @@ class BinanceClient:
             tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
             tf = tf_match.group(1).lower() if tf_match else "5m"
 
-            mid_int = int(item.get("marketId", 0) or 0)
-            strike_price, settlement_price = self._market_oracle_cache.get(mid_int, (0.0, 0.0))
+            # Reconstruct true position size (contracts) from bought shares
+            if bought_shares > 0:
+                final_contracts = int(round(bought_shares))
+            else:
+                final_contracts = int(round(shares)) if shares >= 1 else 1
+
+            # Tag outcome as TAKE_PROFIT if sold before expiration
+            outcome_label = "TAKE_PROFIT" if (won and sold_shares > 0) else ("WIN" if won else "LOSS")
 
             orig = existing_by_token.get(token_id)
             if orig is not None:
                 orig.result = outcome_label
                 orig.realized_pnl = pnl_final
+                orig.contracts = final_contracts
                 orig.is_claimed = is_claimed
                 orig.settled_at = settled_at
                 if strike_price > 0:
@@ -2467,7 +2571,7 @@ class BinanceClient:
                     market_id=m_id,
                     symbol=sym,
                     side=side,
-                    contracts=int(shares) if shares >= 1 else 1,
+                    contracts=final_contracts,
                     entry_price=avg_price,
                     target_price=strike_price,
                     settlement_price=settlement_price,

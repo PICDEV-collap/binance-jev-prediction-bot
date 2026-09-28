@@ -158,3 +158,74 @@ def test_oracle_strike_price_update():
     listener.update_official_strike_prices(official_strikes)
     
     assert listener._official_strike_prices["BTCUSDT-5m"] == 84533.295
+
+
+def test_early_take_profit_reconciliation_parity():
+    """
+    Verify that an early take-profit position with partial remainder shares
+    prioritizes realizedPnl (+$15.15), aggregates bought shares (27x),
+    and tags outcome as TAKE_PROFIT.
+    """
+    async def _run():
+        from unittest.mock import AsyncMock
+        client = BinanceClient(api_key="test_key", api_secret="test_secret", paper_trading=False)
+
+        token_id = "TOKEN_TP_WIN_840232"
+        market_id = 12757205
+
+        mock_ended = [{
+            "positionId": 16161249,
+            "tokenId": token_id,
+            "marketId": market_id,
+            "marketTopicTitle": "Bitcoin Up or Down - September 28, 1:30AM-1:35AM ET",
+            "outcomeName": "Down",
+            "shares": "0.96",  # Unsold remainder
+            "avgPrice": "0.41836735",
+            "totalCost": "0.4024489",
+            "positionStatus": "CLAIMED",
+            "isWinner": True,
+            "finalOutcome": "Down",
+            "unrealizedPnl": "0.5575511",  # PnL of remaining 0.96 shares
+            "realizedPnl": "15.15155122",  # TOTAL realized profit of the round
+            "updatedTime": int((time.time() - 100) * 1000),
+        }]
+
+        mock_orders = [
+            {
+                "orderId": "26092800001921651740",
+                "marketId": market_id,
+                "side": "BUY",
+                "status": "FILLED",
+                "filledShareQty": "26.96",
+                "price": "0.41",
+            },
+            {
+                "orderId": "26092800001921655655",
+                "marketId": market_id,
+                "side": "SELL",
+                "status": "FILLED",
+                "filledShareQty": "26.0",
+                "price": "0.98",
+            }
+        ]
+
+        client.fetch_ended_prediction_positions = AsyncMock(return_value=mock_ended)
+        client.fetch_prediction_order_history = AsyncMock(return_value=mock_orders)
+
+        count = await client.sync_historical_closed_positions(limit=10)
+        assert count == 1
+
+        closed = client.get_closed_positions()
+        assert len(closed) == 1
+        pos = closed[0]
+
+        # Must have full profit $15.15, not the partial remainder $0.56!
+        assert pos["realized_pnl"] == 15.15
+        # Must reflect the 27 bought contracts, not 1x!
+        assert pos["contracts"] == 27
+        # Must be tagged as TAKE_PROFIT
+        assert pos["result"] == "TAKE_PROFIT"
+        assert pos["is_claimed"] is True
+
+    asyncio.run(_run())
+
