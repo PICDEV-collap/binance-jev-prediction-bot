@@ -721,12 +721,13 @@ class RiskGuard:
                 pnl_contracts = math.ceil(target_gain / profit_per_contract)
 
                 # 6. Sizing Bounds:
-                # Must buy at least default_order_contracts, sized by pnl_contracts to cover accumulated loss,
+                # Target at least default_order_contracts and pnl_contracts to cover accumulated loss,
                 # strictly bounded by max_possible_contracts (enforcing max_position_size_usdt and live balance)
-                contracts = max(self.default_order_contracts, min(pnl_contracts, max_possible_contracts))
-                if pnl_contracts > max_possible_contracts:
+                target_contracts = max(self.default_order_contracts, pnl_contracts)
+                contracts = max(1, min(target_contracts, max_possible_contracts))
+                if target_contracts > max_possible_contracts:
                     logger.warning(
-                        f"[MARTINGALE BUDGET CAP] {sym} {stage_label}: Needed {pnl_contracts} contracts to fully "
+                        f"[MARTINGALE BUDGET CAP] {sym} {stage_label}: Needed {target_contracts} contracts to fully "
                         f"recover -${accum_loss:.2f} loss, but capped at {max_possible_contracts} contracts by "
                         f"max_position_size_usdt (${self.max_position_size_usdt:.2f})."
                     )
