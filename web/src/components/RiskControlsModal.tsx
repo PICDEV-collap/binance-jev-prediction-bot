@@ -648,6 +648,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                         <span className="text-amber-400 font-semibold">4 ไม้ (แนะนำ)</span>
                         <span>6 ไม้ (Max)</span>
                       </div>
+                      <div className="p-2 rounded bg-amber-500/10 border border-amber-500/30 text-[10px] text-amber-300/90 font-mono leading-relaxed">
+                        🛡️ <strong>Cut-Loss & PnL Reset:</strong> เมื่อเปิดไม้แก้ครบ {martingaleMaxSteps} ไม้แล้วยังแพ้ ระบบจะตัดขาดทุนทันที โดยรีเซ็ต PnL สะสมเป็น $0.00 และเริ่มระบบใหม่ที่ไม้ 1 (Base) เพื่อปกป้องเงินทุน
+                      </div>
                     </div>
 
                     {/* AI Hurdle Escalation Step */}

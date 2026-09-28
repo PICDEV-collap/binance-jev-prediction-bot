@@ -90,6 +90,7 @@ class RiskGuard:
         self.consecutive_wins: int = 0
         self.last_settled_result: str = "NONE"
         self.recovery_cycles_completed: int = 0
+        self.recovery_cycles_failed: int = 0
 
         # Per-Symbol Martingale State (Asset-Specific Isolation)
         self._symbol_martingale_step: Dict[str, int] = {}
@@ -98,6 +99,7 @@ class RiskGuard:
         self._symbol_consecutive_wins: Dict[str, int] = {}
         self._symbol_last_result: Dict[str, str] = {}
         self._symbol_recovery_cycles: Dict[str, int] = {}
+        self._symbol_failed_recovery_cycles: Dict[str, int] = {}
 
         # State tracking
         self._market_last_traded: Dict[str, float] = {}
@@ -177,11 +179,19 @@ class RiskGuard:
                 return f"ไม้แก้ {step} (PnL: -${accum_loss:.2f})"
         return f"ไม้แก้ {step} ({mult:.0f}x)"
 
-    def record_settlement_result(self, won: bool, pnl: float, symbol: str = "") -> None:
+    def record_settlement_result(
+        self,
+        won: bool,
+        pnl: float,
+        symbol: str = "",
+        martingale_step: Optional[int] = None,
+    ) -> None:
         """
         Feedback from settled round.
         Tracks Martingale recovery step independently per symbol and updates global counters.
         When LOSS: Advance Martingale recovery step, accumulate USD loss, increase multiplier & raise AI conviction hurdle.
+                   If the trade was at or exceeded martingale_max_steps (max recovery step reached):
+                   trigger Cut-Loss, reset Martingale step to 0 (Base Round), and reset accumulated USD loss to 0.0!
         When WIN: Reset Martingale step to 0 (Base Round), reset accumulated USD loss to 0, and restore base AI hurdle!
         """
         clean_sym = symbol.upper() if symbol else ""
@@ -219,21 +229,39 @@ class RiskGuard:
             # Per-symbol state update
             if clean_sym:
                 old_sym_step = self._symbol_martingale_step.get(clean_sym, 0)
+                trade_step = martingale_step if martingale_step is not None else old_sym_step
                 loss_amt = abs(pnl) if pnl < 0 else 0.0
                 current_loss = self._symbol_accumulated_loss.get(clean_sym, 0.0)
-                self._symbol_accumulated_loss[clean_sym] = round(current_loss + loss_amt, 4)
 
                 if self.martingale_enabled:
-                    new_sym_step = min(self.martingale_max_steps, old_sym_step + 1)
-                    self._symbol_martingale_step[clean_sym] = new_sym_step
-                    new_sym_hurdle = self.get_effective_confidence_threshold(clean_sym)
-                    mult = self.martingale_multiplier ** new_sym_step
-                    logger.warning(
-                        f"⚠️ [{clean_sym} MARTINGALE LOSS ESCALATION] Round lost (-${loss_amt:.2f} | "
-                        f"Cycle Loss Total: -${self._symbol_accumulated_loss[clean_sym]:.2f}). "
-                        f"Advancing from Step {old_sym_step} -> Step {new_sym_step} (ไม้แก้ {new_sym_step}). "
-                        f"Mode: {self.martingale_mode} | Next Multiplier Cap: {mult:.0f}x | Next AI Hurdle: {new_sym_hurdle*100:.0f}%"
-                    )
+                    if trade_step >= self.martingale_max_steps:
+                        # 🛑 Max recovery step reached and lost! Cut-Loss & Restart fresh
+                        self._symbol_martingale_step[clean_sym] = 0
+                        self._symbol_accumulated_loss[clean_sym] = 0.0
+                        self._symbol_failed_recovery_cycles[clean_sym] = self._symbol_failed_recovery_cycles.get(clean_sym, 0) + 1
+                        self.recovery_cycles_failed += 1
+                        logger.warning(
+                            f"🛑 [{clean_sym} MARTINGALE CUT-LOSS / MAX STEP REACHED] "
+                            f"Trade lost at Max Recovery Step {trade_step} (Limit: {self.martingale_max_steps}) with loss -${loss_amt:.2f}. "
+                            f"Prior cycle accumulated loss (-${current_loss:.2f}) absorbed. "
+                            f"RESETTING CYCLE PnL TO $0.00 & STEP TO 0 TO RESTART FRESH FROM BASE ROUND (ไม้ 1)."
+                        )
+                    else:
+                        new_sym_step = trade_step + 1
+                        self._symbol_martingale_step[clean_sym] = new_sym_step
+                        self._symbol_accumulated_loss[clean_sym] = round(current_loss + loss_amt, 4)
+                        new_sym_hurdle = self.get_effective_confidence_threshold(clean_sym)
+                        mult = self.martingale_multiplier ** new_sym_step
+                        logger.warning(
+                            f"⚠️ [{clean_sym} MARTINGALE LOSS ESCALATION] Round lost (-${loss_amt:.2f} | "
+                            f"Cycle Loss Total: -${self._symbol_accumulated_loss[clean_sym]:.2f}). "
+                            f"Advancing from Step {trade_step} -> Step {new_sym_step} (ไม้แก้ {new_sym_step}). "
+                            f"Mode: {self.martingale_mode} | Next Multiplier Cap: {mult:.0f}x | Next AI Hurdle: {new_sym_hurdle*100:.0f}%"
+                        )
+                else:
+                    self._symbol_martingale_step[clean_sym] = 0
+                    self._symbol_accumulated_loss[clean_sym] = 0.0
+
                 self._symbol_consecutive_losses[clean_sym] = self._symbol_consecutive_losses.get(clean_sym, 0) + 1
                 self._symbol_consecutive_wins[clean_sym] = 0
                 self._symbol_last_result[clean_sym] = "LOSS"
@@ -265,10 +293,10 @@ class RiskGuard:
 
             p_list.sort(key=_get_settled_at)
 
-            accum_loss = 0.0
             consec_losses = 0
             consec_wins = 0
             last_res = "LOSS"
+            loss_history: List[float] = []
 
             # Traverse backwards from the latest closed trade
             for p in reversed(p_list):
@@ -281,10 +309,35 @@ class RiskGuard:
                     break
                 else:
                     consec_losses += 1
-                    accum_loss += abs(pnl)
+                    loss_history.append(abs(pnl))
                     last_res = "LOSS"
 
-            step = min(self.martingale_max_steps, consec_losses) if self.martingale_enabled else 0
+            # Check if latest loss was at max recovery step, or compute active cycle losses
+            cycle_size = self.martingale_max_steps + 1
+            cycle_losses = (consec_losses % cycle_size) if self.martingale_enabled else 0
+
+            latest_trade_step = 0
+            if p_list:
+                latest_p = p_list[-1]
+                latest_trade_step = int(latest_p.get("martingale_step", 0) if isinstance(latest_p, dict) else getattr(latest_p, "martingale_step", 0))
+
+            if not self.martingale_enabled or consec_losses == 0:
+                step = 0
+                accum_loss = 0.0
+            elif (latest_trade_step >= self.martingale_max_steps and last_res == "LOSS") or (consec_losses > 0 and cycle_losses == 0):
+                # Max recovery step reached and lost! Reset cycle PnL & step to 0
+                step = 0
+                accum_loss = 0.0
+                logger.info(
+                    f"[RISK GUARD RECONCILE] {sym}: Latest loss was at max recovery step ({latest_trade_step} >= {self.martingale_max_steps}) "
+                    f"or full cycle lost ({consec_losses} losses). Martingale reset to Step 0 with $0.00 accumulated loss."
+                )
+            else:
+                step = cycle_losses
+                # Only accumulate losses from the CURRENT active recovery cycle (last cycle_losses trades)
+                active_cycle_losses = loss_history[:cycle_losses]
+                accum_loss = sum(active_cycle_losses)
+
             self._symbol_martingale_step[sym] = step
             self._symbol_accumulated_loss[sym] = round(accum_loss, 2)
             self._symbol_consecutive_losses[sym] = consec_losses
@@ -951,6 +1004,7 @@ class RiskGuard:
                 "consecutive_wins": self.consecutive_wins,
                 "last_settled_result": self.last_settled_result,
                 "recovery_cycles_completed": self.recovery_cycles_completed,
+                "recovery_cycles_failed": self.recovery_cycles_failed,
                 "symbol_steps": dict(self._symbol_martingale_step),
             }
         }

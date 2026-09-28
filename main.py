@@ -385,7 +385,8 @@ class TradingBotCoordinator:
                             self.risk_guard.record_settlement_result(
                                 won=True,
                                 pnl=tp_rec["pnl"],
-                                symbol=tp_rec["symbol"]
+                                symbol=tp_rec["symbol"],
+                                martingale_step=tp_rec.get("martingale_step"),
                             )
 
                     pnl, settled_records = await self.binance_client.settle_expired_positions(active_market_ids, current_prices)
@@ -393,7 +394,8 @@ class TradingBotCoordinator:
                         self.risk_guard.record_settlement_result(
                             won=rec["won"],
                             pnl=rec["pnl"],
-                            symbol=rec["symbol"]
+                            symbol=rec["symbol"],
+                            martingale_step=rec.get("martingale_step"),
                         )
                     if settled_records:
                         self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())

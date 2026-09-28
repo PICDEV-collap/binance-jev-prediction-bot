@@ -166,6 +166,7 @@ export interface SystemStatus {
       consecutive_wins: number;
       last_settled_result: string;
       recovery_cycles_completed: number;
+      recovery_cycles_failed?: number;
     };
   };
   account: {

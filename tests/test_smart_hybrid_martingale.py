@@ -206,3 +206,145 @@ def test_smart_hybrid_pnl_covers_accumulated_loss_at_prediction_odds():
     # Exposure must respect max_position_size_usdt
     assert (res.adjusted_contracts * market.target_price) <= 20.0
 
+
+def test_martingale_max_step_loss_resets_pnl_and_step_hybrid():
+    """
+    Test that reaching martingale_max_steps and losing triggers Cut-Loss:
+    1. Resets martingale step to 0 (Base / ไม้ 1)
+    2. Resets cycle accumulated loss to $0.00
+    3. Increments recovery_cycles_failed
+    4. Next order is sized as standard Base round (not massive recovery contracts)
+    """
+    guard = RiskGuard(
+        martingale_enabled=True,
+        martingale_mode="SMART_HYBRID",
+        martingale_multiplier=2.0,
+        martingale_max_steps=4,
+        default_order_contracts=10,
+        max_position_size_usdt=100.0,
+        confidence_threshold=0.80,
+    )
+
+    # Initial state
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 0
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 0.0
+    assert guard.recovery_cycles_failed == 0
+
+    # Step 0 (Base) loses -$1.50 -> Step 1
+    guard.record_settlement_result(won=False, pnl=-1.50, symbol="ETHUSDT", martingale_step=0)
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 1
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 1.50
+
+    # Step 1 (Recovery 1) loses -$3.00 -> Step 2
+    guard.record_settlement_result(won=False, pnl=-3.00, symbol="ETHUSDT", martingale_step=1)
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 2
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 4.50
+
+    # Step 2 (Recovery 2) loses -$6.00 -> Step 3
+    guard.record_settlement_result(won=False, pnl=-6.00, symbol="ETHUSDT", martingale_step=2)
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 3
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 10.50
+
+    # Step 3 (Recovery 3) loses -$12.00 -> Step 4 (Max Step)
+    guard.record_settlement_result(won=False, pnl=-12.00, symbol="ETHUSDT", martingale_step=3)
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 4
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 22.50
+    assert "ไม้แก้ 4" in guard.get_stage_label("ETHUSDT")
+
+    # Step 4 (Max Recovery Step!) executes and LOSES -$24.00
+    guard.record_settlement_result(won=False, pnl=-24.00, symbol="ETHUSDT", martingale_step=4)
+
+    # MUST CUT-LOSS AND RESET!
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 0
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 0.0
+    assert guard.get_stage_label("ETHUSDT") == "ไม้ 1 (Base)"
+    assert guard.current_martingale_step == 0
+    assert guard.recovery_cycles_failed == 1
+    assert guard.metrics["martingale"]["recovery_cycles_failed"] == 1
+
+    # Verify that the NEXT order is sized strictly as Base order (10 contracts)
+    decision = JevEvaluationResult(action="BUY_YES", confidence=0.82, reasoning="Fresh cycle bounce")
+    market = MarketContext(
+        market_id="round_eth_fresh_001",
+        symbol="ETHUSDT",
+        question="Will Ethereum be Up or Down?",
+        underlying_price=2750.0,
+        target_price=0.50,
+        odds_yes=0.50,
+        odds_no=0.50,
+        spread=0.01,
+        time_left_seconds=300,
+        min_payout_multiplier=1.0,
+    )
+    res = guard.validate_and_size_order(decision, market)
+    assert res.approved is True
+    assert res.martingale_step == 0
+    assert res.stage_label == "ไม้ 1 (Base)"
+    # Base contracts = 10, not an escalated 50+ contracts
+    assert res.adjusted_contracts == 10
+
+
+def test_martingale_max_step_loss_resets_fixed_multiplier():
+    """Verify that FIXED_MULTIPLIER mode also resets when max recovery step loses."""
+    guard = RiskGuard(
+        martingale_enabled=True,
+        martingale_mode="FIXED_MULTIPLIER",
+        martingale_multiplier=2.0,
+        martingale_max_steps=3,
+        default_order_contracts=5,
+    )
+
+    # Step 0 -> Step 1
+    guard.record_settlement_result(won=False, pnl=-2.00, symbol="BTCUSDT", martingale_step=0)
+    assert guard.get_symbol_martingale_step("BTCUSDT") == 1
+
+    # Step 1 -> Step 2
+    guard.record_settlement_result(won=False, pnl=-4.00, symbol="BTCUSDT", martingale_step=1)
+    assert guard.get_symbol_martingale_step("BTCUSDT") == 2
+
+    # Step 2 -> Step 3 (Max Step)
+    guard.record_settlement_result(won=False, pnl=-8.00, symbol="BTCUSDT", martingale_step=2)
+    assert guard.get_symbol_martingale_step("BTCUSDT") == 3
+
+    # Step 3 (Max Step) loses -> Cut-Loss & Reset!
+    guard.record_settlement_result(won=False, pnl=-16.00, symbol="BTCUSDT", martingale_step=3)
+    assert guard.get_symbol_martingale_step("BTCUSDT") == 0
+    assert guard.get_symbol_accumulated_loss("BTCUSDT") == 0.0
+    assert guard.recovery_cycles_failed == 1
+
+
+def test_reconcile_from_closed_positions_with_max_step_loss():
+    """Verify that reconcile_from_closed_positions correctly handles full cycle loss reset."""
+    guard = RiskGuard(
+        martingale_enabled=True,
+        martingale_mode="SMART_HYBRID",
+        martingale_max_steps=4,
+        default_order_contracts=10,
+    )
+
+    # 5 consecutive losses: 1 base + 4 recovery steps
+    closed_trades = [
+        {"symbol": "ETHUSDT", "result": "LOSS", "realized_pnl": -1.50, "martingale_step": 0, "settled_at": 100},
+        {"symbol": "ETHUSDT", "result": "LOSS", "realized_pnl": -3.00, "martingale_step": 1, "settled_at": 200},
+        {"symbol": "ETHUSDT", "result": "LOSS", "realized_pnl": -6.00, "martingale_step": 2, "settled_at": 300},
+        {"symbol": "ETHUSDT", "result": "LOSS", "realized_pnl": -12.00, "martingale_step": 3, "settled_at": 400},
+        {"symbol": "ETHUSDT", "result": "LOSS", "realized_pnl": -24.00, "martingale_step": 4, "settled_at": 500},
+    ]
+
+    guard.reconcile_from_closed_positions(closed_trades)
+
+    # Since the 5th trade was at step 4 (max step) and lost, cycle is reset:
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 0
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 0.0
+
+    # Now simulate a 6th trade (a new base trade at step 0) that also lost:
+    closed_trades.append(
+        {"symbol": "ETHUSDT", "result": "LOSS", "realized_pnl": -2.00, "martingale_step": 0, "settled_at": 600}
+    )
+    guard.reconcile_from_closed_positions(closed_trades)
+
+    # Step should be 1 (ไม้แก้ 1 for the new cycle), and accumulated loss should only be the new trade's loss ($2.00)!
+    assert guard.get_symbol_martingale_step("ETHUSDT") == 1
+    assert guard.get_symbol_accumulated_loss("ETHUSDT") == 2.00
+
+
