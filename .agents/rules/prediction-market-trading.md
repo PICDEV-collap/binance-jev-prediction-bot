@@ -21,3 +21,17 @@ These guidelines define mandatory engineering, concurrency, and financial invari
 
 ## 4. Market Microstructure & Quote Cap Backoff
 - If Binance quoted price exceeds the odds cap severely ($P_{\text{quote}} \ge \$0.70$ vs cap $\$0.50 - \$0.57$), apply a 180s evaluation backoff on that round to prevent wasteful 60s repeated quote inquiries on polarized rounds.
+
+## 5. Execution Verification & Ghost Position Elimination
+- **Strict `FILLED`-Only Validation:** Binance FOK market orders can be rejected by the matching engine when liquidity or book depth shifts. An order must ONLY be admitted to active positions if its status is explicitly verified as `"FILLED"`.
+- **Zero Fallthrough on `UNKNOWN`:** If verification times out or returns `"UNKNOWN"`, the bot must query `fetch_ongoing_prediction_positions(limit=10)`. If the token is not confirmed present on Binance, it must mark `REJECTED` and abort. NEVER assume filled.
+- **Handling Error Code -9000 ("Exceeded your available shares"):** In early take-profit sell execution, if Binance returns HTTP 400 with code `-9000`, the active desk must immediately purge the position as a phantom rather than retrying endlessly.
+- **Active Cross-Reconciliation (25s Grace Period):** Every cycle of `sync_historical_closed_positions` must cross-reconcile active positions against both Binance `ongoing_positions` and `ended_positions`. Positions older than 25 seconds missing from both must be purged.
+
+## 6. Official Settlement & Order History Parity
+- **Prioritize Official `realizedPnl` for Wins/Take-Profits:** On Binance prediction markets, if a position was partially or fully sold early before expiration, Binance returns the round's total realized profit in `realizedPnl` and only the PnL of the remaining unsold shares in `unrealizedPnl`. History reconciliation must ALWAYS prioritize `realizedPnl` for winning and early-sold positions. For losses, it must use negative total cost (`unrealizedPnl < 0` or `-cost`).
+- **Correlate Order History for Contract Sizing:** In `ended_list`, `shares` represents only the unsold remainder at expiration. To display true initial size and detect early sales, the bot must correlate filled buy orders (`side == BUY`) from `order/history` to determine total bought contracts and tag early sold positions (`side == SELL`) as `TAKE_PROFIT`.
+
+## 7. Continuous Deployment (Vercel) Parity
+- Local commits that fix bugs or enrich features on `main` MUST be pushed to `origin/main` (`git push origin main`) to ensure the production dashboard on Vercel (`binance-jev-prediction-bot.vercel.app`) is in parity with the local runtime.
+
