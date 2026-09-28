@@ -591,10 +591,20 @@ class TradingBotCoordinator:
                         logger.info(f"[ROUND ALREADY TRADED] Market {market.market_id} already has an entry. Skipping duplicate execution.")
                         return
                     else:
-                        # Estimate preliminary cost for pre-flight quote inquiry
+                        # Estimate preliminary cost for pre-flight quote inquiry based on Smart Hybrid recovery sizing
                         est_odds = market.odds_yes if decision.action in ("UP", "BUY_YES") else market.odds_no
-                        mult = self.risk_guard.martingale_multiplier ** market.martingale_step if (self.risk_guard.martingale_enabled and market.martingale_step > 0) else 1.0
-                        est_contracts = max(1, math.ceil(self.risk_guard.default_order_contracts * mult))
+                        if self.risk_guard.martingale_enabled and market.martingale_step > 0:
+                            if self.risk_guard.martingale_mode == "SMART_HYBRID":
+                                accum_loss = self.risk_guard.get_symbol_accumulated_loss(market.symbol)
+                                profit_per_contract = max(0.05, 1.00 - est_odds)
+                                target_gain = accum_loss + (self.risk_guard.default_order_contracts * profit_per_contract)
+                                est_contracts = max(self.risk_guard.default_order_contracts, math.ceil(target_gain / profit_per_contract))
+                            else:
+                                mult = self.risk_guard.martingale_multiplier ** market.martingale_step
+                                est_contracts = max(1, math.ceil(self.risk_guard.default_order_contracts * mult))
+                        else:
+                            est_contracts = self.risk_guard.default_order_contracts
+
                         est_cost = max(1.5, min(self.risk_guard.max_position_size_usdt, float(est_contracts * est_odds)))
 
                         logger.info(

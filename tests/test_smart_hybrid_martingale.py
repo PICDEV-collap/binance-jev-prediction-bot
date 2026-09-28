@@ -154,3 +154,55 @@ def test_dynamic_mode_switching():
     guard.update_thresholds(martingale_mode="SMART_HYBRID")
     assert guard.martingale_mode == "SMART_HYBRID"
     assert guard.metrics["martingale"]["mode"] == "SMART_HYBRID"
+
+
+def test_smart_hybrid_pnl_covers_accumulated_loss_at_prediction_odds():
+    """
+    Test real-world scenario from user report:
+    BNBUSDT accumulated loss = -$2.89 at Step 2, odds = 0.569.
+    Verify that calculated contracts yield net profit >= accumulated loss upon winning.
+    """
+    guard = RiskGuard(
+        martingale_enabled=True,
+        martingale_mode="SMART_HYBRID",
+        martingale_multiplier=2.0,
+        martingale_max_steps=6,
+        default_order_contracts=1,
+        max_position_size_usdt=20.0,
+        confidence_threshold=0.80,
+    )
+
+    # Simulate 2 consecutive losses totaling $2.89
+    guard.record_settlement_result(won=False, pnl=-1.39, symbol="BNBUSDT")
+    guard.record_settlement_result(won=False, pnl=-1.50, symbol="BNBUSDT")
+
+    assert guard.get_symbol_martingale_step("BNBUSDT") == 2
+    assert guard.get_symbol_accumulated_loss("BNBUSDT") == 2.89
+
+    decision = JevEvaluationResult(action="DOWN", confidence=0.92, reasoning="Strong bear continuation")
+    market = MarketContext(
+        market_id="BNBUSDT-5M-TEST",
+        symbol="BNBUSDT",
+        question="Will BNB be Up or Down?",
+        underlying_price=778.0,
+        target_price=0.569,
+        odds_yes=0.431,
+        odds_no=0.569,
+        spread=0.01,
+        time_left_seconds=250,
+        min_payout_multiplier=1.0,
+    )
+
+    res = guard.validate_and_size_order(decision, market)
+    assert res.approved is True
+
+    # Mathematical verification:
+    # Profit per contract = 1.00 - 0.569 = 0.431
+    # Expected profit on win = contracts * 0.431
+    # Expected profit MUST be strictly greater than accumulated loss ($2.89)
+    expected_profit_on_win = res.adjusted_contracts * (1.00 - market.target_price)
+    assert expected_profit_on_win > guard.get_symbol_accumulated_loss("BNBUSDT")
+    assert res.adjusted_contracts >= 7
+    # Exposure must respect max_position_size_usdt
+    assert (res.adjusted_contracts * market.target_price) <= 20.0
+

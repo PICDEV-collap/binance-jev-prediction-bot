@@ -720,22 +720,24 @@ class RiskGuard:
                 # 5. Exact mathematical contracts needed
                 pnl_contracts = math.ceil(target_gain / profit_per_contract)
 
-                # 6. Upper Multiplier Ceiling (Shield 2): Capped by multiplier power
-                multiplier_cap_contracts = max(
-                    self.default_order_contracts + step,
-                    math.ceil(self.default_order_contracts * multiplier)
-                )
+                # 6. Sizing Bounds:
+                # Must buy at least default_order_contracts, sized by pnl_contracts to cover accumulated loss,
+                # strictly bounded by max_possible_contracts (enforcing max_position_size_usdt and live balance)
+                contracts = max(self.default_order_contracts, min(pnl_contracts, max_possible_contracts))
+                if pnl_contracts > max_possible_contracts:
+                    logger.warning(
+                        f"[MARTINGALE BUDGET CAP] {sym} {stage_label}: Needed {pnl_contracts} contracts to fully "
+                        f"recover -${accum_loss:.2f} loss, but capped at {max_possible_contracts} contracts by "
+                        f"max_position_size_usdt (${self.max_position_size_usdt:.2f})."
+                    )
 
-                # 7. Apply smart bounds: at least default_order_contracts, capped by multiplier ceiling
-                hybrid_contracts = max(self.default_order_contracts, min(pnl_contracts, multiplier_cap_contracts))
-                contracts = max(1, min(hybrid_contracts, max_possible_contracts))
                 approval_reason = (
                     f"Martingale Smart Hybrid Recovery ({stage_label}) approved for {sym}: "
                     f"Targeting +${target_gain:.2f} to cover -${accum_loss:.2f} loss (Odds: {target_price:.3f})"
                 )
                 logger.info(
                     f"[MARTINGALE SMART HYBRID SIZING] {sym} {stage_label}: {contracts} contracts "
-                    f"(PnL target: +${target_gain:.2f} covering -${accum_loss:.2f} loss | Cap: {multiplier_cap_contracts}) | "
+                    f"(PnL target: +${target_gain:.2f} covering -${accum_loss:.2f} loss | Needed: {pnl_contracts}) | "
                     f"Exposure: ${contracts * target_price:.2f} | Max Budget: ${self.max_position_size_usdt:.2f}"
                 )
             else:
