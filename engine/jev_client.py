@@ -48,6 +48,9 @@ class MarketContext(BaseModel):
     dvr_ratio: float = 0.0             # Distance-to-Volatility Ratio in sigma
     strike_diff_bps: float = 0.0       # Normalized distance to strike in basis points ((spot - strike) / strike * 10000)
     strike_diff_pct: float = 0.0       # Normalized distance to strike in percentage ((spot - strike) / strike * 100)
+    strike_velocity_bps_s: float = 0.0 # Velocity of distance to strike (bps / second)
+    strike_velocity_desc: str = "STEADY_STAGNANT" # EXPANDING_BULL_BUFFER, EXPANDING_BEAR_BUFFER, RETREATING_TO_STRIKE, STEADY_STAGNANT
+    market_session: str = "ASIAN_HOURS" # ASIAN_HOURS, LONDON_ACTIVE, US_EU_OVERLAP, NEW_YORK_ACTIVE, PACIFIC_TRANSITION
     recent_candles_summary: str = "[]" # Sequence of recent 3 completed 1m candles (e.g. [+0.08% Bull, -0.02% Bear])
     macro_trend_15m: str = "NEUTRAL"   # Macro trend direction on higher timeframe (BULLISH, BEARISH, NEUTRAL)
     rsi_1m: float = 50.0               # 1m Fast RSI
@@ -181,8 +184,9 @@ class JevClient:
             tf_secs = 300 if "5m" in context.timeframe else (900 if "15m" in context.timeframe else (3600 if "1h" in context.timeframe else 86400))
             elapsed_pct = max(0, min(100, int(((tf_secs - context.time_left_seconds) / tf_secs) * 100)))
 
-            dvr_line = f"Volatility & Strike Distance: ATR(1m) = ${context.atr_1m:.2f} | Strike Diff = {bps_str} | DVR = {context.dvr_ratio:+.2f}sigma\n" if context.atr_1m > 0 else f"Strike Distance: {bps_str}\n"
-            pa_line = f"Price Action & Macro Trend: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend (5m/15m) = {context.macro_trend_15m}\n"
+            vel_str = f" | Velocity: {context.strike_velocity_bps_s:+.2f} bps/s ({context.strike_velocity_desc})" if (context.strike_velocity_bps_s != 0.0 or context.strike_velocity_desc != "STEADY_STAGNANT") else ""
+            dvr_line = f"Volatility & Strike Distance: ATR(1m) = ${context.atr_1m:.2f} | Strike Diff = {bps_str}{vel_str} | DVR = {context.dvr_ratio:+.2f}sigma\n" if context.atr_1m > 0 else f"Strike Distance: {bps_str}{vel_str}\n"
+            pa_line = f"Price Action & Macro Trend: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend (5m/15m) = {context.macro_trend_15m} | Session: {context.market_session}\n"
             micro_line = f"Order Flow / Microstructure: Order Book Imbalance (OBI) = {context.order_book_imbalance:+.2f} | BTC Trend: {context.btc_correlation_dir}\n"
             tech_line = f"Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f} | Regime = {context.market_regime}\n"
             danger_line = "⚠️ EXPIRY DANGER ZONE ACTIVE: Under 60s remaining and price is inside volatility noise buffer. Exercise extreme caution.\n" if context.expiry_danger_flag else ""
@@ -288,8 +292,8 @@ class JevClient:
                             f"Round Progress: {elapsed_pct}% elapsed ({context.time_left_seconds}s remaining)\n"
                             f"Underlying Spot: ${context.underlying_price:,.2f} | Target (Strike): ${context.target_price:,.2f} (Diff: {diff_str} | {bps_str})\n"
                             f"Quantitative Signals:\n"
-                            f"- Strike Distance: {bps_str} | DVR = {context.dvr_ratio:+.2f}sigma | ATR(1m) = ${context.atr_1m:.2f}\n"
-                            f"- Price Action & Macro: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend = {context.macro_trend_15m}\n"
+                            f"- Strike Distance: {bps_str}{vel_str} | DVR = {context.dvr_ratio:+.2f}sigma | ATR(1m) = ${context.atr_1m:.2f}\n"
+                            f"- Price Action & Macro: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend = {context.macro_trend_15m} | Session = {context.market_session}\n"
                             f"- Microstructure: OBI (Order Book Imbalance) = {context.order_book_imbalance:+.2f} | BTC Trend = {context.btc_correlation_dir}\n"
                             f"- Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f}\n"
                             f"- 5m Momentum: {context.momentum_pct:+.2f}%\n"
@@ -515,6 +519,15 @@ class JevClient:
         elif context.btc_correlation_dir == "BEARISH":
             btc_effect = -0.015
 
+        # Factor 7: Strike Approach Velocity (Rate of cushion expansion/decay)
+        velocity_effect = 0.0
+        if context.strike_velocity_desc == "EXPANDING_BULL_BUFFER":
+            velocity_effect = +0.015
+        elif context.strike_velocity_desc == "EXPANDING_BEAR_BUFFER":
+            velocity_effect = -0.015
+        elif context.strike_velocity_desc == "RETREATING_TO_STRIKE":
+            confluence_note += " [Velocity Alert: Cushion eroding towards strike]"
+
         # Aggregate theoretical probability
         theoretical_prob = (
             prob_dvr
@@ -524,9 +537,12 @@ class JevClient:
             + rsi_effect
             + confluence_effect
             + btc_effect
+            + velocity_effect
         )
         if "Contradiction Dampener" in confluence_note:
             theoretical_prob = 0.50 + (theoretical_prob - 0.50) * 0.70
+        if "Velocity Alert" in confluence_note:
+            theoretical_prob = 0.50 + (theoretical_prob - 0.50) * 0.85
 
         theoretical_prob = max(0.05, min(0.95, theoretical_prob))
 

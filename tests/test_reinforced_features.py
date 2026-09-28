@@ -30,6 +30,8 @@ from engine.indicators import (
     compute_order_book_imbalance,
     check_expiry_danger,
     classify_market_regime,
+    get_market_session,
+    compute_strike_velocity,
     RollingCandleAggregator,
     Candle,
 )
@@ -146,7 +148,68 @@ def test_kline_seeding_and_enriched_features():
     assert round_metrics["strike_diff_bps"] == 7.14
     assert round_metrics["strike_diff_pct"] == 0.0714
     assert round_metrics["macro_trend_15m"] in ("BULLISH", "BEARISH", "NEUTRAL")
+    assert "strike_velocity_bps_s" in round_metrics
+    assert "strike_velocity_desc" in round_metrics
+    assert "market_session" in round_metrics
     print(f"      -> Seeding & Scale-invariant Strike Diff ({round_metrics['strike_diff_bps']} bps) verified.")
+
+
+def test_strike_velocity_and_market_session():
+    print("[2.6/5] Testing Strike Velocity and Global Market Session context...")
+    import datetime
+    
+    # 1. Market session classification
+    # Fixed UTC timestamps
+    utc_epoch = datetime.datetime(2026, 9, 28, 4, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    assert get_market_session(utc_epoch) == "ASIAN_HOURS"
+    
+    utc_london = datetime.datetime(2026, 9, 28, 9, 30, 0, tzinfo=datetime.timezone.utc).timestamp()
+    assert get_market_session(utc_london) == "LONDON_ACTIVE"
+    
+    utc_overlap = datetime.datetime(2026, 9, 28, 14, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    assert get_market_session(utc_overlap) == "US_EU_OVERLAP"
+    
+    utc_ny = datetime.datetime(2026, 9, 28, 18, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    assert get_market_session(utc_ny) == "NEW_YORK_ACTIVE"
+    
+    utc_pacific = datetime.datetime(2026, 9, 28, 22, 30, 0, tzinfo=datetime.timezone.utc).timestamp()
+    assert get_market_session(utc_pacific) == "PACIFIC_TRANSITION"
+
+    # 2. Strike approach velocity calculation
+    t0 = 1000.0
+    t1 = 1010.0  # +10s
+    
+    # Bull expanding buffer (+10 bps -> +15 bps)
+    hist_bull_exp = [(t0, 10.0)]
+    vel, desc = compute_strike_velocity(hist_bull_exp, current_bps=15.0, now=t1)
+    assert vel == 0.5
+    assert desc == "EXPANDING_BULL_BUFFER"
+
+    # Bull retreating to strike (+15 bps -> +10 bps)
+    hist_bull_ret = [(t0, 15.0)]
+    vel, desc = compute_strike_velocity(hist_bull_ret, current_bps=10.0, now=t1)
+    assert vel == -0.5
+    assert desc == "RETREATING_TO_STRIKE"
+
+    # Bear expanding buffer (-10 bps -> -15 bps)
+    hist_bear_exp = [(t0, -10.0)]
+    vel, desc = compute_strike_velocity(hist_bear_exp, current_bps=-15.0, now=t1)
+    assert vel == -0.5
+    assert desc == "EXPANDING_BEAR_BUFFER"
+
+    # Bear retreating to strike (-15 bps -> -10 bps)
+    hist_bear_ret = [(t0, -15.0)]
+    vel, desc = compute_strike_velocity(hist_bear_ret, current_bps=-10.0, now=t1)
+    assert vel == 0.5
+    assert desc == "RETREATING_TO_STRIKE"
+
+    # Steady
+    hist_steady = [(t0, 5.0)]
+    vel, desc = compute_strike_velocity(hist_steady, current_bps=5.02, now=t1)
+    assert abs(vel) < 0.05
+    assert desc == "STEADY_STAGNANT"
+
+    print("      -> Strike Velocity math & Market Session taxonomy verified successfully.")
 
 
 def test_jev_client_decision_engine():
@@ -264,9 +327,10 @@ if __name__ == "__main__":
     test_indicator_calculations()
     test_rolling_candle_aggregator()
     test_kline_seeding_and_enriched_features()
+    test_strike_velocity_and_market_session()
     asyncio.run(test_jev_client_decision_engine())
     test_risk_guard_gates()
     test_app_import_sanity()
     print("\n========================================================")
-    print(" [OK] ALL 5/5 TEST SUITES PASSED! READY FOR GIT & RESTART.")
+    print(" [OK] ALL 6/6 TEST SUITES PASSED! READY FOR GIT & RESTART.")
     print("========================================================")

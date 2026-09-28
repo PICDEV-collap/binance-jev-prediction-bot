@@ -12,6 +12,7 @@ Pure Python, zero-external-dependency mathematical implementations for:
 """
 
 from __future__ import annotations
+import datetime
 import math
 import time
 from dataclasses import dataclass, field
@@ -259,6 +260,86 @@ def classify_market_regime(
     return "RANGING_COMPRESSION"
 
 
+def get_market_session(timestamp: Optional[float] = None) -> str:
+    """
+    Classify current global trading session by UTC hour.
+    - ASIAN_HOURS: 00:00 - 07:00 UTC (Tokyo, Singapore, Hong Kong)
+    - LONDON_ACTIVE: 07:00 - 12:00 UTC (European liquidity expansion)
+    - US_EU_OVERLAP: 12:00 - 16:00 UTC (Peak global liquidity)
+    - NEW_YORK_ACTIVE: 16:00 - 21:00 UTC (US session trend / close)
+    - PACIFIC_TRANSITION: 21:00 - 24:00 UTC (Late US / early Asian handover)
+    """
+    t = timestamp or time.time()
+    utc_dt = datetime.datetime.fromtimestamp(t, datetime.timezone.utc)
+    hour = utc_dt.hour
+    if 0 <= hour < 7:
+        return "ASIAN_HOURS"
+    elif 7 <= hour < 12:
+        return "LONDON_ACTIVE"
+    elif 12 <= hour < 16:
+        return "US_EU_OVERLAP"
+    elif 16 <= hour < 21:
+        return "NEW_YORK_ACTIVE"
+    else:
+        return "PACIFIC_TRANSITION"
+
+
+def compute_strike_velocity(
+    history: List[Tuple[float, float]],
+    current_bps: float,
+    now: float,
+    window_seconds: float = 30.0,
+) -> Tuple[float, str]:
+    """
+    Compute rate of change of distance to strike (basis points per second)
+    and interpret directional expansion or contraction relative to strike position.
+    
+    Returns:
+        (velocity_bps_s, description)
+    """
+    if not history:
+        return 0.0, "STEADY_STAGNANT"
+    
+    # Filter within window
+    cutoff = now - window_seconds
+    valid_pts = [(t, bps) for t, bps in history if t >= cutoff]
+    if not valid_pts or len(valid_pts) < 2:
+        if history and (now - history[0][0]) >= 2.0:
+            oldest_t, oldest_bps = history[0]
+        else:
+            return 0.0, "STEADY_STAGNANT"
+    else:
+        oldest_t, oldest_bps = valid_pts[0]
+
+    dt = now - oldest_t
+    if dt < 1.0:
+        return 0.0, "STEADY_STAGNANT"
+    
+    velocity = round((current_bps - oldest_bps) / dt, 3)
+
+    # Interpret state relative to current price position vs strike
+    if current_bps > 0:
+        # Currently above strike (Bullish territory)
+        if velocity > 0.05:
+            desc = "EXPANDING_BULL_BUFFER"
+        elif velocity < -0.05:
+            desc = "RETREATING_TO_STRIKE"
+        else:
+            desc = "STEADY_STAGNANT"
+    elif current_bps < 0:
+        # Currently below strike (Bearish territory)
+        if velocity < -0.05:
+            desc = "EXPANDING_BEAR_BUFFER"
+        elif velocity > 0.05:
+            desc = "RETREATING_TO_STRIKE"
+        else:
+            desc = "STEADY_STAGNANT"
+    else:
+        desc = "AT_STRIKE_PIVOT"
+
+    return velocity, desc
+
+
 class RollingCandleAggregator:
     """
     High-speed, memory-efficient in-memory candle builder.
@@ -272,6 +353,7 @@ class RollingCandleAggregator:
         self._history_1m: Dict[str, List[Candle]] = {}
         self._history_5m: Dict[str, List[Candle]] = {}
         self._current_5m: Dict[str, Candle] = {}
+        self._strike_history: Dict[str, List[Tuple[float, float]]] = {}
 
     def update_tick(self, symbol: str, price: float, volume: float = 0.0, timestamp: Optional[float] = None) -> None:
         """Process a price tick and update rolling 1m and 5m candles."""
@@ -454,22 +536,45 @@ class RollingCandleAggregator:
         spot_price: float,
         strike_price: float,
         time_left_seconds: int,
+        round_id: str = "",
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Combine base symbol features with timeframe-specific strike and expiry metrics.
+        Combine base symbol features with timeframe-specific strike, velocity, session, and expiry metrics.
         Ultra-fast arithmetic only (~0.01ms).
         """
         atr_1m = base_features["atr_1m"]
         dvr = compute_dvr(spot_price, strike_price, atr_1m, time_left_seconds)
         price_diff = round(spot_price - strike_price, 4)
 
-        # Scale-invariant strike distance
+        now = timestamp or time.time()
+
+        # Scale-invariant strike distance & velocity
         if strike_price > 0:
             strike_diff_pct = round(((spot_price - strike_price) / strike_price) * 100.0, 4)
             strike_diff_bps = round(((spot_price - strike_price) / strike_price) * 10000.0, 2)
+
+            # Record strike history and compute velocity (bps / s)
+            hist_key = round_id if round_id else f"{base_features.get('symbol', 'SYM')}_{strike_price:.2f}"
+            hist = self._strike_history.setdefault(hist_key, [])
+            hist.append((now, strike_diff_bps))
+            if len(hist) > 40:
+                cutoff_90 = now - 90.0
+                hist[:] = [p for p in hist if p[0] >= cutoff_90]
+
+            # Prune old round keys if map grows large
+            if len(self._strike_history) > 60:
+                cutoff_300 = now - 300.0
+                stale_keys = [k for k, v in self._strike_history.items() if not v or v[-1][0] < cutoff_300]
+                for sk in stale_keys:
+                    self._strike_history.pop(sk, None)
+
+            strike_velocity_bps_s, strike_velocity_desc = compute_strike_velocity(hist, strike_diff_bps, now)
         else:
             strike_diff_pct = 0.0
             strike_diff_bps = 0.0
+            strike_velocity_bps_s = 0.0
+            strike_velocity_desc = "STEADY_STAGNANT"
 
         expiry_danger = check_expiry_danger(time_left_seconds, price_diff, atr_1m)
         regime = classify_market_regime(
@@ -478,12 +583,16 @@ class RollingCandleAggregator:
             dvr,
             base_features["momentum_pct"],
         )
+        market_session = get_market_session(now)
 
         return {
             "atr_1m": atr_1m,
             "dvr_ratio": dvr,
             "strike_diff_bps": strike_diff_bps,
             "strike_diff_pct": strike_diff_pct,
+            "strike_velocity_bps_s": strike_velocity_bps_s,
+            "strike_velocity_desc": strike_velocity_desc,
+            "market_session": market_session,
             "recent_candles_summary": base_features.get("recent_candles_summary", "[]"),
             "macro_trend_15m": base_features.get("macro_trend_15m", "NEUTRAL"),
             "rsi_1m": base_features["rsi_1m"],
@@ -507,6 +616,8 @@ class RollingCandleAggregator:
         bid_qty: float = 0.0,
         ask_qty: float = 0.0,
         btc_momentum_pct: float = 0.0,
+        round_id: str = "",
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Compute full quantitative feature suite for a symbol in under 1 millisecond.
@@ -518,10 +629,13 @@ class RollingCandleAggregator:
             ask_qty=ask_qty,
             btc_momentum_pct=btc_momentum_pct,
         )
+        base["symbol"] = symbol
         return self.compute_round_metrics(
             base_features=base,
             spot_price=spot_price,
             strike_price=strike_price,
             time_left_seconds=time_left_seconds,
+            round_id=round_id,
+            timestamp=timestamp,
         )
 

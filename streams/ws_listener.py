@@ -506,6 +506,7 @@ class BinanceWSListener:
                 spot_price=mark_price,
                 strike_price=strike,
                 time_left_seconds=time_left,
+                round_id=round_id,
             )
 
             results.append(
@@ -527,6 +528,9 @@ class BinanceWSListener:
                     dvr_ratio=metrics["dvr_ratio"] if strike_confirmed else 0.0,
                     strike_diff_bps=metrics["strike_diff_bps"],
                     strike_diff_pct=metrics["strike_diff_pct"],
+                    strike_velocity_bps_s=metrics["strike_velocity_bps_s"],
+                    strike_velocity_desc=metrics["strike_velocity_desc"],
+                    market_session=metrics["market_session"],
                     recent_candles_summary=metrics["recent_candles_summary"],
                     macro_trend_15m=metrics["macro_trend_15m"],
                     rsi_1m=metrics["rsi_1m"],
@@ -662,6 +666,7 @@ class BinanceWSListener:
                 odds_no = round(1.0 - odds_yes, 3)
 
                 self.candle_aggregator.update_tick(symbol, current_price, volume=random.uniform(50, 500))
+                mock_round_id = f"{symbol}-15M-R{int(time.time() // 900)}"
                 metrics = self.candle_aggregator.compute_all_metrics(
                     symbol=symbol,
                     spot_price=current_price,
@@ -670,10 +675,11 @@ class BinanceWSListener:
                     bid_qty=random.uniform(10, 50),
                     ask_qty=random.uniform(10, 50),
                     btc_momentum_pct=0.05,
+                    round_id=mock_round_id,
                 )
 
                 market = MarketContext(
-                    market_id=f"{symbol}-15M-R{int(time.time() // 900)}",
+                    market_id=mock_round_id,
                     symbol=symbol,
                     question=question,
                     odds_yes=odds_yes,
@@ -687,6 +693,11 @@ class BinanceWSListener:
                     momentum_pct=round(pct_change * 100.0, 2),
                     atr_1m=metrics["atr_1m"],
                     dvr_ratio=metrics["dvr_ratio"],
+                    strike_diff_bps=metrics["strike_diff_bps"],
+                    strike_diff_pct=metrics["strike_diff_pct"],
+                    strike_velocity_bps_s=metrics["strike_velocity_bps_s"],
+                    strike_velocity_desc=metrics["strike_velocity_desc"],
+                    market_session=metrics["market_session"],
                     rsi_1m=metrics["rsi_1m"],
                     rsi_5m=metrics["rsi_5m"],
                     ema_trend=metrics["ema_trend"],
