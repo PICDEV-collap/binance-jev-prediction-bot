@@ -32,6 +32,10 @@ export interface MarketItem {
   expiry_danger_flag?: boolean;
   btc_correlation_dir?: string;
   strike_confirmed?: boolean; // True ONLY when Price to Beat (startPrice) is confirmed from Binance
+  round_start_time_sec?: number | null;
+  round_end_time_sec?: number | null;
+  binance_topic_id?: string | null;
+  binance_market_ids?: string[];
   spot_data_age_ms?: number | null;
   indicator_data_ready?: boolean;
   one_minute_sample_count?: number;
@@ -226,6 +230,10 @@ export interface TelemetryRecord {
   contract_down_ask?: number | null;
   contract_quote_timestamp?: number | null;
   contract_quote_source?: string;
+  round_start_time_sec?: number | null;
+  round_end_time_sec?: number | null;
+  binance_topic_id?: string | null;
+  binance_market_ids?: string[];
   time_left_seconds?: number;
   atr_1m?: number;
   dvr_ratio?: number;

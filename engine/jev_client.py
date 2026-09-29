@@ -12,7 +12,7 @@ import math
 import random
 import time
 from dataclasses import dataclass, asdict
-from typing import Literal, Optional, Dict, Any
+from typing import Literal, Optional, Dict, Any, List
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -67,6 +67,10 @@ class MarketContext(BaseModel):
     btc_correlation_dir: str = "FLAT"  # BULLISH, BEARISH, FLAT
     is_stale: bool = False             # Flagged True if network/data silence exceeds tolerance threshold
     strike_confirmed: bool = False     # Flagged True ONLY when Price to Beat (startPrice) is confirmed from Binance SAPI
+    round_start_time_sec: Optional[float] = None
+    round_end_time_sec: Optional[float] = None
+    binance_topic_id: Optional[str] = None
+    binance_market_ids: List[str] = Field(default_factory=list)
     spot_source_timestamp_ms: Optional[int] = None
     spot_data_age_ms: Optional[float] = None
     indicator_data_ready: bool = False

@@ -108,7 +108,6 @@ class BinanceWSListener:
         self._last_event_time: float = 0.0
         self._active_markets: Dict[str, MarketContext] = {}
         self._round_base_prices: Dict[str, float] = {}
-        self._official_strike_prices: Dict[str, float] = {}
         self._official_strike_details: Dict[str, Dict[str, Any]] = {}
         self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
         self._btc_momentum: float = 0.0
@@ -120,27 +119,22 @@ class BinanceWSListener:
         detailed_strikes: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> None:
         """
-        Update cache of official Binance Price to Beat (startPrice) from oracle / marketTopics catalog.
-        Immediately synchronizes active rounds to official strike prices.
-        """
-        if not strike_map and not detailed_strikes:
-            return
-        if strike_map:
-            self._official_strike_prices.update(strike_map)
-        if detailed_strikes:
-            self._official_strike_details.update(detailed_strikes)
+        Cache dated Binance Price to Beat data from the marketTopics catalog.
 
+        ``strike_map`` remains accepted for existing callers, but flat symbol/timeframe
+        values are deliberately ignored because they cannot identify which round they belong to.
+        """
+        if not detailed_strikes:
+            return
+        self._official_strike_details.update(detailed_strikes)
+
+        # Keep only active rounds in the hot cache. An expired market ID must not be
+        # retained as a source for a later round's Price to Beat.
         now = time.time()
-        for key, price in (strike_map or {}).items():
-            if price > 0:
-                detail = self._official_strike_details.get(key)
-                for round_id in list(self._round_base_prices.keys()):
-                    if detail:
-                        et = detail.get("end_time_sec", 0.0)
-                        if et and now >= et:
-                            continue  # Do not update expired round
-                    if key.upper() in round_id.upper():
-                        self._round_base_prices[round_id] = price
+        for key, detail in list(self._official_strike_details.items()):
+            end_time = float(detail.get("end_time_sec", 0.0) or 0.0)
+            if end_time > 0 and end_time <= now:
+                self._official_strike_details.pop(key, None)
 
     def _spawn_task(self, coro) -> asyncio.Task:
         """Spawn background task with strong reference to prevent premature garbage collection in Python 3.12+."""
@@ -437,9 +431,14 @@ class BinanceWSListener:
             self._btc_momentum = momentum_pct
 
         for tf, round_period in TIMEFRAMES:
-            round_idx = int(now // round_period)
-            round_id = f"{symbol}-{tf.upper()}-R{round_idx}"
+            local_round_idx = int(now // round_period)
+            local_round_id = f"{symbol}-{tf.upper()}-R{local_round_idx}"
             time_left = round_period - int(now % round_period)
+            round_id = local_round_id
+            round_start_time: Optional[float] = None
+            round_end_time: Optional[float] = None
+            binance_topic_id: Optional[str] = None
+            binance_market_ids: List[str] = []
 
             # Determine fixed Price to Beat for this round (prioritizes official Binance oracle startPrice)
             strike_confirmed = False
@@ -451,8 +450,14 @@ class BinanceWSListener:
                 d_st = detail.get("start_time_sec", 0.0)
                 d_et = detail.get("end_time_sec", 0.0)
                 d_price = float(detail.get("start_price", 0.0))
-                if d_price > 0 and (d_et == 0.0 or (d_st <= now < d_et)):
+                if d_price > 0 and d_st > 0 and d_et > d_st and d_st <= now < d_et:
                     official_strike = d_price
+                    round_start_time = float(d_st)
+                    round_end_time = float(d_et)
+                    round_id = f"{symbol}-{tf.upper()}-R{int(round_start_time * 1000)}"
+                    time_left = max(0, math.ceil(round_end_time - now))
+                    binance_topic_id = str(detail.get("topic_id") or "") or None
+                    binance_market_ids = [str(value) for value in detail.get("market_ids", []) if value]
 
             # 2. Check round_base_prices cache if already confirmed
             if official_strike > 0:
@@ -462,22 +467,16 @@ class BinanceWSListener:
             elif round_id in self._round_base_prices:
                 strike = self._round_base_prices[round_id]
                 strike_confirmed = True
+            elif self.enable_mock_stream:
+                # Mock stream offline testing mode
+                strike = round(mark_price, 2)
+                strike_confirmed = True
+                self._round_base_prices[round_id] = strike
             else:
-                # 3. Check flat strike map fallback
-                flat_strike = self._official_strike_prices.get(f"{symbol}-{tf}", 0.0)
-                if flat_strike > 0:
-                    strike = flat_strike
-                    strike_confirmed = True
-                    self._round_base_prices[round_id] = strike
-                elif self.enable_mock_stream:
-                    # Mock stream offline testing mode
-                    strike = round(mark_price, 2)
-                    strike_confirmed = True
-                    self._round_base_prices[round_id] = strike
-                else:
-                    # LIVE mode: DO NOT FABRICATE FAKE STRIKE! Waiting for Binance Oracle
-                    strike = mark_price
-                    strike_confirmed = False
+                # Never reuse an unscoped symbol/timeframe strike: it may belong to
+                # the prior Binance market round. Wait for an active dated oracle record.
+                strike = mark_price
+                strike_confirmed = False
 
             price_diff = round(mark_price - strike, 4) if strike_confirmed else 0.0
             target_price = strike if strike_confirmed else 0.0
@@ -533,6 +532,10 @@ class BinanceWSListener:
                     expiry_danger_flag=metrics["expiry_danger_flag"],
                     btc_correlation_dir=metrics["btc_correlation_dir"],
                     strike_confirmed=strike_confirmed,
+                    round_start_time_sec=round_start_time,
+                    round_end_time_sec=round_end_time,
+                    binance_topic_id=binance_topic_id,
+                    binance_market_ids=binance_market_ids,
                     timestamp=now,
                     spot_source_timestamp_ms=source_timestamp_ms,
                     spot_data_age_ms=spot_data_age_ms,
@@ -785,17 +788,34 @@ class BinanceWSListener:
         for k in list(self._active_markets.keys()):
             m = self._active_markets[k]
             round_period = tf_dict.get(m.timeframe, 300)
-            time_left = round_period - int(now % round_period)
-            current_round_idx = int(now // round_period)
-            expected_round_id = f"{m.symbol}-{m.timeframe.upper()}-R{current_round_idx}"
+            if m.round_start_time_sec is not None and m.round_end_time_sec is not None:
+                if m.round_start_time_sec <= now < m.round_end_time_sec:
+                    m.time_left_seconds = max(0, math.ceil(m.round_end_time_sec - now))
+                else:
+                    # The displayed Binance round has expired (or is not active yet).
+                    # Do not carry its strike into a new locally generated round.
+                    m.time_left_seconds = 0
+                    m.strike_confirmed = False
+                    m.target_price = 0.0
+                    m.price_diff = 0.0
+            else:
+                time_left = round_period - int(now % round_period)
+                current_round_idx = int(now // round_period)
+                expected_round_id = f"{m.symbol}-{m.timeframe.upper()}-R{current_round_idx}"
 
-            # If round transitioned before tick, refresh round ID & time remaining
-            if m.market_id != expected_round_id:
-                m.market_id = expected_round_id
-                if expected_round_id in self._round_base_prices:
-                    m.target_price = self._round_base_prices[expected_round_id]
-
-            m.time_left_seconds = time_left
+                # In the absence of an authoritative Binance interval, move the local
+                # ID but clear the previous round's strike instead of silently reusing it.
+                if m.market_id != expected_round_id:
+                    m.market_id = expected_round_id
+                    cached_strike = self._round_base_prices.get(expected_round_id)
+                    if cached_strike is not None:
+                        m.target_price = cached_strike
+                        m.strike_confirmed = True
+                    else:
+                        m.target_price = 0.0
+                        m.price_diff = 0.0
+                        m.strike_confirmed = False
+                m.time_left_seconds = time_left
             m.is_stale = is_net_stale
             active_list.append(m)
 

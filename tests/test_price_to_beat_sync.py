@@ -54,7 +54,20 @@ def test_ws_listener_official_strike_unlocks_confirmed_status():
     
     # Inject official strike from Binance topic
     official_strike = 84533.295
-    listener.update_official_strike_prices({"BTCUSDT-5m": official_strike})
+    listener.update_official_strike_prices(
+        {"BTCUSDT-5m": official_strike},
+        {
+            "BTCUSDT-5m": {
+                "symbol": "BTCUSDT",
+                "timeframe": "5m",
+                "start_price": official_strike,
+                "start_time_sec": now - 60,
+                "end_time_sec": now + 240,
+                "topic_id": "topic-current",
+                "market_ids": ["market-up", "market-down"],
+            }
+        },
+    )
     
     tick_payload = {
         "s": "BTCUSDT",
@@ -73,6 +86,53 @@ def test_ws_listener_official_strike_unlocks_confirmed_status():
     assert btc_5m.strike_confirmed is True
     assert btc_5m.target_price == official_strike
     assert btc_5m.price_diff == round(84550.00 - official_strike, 4)
+    assert btc_5m.binance_topic_id == "topic-current"
+    assert btc_5m.binance_market_ids == ["market-up", "market-down"]
+    assert btc_5m.round_end_time_sec == now + 240
+    assert 0 < btc_5m.time_left_seconds <= 240
+
+
+def test_unscoped_symbol_strike_is_not_reused_for_live_market():
+    listener = BinanceWSListener(enable_mock_stream=False)
+    listener.update_official_strike_prices({"BTCUSDT-5m": 84533.295})
+    now = time.time()
+    contexts = listener._normalize_market_data({
+        "s": "BTCUSDT",
+        "c": "84550.00",
+        "B": "5.0",
+        "A": "5.0",
+        "E": int(now * 1000),
+    })
+
+    btc_5m = next(context for context in contexts if context.timeframe == "5m")
+    assert btc_5m.strike_confirmed is False
+    assert btc_5m.target_price == 0.0
+
+
+def test_market_snapshot_clears_expired_round_strike():
+    listener = BinanceWSListener(enable_mock_stream=False)
+    now = time.time()
+    old_round_index = int(now // 300) - 1
+    listener._active_markets["BTCUSDT_5m"] = MarketContext(
+        market_id=f"BTCUSDT-5M-R{old_round_index}",
+        symbol="BTCUSDT",
+        question="BTC Up or Down 5m",
+        timeframe="5m",
+        odds_yes=0.60,
+        odds_no=0.40,
+        target_price=84533.295,
+        underlying_price=84550.0,
+        strike_confirmed=True,
+        time_left_seconds=1,
+    )
+
+    snapshot = listener.get_active_markets()
+
+    btc_5m = next(market for market in snapshot if market["timeframe"] == "5m")
+    assert btc_5m["market_id"] == f"BTCUSDT-5M-R{int(now // 300)}"
+    assert btc_5m["strike_confirmed"] is False
+    assert btc_5m["target_price"] == 0.0
+    assert 1 <= btc_5m["time_left_seconds"] <= 300
 
 
 def test_binance_client_rejects_expired_topics_for_start_prices():
@@ -116,6 +176,37 @@ def test_binance_client_rejects_expired_topics_for_start_prices():
     # Active BTC topic must be present
     assert start_prices.get("BTCUSDT-5m") == 85004.615
     assert start_prices.get("12672918") == 85004.615
+
+
+def test_binance_client_selects_latest_active_oracle_round_deterministically():
+    client = BinanceClient(api_key="mock", api_secret="mock", paper_trading=True)
+    now = 1790516400.0
+    older_round = {
+        "topicId": "topic-older",
+        "title": "BTC Up or Down 5m",
+        "symbol": "BTCUSDT",
+        "startDate": int((now - 120) * 1000),
+        "endDate": int((now + 180) * 1000),
+        "variantData": {"startPrice": "85000.00"},
+        "markets": [{"marketId": "older-market"}],
+    }
+    latest_round = {
+        "topicId": "topic-latest",
+        "title": "BTC Up or Down 5m",
+        "symbol": "BTCUSDT",
+        "startDate": int((now - 60) * 1000),
+        "endDate": int((now + 240) * 1000),
+        "variantData": {"startPrice": "85010.00"},
+        "markets": [{"marketId": "latest-market"}],
+    }
+    client._prediction_market_cache = {"marketTopics": [latest_round, older_round]}
+
+    details = client.get_detailed_oracle_strikes(now_ts=now)
+    prices = client.get_market_start_prices(now_ts=now)
+
+    assert details["BTCUSDT-5m"]["start_price"] == 85010.0
+    assert details["BTCUSDT-5m"]["topic_id"] == "topic-latest"
+    assert prices["BTCUSDT-5m"] == 85010.0
 
 
 def test_oracle_gate_blocks_ai_evaluation_when_unconfirmed():

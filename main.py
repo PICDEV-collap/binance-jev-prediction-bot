@@ -569,7 +569,11 @@ class TradingBotCoordinator:
 
         # Timing Filter: Ensure round is within active trading window
         time_left = getattr(market, "time_left_seconds", 300)
-        round_period = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}.get(market.timeframe.lower(), 900)
+        round_period = (
+            max(1, int(market.round_end_time_sec - market.round_start_time_sec))
+            if market.round_start_time_sec is not None and market.round_end_time_sec is not None
+            else {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}.get(market.timeframe.lower(), 900)
+        )
 
         # Skip late round entries (< min_time_left_seconds, e.g. < 60s) to prevent asymmetric expiry risk
         if time_left < self.risk_guard.min_time_left_seconds:
@@ -888,6 +892,10 @@ class TradingBotCoordinator:
                 "contract_down_ask": market.contract_down_ask,
                 "contract_quote_timestamp": market.contract_quote_timestamp,
                 "contract_quote_source": market.contract_quote_source,
+                "round_start_time_sec": market.round_start_time_sec,
+                "round_end_time_sec": market.round_end_time_sec,
+                "binance_topic_id": market.binance_topic_id,
+                "binance_market_ids": market.binance_market_ids,
                 "time_left_seconds": market.time_left_seconds,
                 "decision": decision.model_dump(),
                 "risk_validation": risk_result.model_dump(),

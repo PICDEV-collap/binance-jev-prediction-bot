@@ -386,45 +386,15 @@ class BinanceClient:
         Excludes expired rounds to ensure stale strikes from previous rounds are never reused.
         """
         prices: Dict[str, float] = {}
-        topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
-        now_ms = (now_ts or time.time()) * 1000.0
-
-        for t in topics:
-            # Exclude expired rounds or future rounds
-            end_date = t.get("endDate")
-            if end_date and now_ms >= end_date:
+        details = self.get_detailed_oracle_strikes(now_ts=now_ts)
+        for key, detail in details.items():
+            start_price = float(detail.get("start_price", 0.0) or 0.0)
+            if start_price <= 0:
                 continue
-            start_date = t.get("startDate")
-            if start_date and now_ms < start_date:
-                continue
-
-            variant = t.get("variantData") or {}
-            start_price_str = variant.get("startPrice")
-            if not start_price_str:
-                continue
-            try:
-                start_price = float(start_price_str)
-            except (ValueError, TypeError):
-                continue
-
-            title = str(t.get("title", ""))
-            sym = str(t.get("symbol", "")).upper()
-            if not sym or "USDT" not in sym:
-                for candidate in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]:
-                    base = candidate.replace("USDT", "")
-                    if base in title.upper():
-                        sym = candidate
-                        break
-
-            tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
-            tf = tf_match.group(1).lower() if tf_match else "5m"
-
-            if sym and start_price > 0:
-                prices[f"{sym}-{tf}"] = start_price
-                for m in t.get("markets", []):
-                    m_id = str(m.get("marketId", ""))
-                    if m_id:
-                        prices[m_id] = start_price
+            if key == f"{detail.get('symbol')}-{detail.get('timeframe')}":
+                prices[key] = start_price
+            elif key in detail.get("market_ids", []):
+                prices[key] = start_price
         return prices
 
     def get_detailed_oracle_strikes(self, now_ts: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
@@ -434,15 +404,17 @@ class BinanceClient:
         Keyed by f"{symbol}-{tf}" and marketId.
         """
         details: Dict[str, Dict[str, Any]] = {}
+        symbol_rounds: Dict[str, Dict[str, Any]] = {}
         topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
         now_ms = (now_ts or time.time()) * 1000.0
 
         for t in topics:
-            end_date = t.get("endDate")
-            if end_date and now_ms >= end_date:
+            try:
+                start_date = float(t.get("startDate", 0) or 0)
+                end_date = float(t.get("endDate", 0) or 0)
+            except (TypeError, ValueError):
                 continue
-            start_date = t.get("startDate")
-            if start_date and now_ms < start_date:
+            if start_date <= 0 or end_date <= start_date or not (start_date <= now_ms < end_date):
                 continue
 
             variant = t.get("variantData") or {}
@@ -476,11 +448,16 @@ class BinanceClient:
                 "start_time_sec": (start_date / 1000.0) if start_date else 0.0,
                 "end_time_sec": (end_date / 1000.0) if end_date else 0.0,
                 "market_ids": market_ids,
+                "topic_id": str(t.get("topicId") or t.get("marketTopicId") or ""),
             }
             if sym:
-                details[f"{sym}-{tf}"] = info
+                key = f"{sym}-{tf}"
+                previous = symbol_rounds.get(key)
+                if previous is None or info["start_time_sec"] > previous["start_time_sec"]:
+                    symbol_rounds[key] = info
                 for m_id in market_ids:
                     details[m_id] = info
+        details.update(symbol_rounds)
         return details
 
     async def get_prediction_quote(

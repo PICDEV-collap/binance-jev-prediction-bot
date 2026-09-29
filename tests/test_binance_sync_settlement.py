@@ -150,15 +150,23 @@ def test_reconcile_existing_misreported_trade():
     asyncio.run(_run())
 
 
-def test_oracle_strike_price_update():
-    """Verify that ws_listener uses official oracle strike prices when provided."""
-    listener = BinanceWSListener(enable_mock_stream=True)
-    
-    # Inject official strike price from Binance topic
-    official_strikes = {"BTCUSDT-5m": 84533.295}
-    listener.update_official_strike_prices(official_strikes)
-    
-    assert listener._official_strike_prices["BTCUSDT-5m"] == 84533.295
+def test_unscoped_oracle_strike_is_not_cached_or_applied():
+    """A flat symbol/timeframe strike must not leak into an unidentified live round."""
+    listener = BinanceWSListener(enable_mock_stream=False)
+    now = time.time()
+
+    listener.update_official_strike_prices({"BTCUSDT-5m": 84533.295})
+    contexts = listener._normalize_market_data({
+        "s": "BTCUSDT",
+        "c": "84550.00",
+        "B": "5.0",
+        "A": "5.0",
+        "E": int(now * 1000),
+    })
+
+    btc_5m = next(context for context in contexts if context.timeframe == "5m")
+    assert btc_5m.strike_confirmed is False
+    assert btc_5m.target_price == 0.0
 
 
 def test_early_take_profit_reconciliation_parity():
@@ -320,5 +328,4 @@ def test_early_take_profit_reconstructed_from_orders_alone():
         assert "ไม้ 1 (Base)" in guard.get_stage_label("ETHUSDT")
 
     asyncio.run(_run())
-
 

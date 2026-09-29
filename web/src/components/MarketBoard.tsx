@@ -168,6 +168,12 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
             const seconds = market.time_left_seconds % 60;
             const cleanSymbol = market.symbol.replace('USDT', '');
             const tf = market.timeframe || (market.market_id.includes('-5M-') ? '5m' : market.market_id.includes('-1H-') ? '1h' : market.market_id.includes('-1D-') ? '1d' : '15m');
+            const roundEndLabel = market.round_end_time_sec
+              ? new Date(market.round_end_time_sec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+              : null;
+            const roundTitle = market.binance_topic_id
+              ? `Binance topic ${market.binance_topic_id}${market.binance_market_ids?.length ? ` · markets ${market.binance_market_ids.join(', ')}` : ''}`
+              : 'Awaiting the active Binance prediction-market round';
             
             const diff = market.price_diff !== undefined 
               ? market.price_diff 
@@ -222,7 +228,10 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
 
                   <div className="flex items-center gap-1 text-[11px] font-mono text-cyan-300 bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800">
                     <Timer className="w-3 h-3 text-cyan-400" />
-                    <span>{minutes}:{seconds < 10 ? `0${seconds}` : seconds}</span>
+                    <span title={`${roundTitle}${roundEndLabel ? ` · ends ${roundEndLabel}` : ''}`}>
+                      {minutes}:{seconds < 10 ? `0${seconds}` : seconds}
+                      {roundEndLabel && <span className="ml-1 text-slate-500">· End {roundEndLabel}</span>}
+                    </span>
                   </div>
                 </div>
 
@@ -297,9 +306,9 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-slate-500">Current Price:</span>
+                    <span className="text-[11px] text-slate-500">Binance spot price:</span>
                     <div className="flex items-center gap-1.5 font-semibold">
-                      <span className="text-white">
+                      <span className="text-white" title={market.spot_data_age_ms != null ? `Spot feed age ${Math.round(market.spot_data_age_ms)} ms` : 'Spot feed timestamp unavailable'}>
                         ${market.underlying_price >= 1 ? market.underlying_price.toLocaleString('en-US', { minimumFractionDigits: 2 }) : market.underlying_price.toFixed(4)}
                       </span>
                       {market.strike_confirmed !== false && market.target_price > 0 && (
