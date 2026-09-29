@@ -88,6 +88,42 @@ def test_live_settlement_reconciliation_loss():
     asyncio.run(_run())
 
 
+def test_live_order_history_uses_the_filled_positions_timeframe():
+    """The live order log must not fall back to OrderResult's 15m default."""
+    async def _run():
+        client = BinanceClient(api_key="test_key", api_secret="test_secret", paper_trading=False)
+        client._verify_live_order_status = AsyncMock(return_value={
+            "status": "FILLED",
+            "order": {"filledShareQty": "2", "price": "0.58"},
+        })
+
+        result = await client._process_dispatched_live_order(
+            order_id="ORDER_5M",
+            client_order_id="CLIENT_5M",
+            market_id="ETHUSDT-5M-R1790694600000",
+            symbol="ETHUSDT",
+            side="DOWN",
+            clean_side="DOWN",
+            contracts=2,
+            target_price=0.58,
+            strike_price=2716.02,
+            spot_price=2715.25,
+            timeframe="5m",
+            martingale_step=0,
+            stage="Base",
+            token_id="TOKEN_5M",
+            elapsed_ms=25.0,
+        )
+
+        assert result.status == "FILLED"
+        assert result.timeframe == "5m"
+        position = next(iter(client._live_positions.values()))
+        assert position.timeframe == result.timeframe
+        assert position.market_id == result.market_id
+
+    asyncio.run(_run())
+
+
 def test_reconcile_existing_misreported_trade():
     """
     Verify that sync_historical_closed_positions corrects a past misreported trade

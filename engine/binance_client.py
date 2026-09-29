@@ -802,6 +802,7 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round(elapsed_ms, 2),
+                timeframe=timeframe,
                 martingale_step=martingale_step,
                 stage=stage,
                 error_message=err_msg,
@@ -837,6 +838,7 @@ class BinanceClient:
                     price=target_price,
                     status="REJECTED",
                     latency_ms=round(elapsed_ms, 2),
+                    timeframe=timeframe,
                     martingale_step=martingale_step,
                     stage=stage,
                     error_message=err_msg,
@@ -865,6 +867,7 @@ class BinanceClient:
             price=actual_price,
             status="FILLED",
             latency_ms=round(elapsed_ms, 2),
+            timeframe=timeframe,
             martingale_step=martingale_step,
             stage=stage,
         )
@@ -945,6 +948,7 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                timeframe=timeframe,
                 martingale_step=martingale_step,
                 stage=stage,
                 error_message="Live trading requires both Binance API credentials",
@@ -991,6 +995,7 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                timeframe=clean_tf,
                 martingale_step=martingale_step,
                 stage=stage,
                 error_message=err_msg
@@ -1092,6 +1097,7 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                timeframe=clean_tf,
                 martingale_step=martingale_step,
                 stage=stage,
                 error_message=f"Quote error: {err_msg}"
@@ -1134,6 +1140,7 @@ class BinanceClient:
                     price=quoted_price,
                     status="REJECTED",
                     latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                    timeframe=clean_tf,
                     martingale_step=martingale_step,
                     stage=stage,
                     error_message=f"Quoted price ${quoted_price:.3f} exceeds max cap ${self.max_odds_cap:.2f} (Potential win: +{payout_pct:.1f}%)"
@@ -1157,6 +1164,7 @@ class BinanceClient:
                     price=quoted_price,
                     status="REJECTED",
                     latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                    timeframe=clean_tf,
                     martingale_step=martingale_step,
                     stage=stage,
                     error_message=f"Quoted price ${quoted_price:.3f} below floor ${self.min_odds_floor:.2f}"
@@ -1278,6 +1286,7 @@ class BinanceClient:
                         price=target_price,
                         status="REJECTED",
                         latency_ms=round(elapsed_ms, 2),
+                        timeframe=clean_tf,
                         martingale_step=martingale_step,
                         stage=stage,
                         error_message=full_err
@@ -1305,6 +1314,7 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round(elapsed_ms, 2),
+                timeframe=clean_tf,
                 martingale_step=martingale_step,
                 stage=stage,
                 error_message=f"Network Disconnection/Timeout: {net_err}"
@@ -1326,6 +1336,7 @@ class BinanceClient:
                 price=target_price,
                 status="REJECTED",
                 latency_ms=round(elapsed_ms, 2),
+                timeframe=clean_tf,
                 martingale_step=martingale_step,
                 stage=stage,
                 error_message=str(e)
