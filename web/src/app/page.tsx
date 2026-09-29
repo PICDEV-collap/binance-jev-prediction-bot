@@ -503,11 +503,78 @@ export default function DashboardPage() {
     };
   }, [connectWebSocket]);
 
-  // Offline interactive simulator generator when backend is not connected (e.g. Vercel preview)
+  const getApiUrl = (endpoint: string) => {
+    return `${serverUrl.replace(/\/$/, '')}${endpoint}`;
+  };
+
+  // Periodic REST polling fallback to ensure 100% data sync even if WebSocket is disconnected/reconnecting
+  useEffect(() => {
+    let isCancelled = false;
+
+    const fetchRestSnapshot = async () => {
+      try {
+        const [statusRes, posRes, marketsRes] = await Promise.all([
+          fetch(getApiUrl('/api/status')).catch(() => null),
+          fetch(getApiUrl('/api/positions')).catch(() => null),
+          fetch(getApiUrl('/api/markets')).catch(() => null),
+        ]);
+
+        if (isCancelled) return;
+
+        if (statusRes && statusRes.ok) {
+          const sysStatus = await statusRes.json();
+          setStatus(sysStatus);
+          if (sysStatus.bot_status) {
+            setBotStatus(sysStatus.bot_status === 'STOPPED' ? 'STOPPED' : 'RUNNING');
+          }
+          setIsConnected(true);
+        }
+
+        if (posRes && posRes.ok) {
+          const posData = await posRes.json();
+          if (posData.open_positions) {
+            setOpenPositions(posData.open_positions);
+          }
+          if (posData.closed_positions) {
+            setClosedPositions(posData.closed_positions);
+          }
+        }
+
+        if (marketsRes && marketsRes.ok) {
+          const mData = await marketsRes.json();
+          if (Array.isArray(mData) && mData.length > 0) {
+            setMarkets(mData);
+          }
+        }
+      } catch {
+        // Fallback to offline simulator if both WebSocket and REST fail
+      }
+    };
+
+    // Initial immediate fetch on mount / serverUrl change
+    fetchRestSnapshot();
+
+    // If WebSocket is not connected or stalled, poll via REST every 4 seconds
+    const pollInterval = setInterval(() => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        fetchRestSnapshot();
+      }
+    }, 4000);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(pollInterval);
+    };
+  }, [serverUrl]);
+
+  // Offline interactive simulator generator ONLY when both WebSocket AND REST backend are unavailable (e.g. standalone Vercel preview)
   useEffect(() => {
     if (isConnected) return;
 
     const interval = setInterval(() => {
+      // Only simulate if no real backend has responded yet
+      if (status?.trading_mode === 'LIVE_TRADING') return;
+
       setMarkets((prev) =>
         prev.map((m) => {
           const shift = (Math.random() - 0.5) * 0.015;
@@ -522,25 +589,10 @@ export default function DashboardPage() {
           };
         })
       );
-
-      // Simulate live unrealized PnL movement for any open positions
-      setOpenPositions((prev) =>
-        prev.map((pos) => {
-          const pnlShift = (Math.random() - 0.48) * 0.20;
-          return {
-            ...pos,
-            unrealized_pnl: Number((pos.unrealized_pnl + pnlShift).toFixed(2)),
-          };
-        })
-      );
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [isConnected]);
-
-  const getApiUrl = (endpoint: string) => {
-    return `${serverUrl.replace(/\/$/, '')}${endpoint}`;
-  };
+  }, [isConnected, status]);
 
   const handleSaveServerUrl = (newUrl: string) => {
     setServerUrl(newUrl);

@@ -6,6 +6,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import asyncio
 import time
+from unittest.mock import AsyncMock
 from engine.binance_client import BinanceClient, ClosedPositionInfo, PositionInfo
 from engine.risk_guard import RiskGuard
 from streams.ws_listener import BinanceWSListener
@@ -228,4 +229,96 @@ def test_early_take_profit_reconciliation_parity():
         assert pos["is_claimed"] is True
 
     asyncio.run(_run())
+
+
+def test_early_take_profit_reconstructed_from_orders_alone():
+    """
+    Verify that when Binance tab=ENDED omits a 100% early-sold position (0 shares remaining at expiry),
+    sync_historical_closed_positions accurately reconstructs the closed TAKE_PROFIT position
+    from filled sell orders in order/history, and RiskGuard resets Martingale to Step 0.
+    """
+    async def _run():
+        client = BinanceClient(api_key="test_key", api_secret="test_secret", paper_trading=False)
+        guard = RiskGuard(martingale_enabled=True)
+        # Set ETH in a simulated loss state first
+        guard._symbol_martingale_step["ETHUSDT"] = 1
+        guard._symbol_accumulated_loss["ETHUSDT"] = 0.51
+        guard._symbol_consecutive_losses["ETHUSDT"] = 1
+        guard._symbol_last_result["ETHUSDT"] = "LOSS"
+
+        market_id = 12846549
+
+        # tab=ENDED is EMPTY because position was 100% sold early before expiration
+        client.fetch_ended_prediction_positions = AsyncMock(return_value=[])
+
+        # order/history has the complete BUY and SELL execution history
+        mock_orders = [
+            {
+                "orderId": "26092800001923606296",
+                "marketId": market_id,
+                "marketTopicId": 6164109,
+                "marketTopicTitle": "Ethereum Up or Down - September 28, 7PM ET",
+                "slug": "ethereum-up-or-down-september-28-2026-7pm-et",
+                "outcome": "Up",
+                "side": "SELL",
+                "status": "FILLED",
+                "filledShareQty": "0.15",
+                "price": "0.96",
+                "realizedPnl": "0.05413266",
+                "terminalTime": 1790639962874,
+            },
+            {
+                "orderId": "26092800001923585863",
+                "marketId": market_id,
+                "marketTopicId": 6164109,
+                "marketTopicTitle": "Ethereum Up or Down - September 28, 7PM ET",
+                "slug": "ethereum-up-or-down-september-28-2026-7pm-et",
+                "outcome": "Up",
+                "side": "SELL",
+                "status": "FILLED",
+                "filledShareQty": "11.0",
+                "price": "0.92",
+                "realizedPnl": "3.52092873",
+                "terminalTime": 1790638853933,
+            },
+            {
+                "orderId": "26092800001923565534",
+                "marketId": market_id,
+                "marketTopicId": 6164109,
+                "marketTopicTitle": "Ethereum Up or Down - September 28, 7PM ET",
+                "slug": "ethereum-up-or-down-september-28-2026-7pm-et",
+                "outcome": "Up",
+                "side": "BUY",
+                "status": "FILLED",
+                "filledShareQty": "11.15",
+                "price": "0.59",
+                "createTime": 1790637874134,
+            },
+        ]
+        client.fetch_prediction_order_history = AsyncMock(return_value=mock_orders)
+
+        count = await client.sync_historical_closed_positions(limit=10)
+        assert count == 1
+
+        closed = client.get_closed_positions()
+        assert len(closed) == 1
+        pos = closed[0]
+
+        assert pos["symbol"] == "ETHUSDT"
+        assert pos["timeframe"] == "1h"
+        assert pos["result"] == "TAKE_PROFIT"
+        assert pos["realized_pnl"] == 3.58
+        assert pos["contracts"] == 11
+        assert pos["is_claimed"] is True
+        assert pos["settled_at"] == 1790639962.874
+
+        # RiskGuard must reconcile and reset ETHUSDT to Martingale Step 0 with $0.00 loss
+        guard.reconcile_from_closed_positions(client.get_closed_positions())
+        assert guard.get_symbol_martingale_step("ETHUSDT") == 0
+        assert guard.get_symbol_accumulated_loss("ETHUSDT") == 0.0
+        assert guard._symbol_last_result["ETHUSDT"] == "WIN"
+        assert "ไม้ 1 (Base)" in guard.get_stage_label("ETHUSDT")
+
+    asyncio.run(_run())
+
 

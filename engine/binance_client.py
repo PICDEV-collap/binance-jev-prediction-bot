@@ -2457,28 +2457,39 @@ class BinanceClient:
                 except (ValueError, TypeError):
                     pass
 
-        if ended_list:
-            # Concurrently resolve official Oracle strike and settlement prices for unique markets not yet in cache
-            missing_markets = {}
-            for item in ended_list:
-                mid = item.get("marketId")
-                tid = item.get("marketTopicId")
-                if mid and tid:
-                    try:
-                        mid_int = int(mid)
-                        tid_int = int(tid)
-                        if mid_int not in self._market_oracle_cache:
-                            missing_markets[mid_int] = tid_int
-                    except (ValueError, TypeError):
-                        pass
+        # Concurrently resolve official Oracle strike and settlement prices for unique markets not yet in cache
+        missing_markets = {}
+        for item in (ended_list or []):
+            mid = item.get("marketId")
+            tid = item.get("marketTopicId")
+            if mid and tid:
+                try:
+                    mid_int = int(mid)
+                    tid_int = int(tid)
+                    if mid_int not in self._market_oracle_cache:
+                        missing_markets[mid_int] = tid_int
+                except (ValueError, TypeError):
+                    pass
 
-            if missing_markets:
-                sem = asyncio.Semaphore(5)
-                async def _fetch_with_sem(t_id: int, m_id: int):
-                    async with sem:
-                        await self.fetch_market_oracle_prices(t_id, m_id)
+        for o in (raw_orders or []):
+            mid = o.get("marketId")
+            tid = o.get("marketTopicId")
+            if mid and tid:
+                try:
+                    mid_int = int(mid)
+                    tid_int = int(tid)
+                    if mid_int not in self._market_oracle_cache:
+                        missing_markets[mid_int] = tid_int
+                except (ValueError, TypeError):
+                    pass
 
-                await asyncio.gather(*[_fetch_with_sem(tid, mid) for mid, tid in missing_markets.items()], return_exceptions=True)
+        if missing_markets:
+            sem = asyncio.Semaphore(5)
+            async def _fetch_with_sem(t_id: int, m_id: int):
+                async with sem:
+                    await self.fetch_market_oracle_prices(t_id, m_id)
+
+            await asyncio.gather(*[_fetch_with_sem(tid, mid) for mid, tid in missing_markets.items()], return_exceptions=True)
 
         existing_by_token: Dict[str, ClosedPositionInfo] = {}
         for p in self._closed_positions:
@@ -2540,7 +2551,12 @@ class BinanceClient:
             # Derive symbol and timeframe
             sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
             tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
-            tf = tf_match.group(1).lower() if tf_match else "5m"
+            if tf_match:
+                tf = tf_match.group(1).lower()
+            elif "hourly" in title.lower() or "hourly" in str(item.get("slug", "")).lower() or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", title, re.IGNORECASE):
+                tf = "1h"
+            else:
+                tf = "5m"
 
             # Reconstruct true position size (contracts) from bought shares
             if bought_shares > 0:
@@ -2588,6 +2604,100 @@ class BinanceClient:
                 synced_closed.append(closed_item)
             updated_count += 1
 
+        ended_market_ids: Set[int] = {
+            int(item.get("marketId", 0) or 0) for item in ended_list if item.get("marketId")
+        }
+
+        # Also reconstruct any early closed / take-profit positions from order history that Binance omitted from tab=ENDED
+        for mid_int, m_orders in orders_by_market.items():
+            if mid_int in ended_market_ids:
+                continue
+
+            # Skip if this market is currently an active open position in bot memory
+            if any(str(mid_int) in pos.market_id for pos in self._live_positions.values()):
+                continue
+
+            buys = [o for o in m_orders if o.get("side") == "BUY" and o.get("status") == "FILLED"]
+            sells = [o for o in m_orders if o.get("side") == "SELL" and o.get("status") == "FILLED"]
+
+            bought_shares = sum(float(o.get("filledShareQty", 0.0) or 0.0) for o in buys)
+            sold_shares = sum(float(o.get("filledShareQty", 0.0) or 0.0) for o in sells)
+
+            # Check if this position was closed early via sell orders (Take-Profit or Early Exit)
+            if bought_shares > 0 and sold_shares > 0 and (sold_shares >= bought_shares * 0.99):
+                realized_sum = sum(float(o.get("realizedPnl", 0.0) or 0.0) for o in sells)
+                if abs(realized_sum) < 0.0001:
+                    total_usdt_sold = sum(float(o.get("filledUsdtAmount", 0.0) or 0.0) for o in sells)
+                    total_usdt_bought = sum(float(o.get("filledUsdtAmount", 0.0) or 0.0) for o in buys)
+                    pnl = total_usdt_sold - total_usdt_bought
+                else:
+                    pnl = realized_sum
+
+                pnl_final = round(pnl, 4) if abs(pnl) < 0.05 else round(pnl, 2)
+                won = (pnl_final > 0)
+                outcome_label = "TAKE_PROFIT" if won else "LOSS"
+
+                sample_order = buys[0] if buys else sells[0]
+                title = str(sample_order.get("marketTopicTitle") or sample_order.get("marketTitle") or "")
+                slug = str(sample_order.get("slug", "")).lower()
+                side = str(sample_order.get("outcome", "UP")).upper()
+                sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
+                tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
+                if tf_match:
+                    tf = tf_match.group(1).lower()
+                elif "hourly" in title.lower() or "hourly" in slug or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", title, re.IGNORECASE):
+                    tf = "1h"
+                else:
+                    tf = "5m"
+                avg_price = float(buys[0].get("price", 0.50) or 0.50) if buys else 0.50
+                final_contracts = int(round(bought_shares))
+
+                latest_sell_ms = max(
+                    float(o.get("terminalTime") or o.get("modifyTime") or o.get("createTime") or 0)
+                    for o in sells
+                )
+                settled_at = (latest_sell_ms / 1000.0) if latest_sell_ms > 0 else now
+                strike_price, settlement_price = self._market_oracle_cache.get(mid_int, (0.0, 0.0))
+
+                token_id = str(sample_order.get("tokenId", "")).strip() or f"TAKE_PROFIT_{mid_int}"
+
+                orig = existing_by_token.get(token_id)
+                if orig is not None:
+                    orig.result = outcome_label
+                    orig.realized_pnl = pnl_final
+                    orig.contracts = final_contracts
+                    orig.is_claimed = True
+                    orig.settled_at = settled_at
+                    if strike_price > 0:
+                        orig.target_price = strike_price
+                    if settlement_price > 0:
+                        orig.settlement_price = settlement_price
+                    synced_closed.append(orig)
+                else:
+                    pos_id = f"POS_BINANCE_{sample_order.get('orderId', uuid.uuid4().hex[:6])}"
+                    m_id = f"{sym}-{tf.upper()}-B{mid_int}"
+                    closed_item = ClosedPositionInfo(
+                        position_id=pos_id,
+                        market_id=m_id,
+                        symbol=sym,
+                        side=side,
+                        contracts=final_contracts,
+                        entry_price=avg_price,
+                        target_price=strike_price,
+                        settlement_price=settlement_price,
+                        timeframe=tf,
+                        result=outcome_label,
+                        realized_pnl=pnl_final,
+                        martingale_step=0,
+                        stage="Binance Official",
+                        token_id=token_id,
+                        is_claimed=True,
+                        entry_time=settled_at - 300,
+                        settled_at=settled_at,
+                    )
+                    synced_closed.append(closed_item)
+                updated_count += 1
+
         # Replace _closed_positions with the official synced list (sorted oldest to newest)
         synced_closed.sort(key=lambda x: getattr(x, "settled_at", 0))
         self._closed_positions = synced_closed[-100:]
@@ -2595,6 +2705,11 @@ class BinanceClient:
         # CRITICAL FIX: Immediately purge ended/settled tokens from live active positions
         ended_tokens = {str(item.get("tokenId", "")).strip() for item in ended_list if item.get("tokenId")}
         ended_mids = {str(item.get("marketId", "")).strip() for item in ended_list if item.get("marketId")}
+        for c_item in synced_closed:
+            if c_item.token_id:
+                ended_tokens.add(str(c_item.token_id).strip())
+            if "-B" in c_item.market_id:
+                ended_mids.add(c_item.market_id.split("-B")[-1].strip())
         for pid, pos in list(self._live_positions.items()):
             if pos.token_id and pos.token_id in ended_tokens:
                 logger.info(f"[BINANCE HISTORY SYNC] Purging settled position {pid} ({pos.symbol} {pos.market_id}) from active positions (matched tokenId {pos.token_id}).")
@@ -2609,6 +2724,56 @@ class BinanceClient:
             ongoing_tokens = {str(item.get("tokenId", "")).strip() for item in ongoing_positions if item.get("tokenId")}
             ongoing_mids = {str(item.get("marketId", "")).strip() for item in ongoing_positions if item.get("marketId")}
             now_ts = time.time()
+
+            # Hydrate missing live active positions from Binance ONGOING list (e.g. after bot restart)
+            for op in ongoing_positions:
+                op_token = str(op.get("tokenId", "")).strip()
+                op_mid = str(op.get("marketId", "")).strip()
+                if not op_token and not op_mid:
+                    continue
+                already_present = any(
+                    (pos.token_id and pos.token_id == op_token) or (op_mid and op_mid in pos.market_id)
+                    for pos in self._live_positions.values()
+                )
+                if not already_present:
+                    title = str(op.get("marketTopicTitle") or op.get("marketTitle") or "")
+                    sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
+                    tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
+                    if tf_match:
+                        tf = tf_match.group(1).lower()
+                    elif "hourly" in title.lower() or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", title, re.IGNORECASE):
+                        tf = "1h"
+                    else:
+                        tf = "1h"
+                    op_side = str(op.get("outcomeName", "UP")).upper()
+                    shares = float(op.get("shares", 0.0) or 1.0)
+                    avg_p = float(op.get("avgPrice", 0.50) or 0.50)
+                    mid_int = int(op.get("marketId", 0) or 0)
+                    strike_price, _ = self._market_oracle_cache.get(mid_int, (0.0, 0.0))
+                    created_ms = float(op.get("createdTime") or op.get("updatedTime") or (now_ts * 1000))
+                    
+                    hydrated_pos = PositionInfo(
+                        position_id=f"POS_BINANCE_{op.get('positionId', op_mid)}",
+                        market_id=f"{sym}-{tf.upper()}-B{op_mid}",
+                        symbol=sym,
+                        side=op_side,
+                        contracts=int(round(shares)),
+                        entry_price=avg_p,
+                        current_price=strike_price if strike_price > 0 else avg_p,
+                        target_price=strike_price,
+                        timeframe=tf,
+                        unrealized_pnl=0.0,
+                        martingale_step=0,
+                        stage="Binance Official",
+                        token_id=op_token,
+                        is_settling=False,
+                        entry_time=created_ms / 1000.0,
+                    )
+                    self._live_positions[hydrated_pos.position_id] = hydrated_pos
+                    logger.info(
+                        f"[BINANCE ONGOING RECOVERY] Hydrated live active position from Binance: "
+                        f"{hydrated_pos.position_id} ({sym} {op_side} {hydrated_pos.contracts}x @ {avg_p:.3f})"
+                    )
 
             for pid, pos in list(self._live_positions.items()):
                 # Give position 25 seconds grace period after entry before declaring ghost
