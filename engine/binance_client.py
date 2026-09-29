@@ -77,6 +77,55 @@ def _prediction_position_symbol(position: Dict[str, Any]) -> Optional[str]:
     return _prediction_topic_symbol({"symbol": raw_symbol, "title": title})
 
 
+def _prediction_timeframe(position: Dict[str, Any], default: str = "5m") -> str:
+    """Infer a prediction market interval from Binance metadata and its time window."""
+    title = str(
+        position.get("marketTopicTitle")
+        or position.get("marketTitle")
+        or position.get("title")
+        or ""
+    )
+    slug = str(position.get("slug") or "").replace("-", " ").replace("_", " ")
+    text = f"{title} {slug} {position.get('timeframe', '')}".lower()
+
+    explicit = re.search(r"\b(5m|15m|1h|1d)\b", text, re.IGNORECASE)
+    if explicit:
+        return explicit.group(1).lower()
+
+    # Binance titles for short markets commonly carry the exact ET interval,
+    # e.g. "10:35AM-10:40AM ET". Do not mistake those rows for hourly markets.
+    time_range = re.search(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*[-–]\s*"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s+et\b",
+        text,
+        re.IGNORECASE,
+    )
+    if time_range:
+        start_hour, start_minute, start_period, end_hour, end_minute, end_period = time_range.groups()
+
+        def _minutes(hour: str, minute: Optional[str], period: str) -> int:
+            hour_24 = int(hour) % 12
+            if period.lower() == "pm":
+                hour_24 += 12
+            return hour_24 * 60 + int(minute or 0)
+
+        duration = _minutes(end_hour, end_minute, end_period) - _minutes(start_hour, start_minute, start_period)
+        if duration <= 0:
+            duration += 24 * 60
+        if 4 <= duration <= 6:
+            return "5m"
+        if 14 <= duration <= 16:
+            return "15m"
+        if 55 <= duration <= 65:
+            return "1h"
+        if 23 * 60 <= duration <= 25 * 60:
+            return "1d"
+
+    if "hourly" in text or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", text, re.IGNORECASE):
+        return "1h"
+    return default
+
+
 class OrderResult(BaseModel):
     """Execution feedback returned after dispatching an order."""
     order_id: str
@@ -2697,16 +2746,31 @@ class BinanceClient:
             cost = float(item.get("totalCost", 0.0) or 0.0)
             shares = float(item.get("shares", 0.0) or 1.0)
 
-            # Prioritize Binance official realizedPnl for winning / take-profit rounds
-            if won:
-                if realized_raw > 0:
-                    pnl = realized_raw
-                elif unrealized_raw > 0:
-                    pnl = unrealized_raw
-                else:
-                    pnl = (shares * 1.00 - cost) if cost > 0 else 0.0
+            # Binance's official realizedPnl is the round's net result. It can be
+            # positive even when the final outcome lost, if an early partial sale
+            # covered the cost of the position. Never discard it based on isWinner.
+            if abs(realized_raw) > 1e-9:
+                pnl = realized_raw
             else:
-                if unrealized_raw < 0:
+                buy_cash = [o.get("filledUsdtAmount") for o in buys]
+                sell_cash = [o.get("filledUsdtAmount") for o in sells]
+                has_fill_cash = bool(buys) and all(
+                    value not in (None, "") for value in buy_cash + sell_cash
+                )
+                if has_fill_cash:
+                    remaining_shares = max(0.0, bought_shares - sold_shares)
+                    settlement_payout = remaining_shares if won else 0.0
+                    pnl = (
+                        sum(float(value or 0.0) for value in sell_cash)
+                        + settlement_payout
+                        - sum(float(value or 0.0) for value in buy_cash)
+                    )
+                elif won:
+                    if unrealized_raw > 0:
+                        pnl = unrealized_raw
+                    else:
+                        pnl = (shares * 1.00 - cost) if cost > 0 else 0.0
+                elif unrealized_raw < 0:
                     pnl = unrealized_raw
                 elif cost > 0:
                     pnl = -cost
@@ -2728,13 +2792,7 @@ class BinanceClient:
             if not sym:
                 logger.warning("Skipping Binance ended position with unrecognized prediction pair: %s", title)
                 continue
-            tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
-            if tf_match:
-                tf = tf_match.group(1).lower()
-            elif "hourly" in title.lower() or "hourly" in str(item.get("slug", "")).lower() or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", title, re.IGNORECASE):
-                tf = "1h"
-            else:
-                tf = "5m"
+            tf = _prediction_timeframe(item)
 
             # Reconstruct true position size (contracts) from bought shares
             if bought_shares > 0:
@@ -2747,6 +2805,11 @@ class BinanceClient:
 
             orig = existing_by_token.get(token_id)
             if orig is not None:
+                orig.market_id = f"{sym}-{tf.upper()}-B{mid_int}"
+                orig.symbol = sym
+                orig.side = side
+                orig.timeframe = tf
+                orig.entry_price = avg_price
                 orig.result = outcome_label
                 orig.realized_pnl = pnl_final
                 orig.contracts = final_contracts
@@ -2817,19 +2880,12 @@ class BinanceClient:
 
                 sample_order = buys[0] if buys else sells[0]
                 title = str(sample_order.get("marketTopicTitle") or sample_order.get("marketTitle") or "")
-                slug = str(sample_order.get("slug", "")).lower()
                 side = str(sample_order.get("outcome", "UP")).upper()
                 sym = _prediction_position_symbol(sample_order)
                 if not sym:
                     logger.warning("Skipping Binance closed order with unrecognized prediction pair: %s", title)
                     continue
-                tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
-                if tf_match:
-                    tf = tf_match.group(1).lower()
-                elif "hourly" in title.lower() or "hourly" in slug or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", title, re.IGNORECASE):
-                    tf = "1h"
-                else:
-                    tf = "5m"
+                tf = _prediction_timeframe(sample_order)
                 avg_price = float(buys[0].get("price", 0.50) or 0.50) if buys else 0.50
                 final_contracts = int(round(bought_shares))
 
@@ -2922,13 +2978,7 @@ class BinanceClient:
                     if not sym:
                         logger.warning("Skipping Binance ongoing position with unrecognized prediction pair: %s", title)
                         continue
-                    tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
-                    if tf_match:
-                        tf = tf_match.group(1).lower()
-                    elif "hourly" in title.lower() or re.search(r"\b\d{1,2}(?:am|pm)\s+et\b", title, re.IGNORECASE):
-                        tf = "1h"
-                    else:
-                        tf = "1h"
+                    tf = _prediction_timeframe(op, default="1h")
                     op_side = str(op.get("outcomeName", "UP")).upper()
                     shares = float(op.get("shares", 0.0) or 1.0)
                     avg_p = float(op.get("avgPrice", 0.50) or 0.50)

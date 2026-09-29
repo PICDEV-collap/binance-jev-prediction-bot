@@ -239,6 +239,70 @@ def test_early_take_profit_reconciliation_parity():
     asyncio.run(_run())
 
 
+def test_history_sync_keeps_net_pnl_and_corrects_existing_market_metadata():
+    """A losing outcome can still have positive net PnL after a partial sale."""
+    async def _run():
+        for official_pnl in (0.43, 0.0):
+            client = BinanceClient(api_key="test_key", api_secret="test_secret", paper_trading=False)
+            token_id = f"TOKEN_PARTIAL_LOSS_{official_pnl}"
+            existing = ClosedPositionInfo(
+                position_id="POS_OLD_ETH",
+                market_id="ETHUSDT-1H-B12931620",
+                symbol="ETHUSDT",
+                side="DOWN",
+                contracts=3,
+                entry_price=0.52,
+                timeframe="1h",
+                result="LOSS",
+                realized_pnl=-0.46,
+                token_id=token_id,
+                entry_time=time.time() - 600,
+                settled_at=time.time() - 300,
+            )
+            client._closed_positions.append(existing)
+            client.fetch_ended_prediction_positions = AsyncMock(return_value=[{
+                "positionId": 12931620,
+                "marketId": 12931620,
+                "tokenId": token_id,
+                "marketTopicTitle": "Ethereum Up or Down - September 29, 10:35AM-10:40AM ET",
+                "outcomeName": "Down",
+                "shares": "0.88",
+                "avgPrice": "0.52",
+                "totalCost": "1.50",
+                "isWinner": False,
+                "unrealizedPnl": "-0.46",
+                "realizedPnl": str(official_pnl),
+                "updatedTime": int((time.time() - 10) * 1000),
+            }])
+            client.fetch_prediction_order_history = AsyncMock(return_value=[
+                {
+                    "marketId": 12931620,
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "filledShareQty": "2.88",
+                    "filledUsdtAmount": "1.50",
+                },
+                {
+                    "marketId": 12931620,
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "filledShareQty": "2.00",
+                    "filledUsdtAmount": "1.93",
+                },
+            ])
+            client.fetch_ongoing_prediction_positions = AsyncMock(return_value=([], 0, 0))
+
+            assert await client.sync_historical_closed_positions(limit=10) == 1
+            synced = client.get_closed_positions()[0]
+            assert synced["result"] == "LOSS"
+            assert synced["realized_pnl"] == 0.43
+            assert synced["timeframe"] == "5m"
+            assert synced["market_id"] == "ETHUSDT-5M-B12931620"
+            assert synced["contracts"] == 3
+
+    asyncio.run(_run())
+
+
 def test_early_take_profit_reconstructed_from_orders_alone():
     """
     Verify that when Binance tab=ENDED omits a 100% early-sold position (0 shares remaining at expiry),
@@ -328,4 +392,3 @@ def test_early_take_profit_reconstructed_from_orders_alone():
         assert "ไม้ 1 (Base)" in guard.get_stage_label("ETHUSDT")
 
     asyncio.run(_run())
-
