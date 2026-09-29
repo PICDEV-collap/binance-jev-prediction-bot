@@ -21,7 +21,8 @@ import {
   Save,
   CheckCircle2,
   Scale,
-  Percent
+  Percent,
+  Plus
 } from 'lucide-react';
 import { BotConfig } from '../types/trading';
 
@@ -70,7 +71,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentTargetSymbol = 'BTCUSDT',
   currentTargetTimeframe = '15m',
   currentActiveSymbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'],
-  availableSymbols = currentActiveSymbols,
+  availableSymbols = [],
   currentEvalIntervalSeconds = 60,
   currentPaperTrading,
   currentMartingaleEnabled = true,
@@ -107,6 +108,8 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   const [targetSymbol, setTargetSymbol] = useState<string>(currentTargetSymbol.toUpperCase());
   const [targetTimeframe, setTargetTimeframe] = useState<string>(currentTargetTimeframe.toLowerCase());
   const [activeSymbols, setActiveSymbols] = useState<string[]>(currentActiveSymbols);
+  const [manualPairInput, setManualPairInput] = useState<string>('');
+  const [manualPairError, setManualPairError] = useState<string | null>(null);
   const [evalIntervalSeconds, setEvalIntervalSeconds] = useState<number>(currentEvalIntervalSeconds);
   const activeSymbolsKey = currentActiveSymbols.join(',');
 
@@ -154,6 +157,8 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     setTargetSymbol(currentTargetSymbol.toUpperCase());
     setTargetTimeframe(currentTargetTimeframe.toLowerCase());
     setActiveSymbols(currentActiveSymbols);
+    setManualPairInput('');
+    setManualPairError(null);
     setEvalIntervalSeconds(currentEvalIntervalSeconds);
     setPaperTrading(currentPaperTrading);
     setCustomServerUrl(serverUrl);
@@ -297,6 +302,28 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     }
     if (activeSymbols.length >= 24) return;
     setActiveSymbols([...activeSymbols, symbol].sort());
+  };
+
+  const addManualPair = () => {
+    const enteredPair = manualPairInput.trim().toUpperCase().replace(/\s+/g, '');
+    if (!/^[A-Z0-9]{2,20}\/?USDT$/.test(enteredPair)) {
+      setManualPairError('กรอกคู่ Binance แบบ USDT เช่น SOL/USDT');
+      return;
+    }
+
+    const symbol = enteredPair.replace('/', '');
+    if (activeSymbols.some((activeSymbol) => activeSymbol.toUpperCase() === symbol)) {
+      setManualPairError('คู่นี้อยู่ในรายการแล้ว');
+      return;
+    }
+    if (activeSymbols.length >= 24) {
+      setManualPairError('เพิ่มได้สูงสุด 24 คู่');
+      return;
+    }
+
+    setActiveSymbols([...activeSymbols, symbol].sort());
+    setManualPairInput('');
+    setManualPairError(null);
   };
 
   const supportedPairOptions = Array.from(new Set([...availableSymbols, ...activeSymbols])).sort();
@@ -897,6 +924,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                   {supportedPairOptions.map((symbol) => {
                     const checked = activeSymbols.includes(symbol);
                     const disabled = !checked && activeSymbols.length >= 24;
+                    const marketListed = availableSymbols.includes(symbol);
                     return (
                       <label
                         key={symbol}
@@ -914,12 +942,51 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                           className="accent-emerald-500"
                         />
                         <span>{symbol.replace('USDT', '/USDT')}</span>
+                        {checked && availableSymbols.length > 0 && !marketListed && (
+                          <span className="ml-auto text-[9px] text-amber-300" title="Live orders stay blocked until Binance lists a Prediction Market for this pair">
+                            PENDING
+                          </span>
+                        )}
                       </label>
                     );
                   })}
                 </div>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={manualPairInput}
+                    onChange={(event) => {
+                      setManualPairInput(event.target.value);
+                      setManualPairError(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        addManualPair();
+                      }
+                    }}
+                    placeholder="เพิ่มคู่เอง เช่น SOL/USDT"
+                    aria-label="เพิ่มคู่เทรด Binance"
+                    disabled={activeSymbols.length >= 24}
+                    className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                  <button
+                    type="button"
+                    onClick={addManualPair}
+                    disabled={activeSymbols.length >= 24 || !manualPairInput.trim()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs font-mono font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    เพิ่มคู่
+                  </button>
+                </div>
+                {manualPairError && (
+                  <p role="alert" className="text-[10px] font-mono text-rose-300">
+                    {manualPairError}
+                  </p>
+                )}
                 <p className="text-[10px] leading-relaxed text-slate-500 font-mono">
-                  เลือกคู่ที่ Binance มี Prediction Market เพื่อเปิด feed ให้บอท คู่ที่เลือกจะถูกสแกนเมื่อเลือก AI target เป็น ALL
+                  กรอกคู่ Binance แบบ USDT เพื่อเพิ่มเข้า allowlist; Live จะส่งออเดอร์ได้เมื่อ Binance มี Prediction Market ของคู่นั้น โดย AI target = ALL จะสแกนทุกคู่ที่เปิดไว้
                 </p>
               </div>
 

@@ -1021,9 +1021,7 @@ class TradingBotCoordinator:
                 "target_symbol": self.target_symbol,
                 "target_timeframe": self.target_timeframe,
                 "active_symbols": list(self.active_symbols),
-                "available_symbols": sorted(
-                    set(self.binance_client.get_supported_prediction_symbols()) | set(self.active_symbols)
-                ),
+                "available_symbols": sorted(self.binance_client.get_supported_prediction_symbols()),
                 "evaluated_rounds_count": len(self.evaluated_rounds),
                 "evaluation_policy": f"every_{self.eval_interval_seconds}s",
                 "eval_interval_seconds": self.eval_interval_seconds,
@@ -1261,9 +1259,7 @@ async def get_config_endpoint() -> Dict[str, Any]:
             "target_symbol": bot.target_symbol,
             "target_timeframe": bot.target_timeframe,
             "active_symbols": list(bot.active_symbols),
-            "available_symbols": sorted(
-                set(bot.binance_client.get_supported_prediction_symbols()) | set(bot.active_symbols)
-            ),
+            "available_symbols": sorted(bot.binance_client.get_supported_prediction_symbols()),
             "eval_interval_seconds": bot.eval_interval_seconds,
             # Mode & Credentials Status
             "paper_trading": bot.binance_client.paper_trading,
@@ -1295,11 +1291,11 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
             except Exception as exc:
                 logger.warning("Could not refresh Binance pair catalog while updating active pairs: %s", exc)
             available_prediction_symbols = bot.binance_client.get_supported_prediction_symbols()
-            unsupported = sorted(added_symbols - available_prediction_symbols)
-            if unsupported:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Binance has no supported active Prediction market for: {', '.join(unsupported)}",
+            pending_symbols = sorted(added_symbols - available_prediction_symbols)
+            if pending_symbols:
+                logger.info(
+                    "Configured pair(s) without a current Binance Prediction Market; live execution remains blocked: %s",
+                    ", ".join(pending_symbols),
                 )
 
         removed_symbols = set(bot.active_symbols) - set(next_active_symbols)
@@ -1559,9 +1555,7 @@ async def get_target_endpoint() -> Dict[str, Any]:
         "target_symbol": bot.target_symbol,
         "target_timeframe": bot.target_timeframe,
         "active_symbols": list(bot.active_symbols),
-        "available_symbols": sorted(
-            set(bot.binance_client.get_supported_prediction_symbols()) | set(bot.active_symbols)
-        ),
+        "available_symbols": sorted(bot.binance_client.get_supported_prediction_symbols()),
         "evaluated_rounds_count": len(bot.evaluated_rounds),
         "policy": "1x_per_round",
     }

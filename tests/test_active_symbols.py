@@ -1,5 +1,6 @@
 import asyncio
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -100,3 +101,52 @@ def test_listener_accepts_new_pairs_and_reconfigures_streams():
     asyncio.run(listener.configure_active_symbols(["ada/usdt", "SOLUSDT"]))
     assert listener.active_symbols == ["ADAUSDT", "SOLUSDT"]
     assert "adausdt@ticker/solusdt@ticker" in listener.stream_url
+
+
+def test_update_config_accepts_manual_pair_while_catalog_is_pending(monkeypatch):
+    import main
+
+    bot = main.bot
+    monkeypatch.setattr(bot, "active_symbols", ["BTCUSDT"])
+    monkeypatch.setattr(bot, "target_symbol", "ALL")
+    monkeypatch.setattr(main.settings, "active_symbols", "BTCUSDT")
+    monkeypatch.setattr(bot.binance_client, "fetch_prediction_market_topics", AsyncMock(return_value=[]))
+    monkeypatch.setattr(bot.binance_client, "get_supported_prediction_symbols", lambda: {"BTCUSDT"})
+    monkeypatch.setattr(bot.binance_client, "get_positions", lambda: [])
+    monkeypatch.setattr(bot.ws_listener, "configure_active_symbols", AsyncMock())
+    monkeypatch.setattr(
+        bot.risk_guard,
+        "supported_prediction_symbols",
+        set(bot.risk_guard.supported_prediction_symbols),
+    )
+
+    request = main.ConfigUpdateRequest(
+        active_symbols=["BTCUSDT", "SOL/USDT"],
+        target_symbol="ALL",
+        persist_to_env=False,
+    )
+    result = asyncio.run(main.update_config(request))
+
+    assert result["status"] == "success"
+    assert result["current_status"]["target_market"]["active_symbols"] == ["BTCUSDT", "SOLUSDT"]
+    assert result["current_status"]["target_market"]["available_symbols"] == ["BTCUSDT"]
+
+
+def test_live_client_rejects_manual_pair_without_prediction_contract(monkeypatch):
+    client = BinanceClient(api_key="test-key", api_secret="test-secret", paper_trading=False)
+    client._session = type("OpenSession", (), {"closed": False})()
+    monkeypatch.setattr(client, "fetch_prediction_market_topics", AsyncMock(return_value=[]))
+    monkeypatch.setattr(client, "get_supported_prediction_symbols", lambda: {"BTCUSDT"})
+
+    result = asyncio.run(
+        client.place_prediction_order(
+            market_id="SOLUSDT-5M-TEST",
+            symbol="SOLUSDT",
+            side="UP",
+            contracts=1,
+            target_price=0.5,
+        )
+    )
+
+    assert result.status == "REJECTED"
+    assert "no binary prediction contracts on Binance" in result.error_message

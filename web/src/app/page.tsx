@@ -878,7 +878,7 @@ export default function DashboardPage() {
         currentTargetSymbol={status?.target_market?.target_symbol ?? 'BTCUSDT'}
         currentTargetTimeframe={status?.target_market?.target_timeframe ?? '15m'}
         currentActiveSymbols={status?.target_market?.active_symbols ?? ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']}
-        availableSymbols={status?.target_market?.available_symbols ?? ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']}
+        availableSymbols={status?.target_market?.available_symbols ?? []}
         currentEvalIntervalSeconds={status?.target_market?.eval_interval_seconds ?? 60}
         currentPaperTrading={status ? status.trading_mode === 'PAPER_TRADING' : true}
         currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}
