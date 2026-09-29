@@ -35,11 +35,15 @@ def test_risk_guard_sizing_underflow_rejected():
         question="BTC Up or Down",
         odds_yes=0.50,  # 1 contract costs $0.50 (> $0.30 budget)
         odds_no=0.50,
+        contract_up_ask=0.50,
+        contract_down_ask=0.50,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         underlying_price=84000.0,
         target_price=84000.0,
         time_left_seconds=400,
     )
-    decision = JevEvaluationResult(action="UP", confidence=0.85, reasoning="Bullish")
+    decision = JevEvaluationResult(action="UP", confidence=0.85, probability_up=0.85, reasoning="Bullish")
 
     res = guard.validate_and_size_order(decision, ctx)
     assert res.approved is False
@@ -57,14 +61,16 @@ def test_risk_guard_zero_or_negative_pricing_rejected():
         question="BTC Up or Down",
         odds_yes=0.0,
         odds_no=0.0,
+        contract_up_ask=0.0,
+        contract_down_ask=0.0,
         underlying_price=84000.0,
         target_price=84000.0,
         time_left_seconds=400,
     )
-    decision = JevEvaluationResult(action="UP", confidence=0.85, reasoning="Bullish")
+    decision = JevEvaluationResult(action="UP", confidence=0.85, probability_up=0.85, reasoning="Bullish")
     res = guard.validate_and_size_order(decision, ctx)
     assert res.approved is False
-    assert "Invalid pricing" in res.reason or "minimum odds floor" in res.reason
+    assert "MISSING_EXECUTABLE_QUOTE" in res.reason
 
 
 def test_auto_claim_transient_error_preserves_unclaimed_status():

@@ -127,6 +127,10 @@ class RiskGuard:
             "UNREALISTIC_VELOCITY_RISK": 0,
             "UNSUPPORTED_PREDICTION_ASSET": 0,
             "POSITION_SIZE_EXCEEDED": 0,
+            "MISSING_EXECUTABLE_QUOTE": 0,
+            "STALE_EXECUTABLE_QUOTE": 0,
+            "MISSING_OUTCOME_PROBABILITY": 0,
+            "INVALID_OUTCOME_PROBABILITY": 0,
         }
         self.supported_prediction_symbols: Set[str] = {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
 
@@ -620,21 +624,97 @@ class RiskGuard:
                 effective_threshold=effective_threshold,
             )
 
-        # Gate 5: Expected Value (EV) Gate
-        # In Binary Prediction Markets, winning payout is $1.00 per contract.
-        # Cost = target_price. EV = (Confidence * $1.00) - target_price.
-        # Must have a positive edge (EV >= min_ev_edge, e.g. at least +5% edge over market odds).
-        if confirmed_quote_price is not None and confirmed_quote_price > 0:
+        # Gate 5: Expected Value (EV) Gate. Conviction is not a win probability;
+        # use the explicit UP forecast and convert it to the selected outcome.
+        quote_is_confirmed = confirmed_quote_price is not None and confirmed_quote_price > 0
+        if quote_is_confirmed:
             target_price = confirmed_quote_price
+        elif decision.action in ("BUY_YES", "UP"):
+            target_price = market.contract_up_ask
         else:
-            target_price = market.odds_yes if decision.action in ("BUY_YES", "UP") else market.odds_no
-        expected_value = (decision.confidence * 1.00) - target_price
+            target_price = market.contract_down_ask
+
+        if target_price is None or not math.isfinite(float(target_price)) or target_price <= 0:
+            self._record_rejection("MISSING_EXECUTABLE_QUOTE")
+            return RiskEvaluationResult(
+                approved=False,
+                reason="MISSING_EXECUTABLE_QUOTE: no valid Binance outcome quote is available",
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
+
+        if not quote_is_confirmed:
+            quote_time = market.contract_quote_timestamp
+            quote_age = (now - quote_time) if quote_time is not None else math.inf
+            if quote_age < 0 or quote_age > 5.0:
+                self._record_rejection("STALE_EXECUTABLE_QUOTE")
+                return RiskEvaluationResult(
+                    approved=False,
+                    reason="STALE_EXECUTABLE_QUOTE: execution quote is missing or older than 5 seconds",
+                    adjusted_contracts=0,
+                    confidence=decision.confidence,
+                    market_id=market.market_id,
+                    action=decision.action,
+                    target_price=float(target_price),
+                    martingale_step=step,
+                    stage_label=stage_label,
+                    multiplier=multiplier,
+                    effective_threshold=effective_threshold,
+                )
+
+        if decision.probability_up is None:
+            self._record_rejection("MISSING_OUTCOME_PROBABILITY")
+            return RiskEvaluationResult(
+                approved=False,
+                reason="MISSING_OUTCOME_PROBABILITY: confidence cannot substitute for P(UP)",
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                target_price=float(target_price),
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
+
+        if (
+            (decision.action in ("UP", "BUY_YES") and decision.probability_up < 0.5)
+            or (decision.action in ("DOWN", "BUY_NO") and decision.probability_up >= 0.5)
+        ):
+            self._record_rejection("INVALID_OUTCOME_PROBABILITY")
+            return RiskEvaluationResult(
+                approved=False,
+                reason="INVALID_OUTCOME_PROBABILITY: action conflicts with P(UP)",
+                adjusted_contracts=0,
+                confidence=decision.confidence,
+                market_id=market.market_id,
+                action=decision.action,
+                target_price=float(target_price),
+                martingale_step=step,
+                stage_label=stage_label,
+                multiplier=multiplier,
+                effective_threshold=effective_threshold,
+            )
+
+        probability_for_action = (
+            decision.probability_up
+            if decision.action in ("BUY_YES", "UP")
+            else 1.0 - decision.probability_up
+        )
+        expected_value = (probability_for_action * 1.00) - float(target_price)
         min_ev_edge = self.min_ev_edge
         if expected_value < min_ev_edge:
             self._record_rejection("NEGATIVE_EV_RISK")
             ev_reason = (
                 f"Negative/Low Expected Value Filter: EV is {expected_value:+.3f} (Edge: {expected_value*100:+.1f}% < {min_ev_edge*100:.1f}%). "
-                f"Market price {target_price:.3f} is too expensive for conviction {decision.confidence*100:.0f}%."
+                f"Market price {float(target_price):.3f} is too expensive for P(win) {probability_for_action*100:.1f}%."
             )
             logger.info(f"[RISK FILTER] {ev_reason} for {market.market_id}. Capital preserved.")
             return RiskEvaluationResult(
@@ -644,7 +724,7 @@ class RiskGuard:
                 confidence=decision.confidence,
                 market_id=market.market_id,
                 action=decision.action,
-                target_price=target_price,
+                target_price=float(target_price),
                 martingale_step=step,
                 stage_label=stage_label,
                 multiplier=multiplier,
@@ -652,6 +732,7 @@ class RiskGuard:
             )
 
         # Gate 5.5: Odds Pricing and Skew Sanity Check (Strict Bounds to guarantee favorable Risk/Reward)
+        target_price = float(target_price)
         if target_price < self.min_odds_floor:
             self._record_rejection("EXTREME_ODDS_RISK")
             reason_str = (
@@ -696,7 +777,7 @@ class RiskGuard:
             )
 
         # Gate 6: Spread Sanity Check
-        if market.spread > 0.06:
+        if market.spread is not None and market.spread > 0.06:
             self._record_rejection("WIDE_SPREAD")
             return RiskEvaluationResult(
                 approved=False,

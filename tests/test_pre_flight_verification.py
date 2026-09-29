@@ -255,6 +255,7 @@ def test_pre_flight_success_and_risk_guard_integration():
         decision = JevEvaluationResult(
             action="UP",
             confidence=0.88,
+            probability_up=0.88,
             horizon_minutes=5,
             edge_estimate=0.15,
             reasoning="Strong momentum confirmation"
@@ -330,3 +331,53 @@ def test_trading_bot_coordinator_order_execution_lock_exists():
     assert hasattr(bot, "_order_execution_lock")
     assert isinstance(bot._order_execution_lock, asyncio.Lock)
 
+
+def test_prediction_quote_snapshot_requires_two_executable_quotes():
+    async def _run():
+        now_ms = int(time.time() * 1000)
+        client = BinanceClient(api_key="test_key", api_secret="test_secret", paper_trading=False)
+        topic = {
+            "topicId": "topic-current",
+            "title": "BTC Up or Down 5m",
+            "symbol": "BTCUSDT",
+            "startDate": now_ms - 60_000,
+            "endDate": now_ms + 240_000,
+            "markets": [{
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "Up", "tokenId": "up-token"},
+                    {"name": "Down", "tokenId": "down-token"},
+                ],
+            }],
+        }
+
+        async def mock_topics(force_refresh=False):
+            return [topic]
+
+        async def mock_quote(token_id, **kwargs):
+            price = "0.54" if token_id == "up-token" else "0.47"
+            return {"quoteId": f"quote-{token_id}", "price": price}
+
+        client.fetch_prediction_market_topics = mock_topics
+        client.get_prediction_quote = mock_quote
+
+        snapshot = await client.get_prediction_quote_snapshot("BTCUSDT", "5m", estimated_cost_usdt=2.0)
+
+        assert snapshot is not None
+        assert snapshot["up_ask"] == 0.54
+        assert snapshot["down_ask"] == 0.47
+        assert snapshot["source"] == "binance_prediction_buy_quote"
+        assert snapshot["quote_ids"] == {
+            "up": "quote-up-token",
+            "down": "quote-down-token",
+        }
+
+        async def missing_down_quote(token_id, **kwargs):
+            if token_id == "down-token":
+                return None
+            return {"quoteId": "quote-up", "price": "0.54"}
+
+        client.get_prediction_quote = missing_down_quote
+        assert await client.get_prediction_quote_snapshot("BTCUSDT", "5m") is None
+
+    asyncio.run(_run())

@@ -270,7 +270,7 @@ const JevAiRadarComponent: React.FC<JevAiRadarProps> = ({
           <div className="flex items-center justify-between text-slate-400 text-[10px]">
             <span className="flex items-center gap-1">
               <Scale className="w-3 h-3 text-amber-400" />
-              <span>Order Imbalance</span>
+              <span>Spot Top-of-Book Imbalance</span>
             </span>
             <span className="text-[9px] text-slate-500">OBI</span>
           </div>
@@ -278,10 +278,20 @@ const JevAiRadarComponent: React.FC<JevAiRadarProps> = ({
             <span className={`text-xs font-bold ${
               (latestRecord?.order_book_imbalance ?? 0) > 0.1 ? 'text-emerald-400' : (latestRecord?.order_book_imbalance ?? 0) < -0.1 ? 'text-rose-400' : 'text-slate-300'
             }`}>
-              {latestRecord?.order_book_imbalance !== undefined ? `${latestRecord.order_book_imbalance > 0 ? '+' : ''}${(latestRecord.order_book_imbalance * 100).toFixed(0)}%` : '0%'}
+              {latestRecord?.obi_available === false
+                ? 'N/A'
+                : latestRecord?.order_book_imbalance !== undefined
+                  ? `${latestRecord.order_book_imbalance > 0 ? '+' : ''}${(latestRecord.order_book_imbalance * 100).toFixed(0)}%`
+                  : 'N/A'}
             </span>
             <span className="text-[9px] text-slate-500">
-              {(latestRecord?.order_book_imbalance ?? 0) > 0.1 ? 'Bid Wall' : (latestRecord?.order_book_imbalance ?? 0) < -0.1 ? 'Ask Wall' : 'Balanced'}
+              {latestRecord?.obi_available === false
+                ? 'Unavailable'
+                : (latestRecord?.order_book_imbalance ?? 0) > 0.1
+                  ? 'Bid-side tilt'
+                  : (latestRecord?.order_book_imbalance ?? 0) < -0.1
+                    ? 'Ask-side tilt'
+                    : 'Balanced'}
             </span>
           </div>
         </div>

@@ -10,6 +10,7 @@ from collections import deque
 import hashlib
 import hmac
 import logging
+import math
 import re
 import time
 import uuid
@@ -532,6 +533,121 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Exception requesting prediction quote: {e}")
             return None
+
+    @staticmethod
+    def _extract_prediction_quote_price(quote_data: Optional[Dict[str, Any]]) -> Optional[float]:
+        """Normalize Binance's direct price or amountIn/amountOut quote representation."""
+        if not quote_data:
+            return None
+        try:
+            if quote_data.get("price") is not None:
+                price = float(quote_data["price"])
+            elif quote_data.get("amountIn") is not None and quote_data.get("amountOut") is not None:
+                amount_in = float(quote_data["amountIn"])
+                amount_out = float(quote_data["amountOut"])
+                price = amount_in / amount_out if amount_out > 0 else math.nan
+            else:
+                return None
+        except (ValueError, TypeError, ZeroDivisionError):
+            return None
+        return price if math.isfinite(price) and 0.0 < price <= 1.0 else None
+
+    async def get_prediction_quote_snapshot(
+        self,
+        symbol: str,
+        timeframe: str,
+        estimated_cost_usdt: float = 1.5,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch fresh, executable BUY quotes for both outcomes of the active market.
+
+        These are per-outcome execution prices, not order-book midpoints. Live callers
+        must fail closed if either side cannot be quoted. Paper mode returns an explicitly
+        marked simulation price and never represents it as exchange market data.
+        """
+        if self.paper_trading:
+            return {
+                "up_ask": 0.50,
+                "down_ask": 0.50,
+                "timestamp": time.time(),
+                "source": "paper_simulation",
+                "quote_ids": {},
+            }
+        if not (self.api_key.strip() and self.api_secret.strip()):
+            return None
+
+        topics = await self.fetch_prediction_market_topics()
+        now_ms = time.time() * 1000.0
+        clean_symbol = symbol.upper().strip()
+        clean_base = clean_symbol.replace("USDT", "")
+        clean_tf = timeframe.lower().strip()
+
+        candidates: List[Dict[str, Any]] = []
+        for topic in topics:
+            title = str(topic.get("title", ""))
+            topic_symbol = str(topic.get("symbol", "")).upper()
+            if not ((topic_symbol == clean_symbol) or (clean_base and clean_base in title.upper())):
+                continue
+            if not re.search(rf"\b{re.escape(clean_tf)}\b", title, re.IGNORECASE):
+                continue
+            try:
+                start_ms = float(topic.get("startDate", 0) or 0)
+                end_ms = float(topic.get("endDate", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+            if (start_ms and now_ms < start_ms) or (end_ms and now_ms >= end_ms):
+                continue
+            candidates.append(topic)
+
+        # Prefer the most recently started active round if the catalog briefly overlaps.
+        candidates.sort(key=lambda item: float(item.get("startDate", 0) or 0), reverse=True)
+        for topic in candidates:
+            token_ids: Dict[str, str] = {}
+            for market in topic.get("markets", []):
+                if str(market.get("tradingStatus", "OPEN")).upper() not in {"OPEN", "REGISTERED"}:
+                    continue
+                for outcome in market.get("outcomes", []):
+                    name = str(outcome.get("name", "")).strip().lower()
+                    token_id = str(outcome.get("tokenId", "")).strip()
+                    if token_id and name in {"up", "yes"}:
+                        token_ids["up"] = token_id
+                    elif token_id and name in {"down", "no"}:
+                        token_ids["down"] = token_id
+                if "up" in token_ids and "down" in token_ids:
+                    break
+            if not {"up", "down"}.issubset(token_ids):
+                continue
+
+            amount_wei = str(int(max(1.5, estimated_cost_usdt) * 10**18))
+            up_task = self.get_prediction_quote(
+                token_id=token_ids["up"], amount_wei=amount_wei, side="BUY",
+                order_type="MARKET", slippage_bps=self.slippage_bps,
+            )
+            down_task = self.get_prediction_quote(
+                token_id=token_ids["down"], amount_wei=amount_wei, side="BUY",
+                order_type="MARKET", slippage_bps=self.slippage_bps,
+            )
+            up_data, down_data = await asyncio.gather(up_task, down_task, return_exceptions=False)
+            up_price = self._extract_prediction_quote_price(up_data)
+            down_price = self._extract_prediction_quote_price(down_data)
+            if (
+                up_price is None or down_price is None
+                or not up_data or not down_data
+                or not up_data.get("quoteId") or not down_data.get("quoteId")
+            ):
+                continue
+            return {
+                "up_ask": up_price,
+                "down_ask": down_price,
+                "timestamp": time.time(),
+                "source": "binance_prediction_buy_quote",
+                "quote_ids": {
+                    "up": str(up_data["quoteId"]),
+                    "down": str(down_data["quoteId"]),
+                },
+                "estimated_cost_usdt": max(1.5, estimated_cost_usdt),
+                "market_topic_id": str(topic.get("topicId", "")),
+            }
+        return None
 
     async def _verify_live_order_status(self, order_id: str, timeout_seconds: float = 3.5) -> Dict[str, Any]:
         """

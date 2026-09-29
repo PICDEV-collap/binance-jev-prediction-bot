@@ -8,10 +8,14 @@ export interface MarketItem {
   symbol: string;
   question: string;
   timeframe?: string;
-  odds_yes: number; // UP Odds
-  odds_no: number;  // DOWN Odds
-  spread: number;
-  volume_24h: number;
+  odds_yes: number; // Spot-derived model estimate P(UP), not a contract price
+  odds_no: number;  // Spot-derived model estimate P(DOWN), not a contract price
+  spread?: number | null; // Prediction contract spread is unknown unless supplied by its order book
+  contract_up_ask?: number | null;
+  contract_down_ask?: number | null;
+  contract_quote_timestamp?: number | null;
+  contract_quote_source?: string;
+  volume_24h: number; // Underlying spot pair's rolling 24h quote volume
   time_left_seconds: number;
   underlying_price: number; // Current Price
   target_price: number;     // Price to Beat
@@ -23,16 +27,23 @@ export interface MarketItem {
   rsi_5m?: number;
   ema_trend?: string;
   order_book_imbalance?: number;
+  obi_available?: boolean;
   market_regime?: string;
   expiry_danger_flag?: boolean;
   btc_correlation_dir?: string;
   strike_confirmed?: boolean; // True ONLY when Price to Beat (startPrice) is confirmed from Binance
+  spot_data_age_ms?: number | null;
+  indicator_data_ready?: boolean;
+  one_minute_sample_count?: number;
+  five_minute_sample_count?: number;
+  momentum_available?: boolean;
   timestamp?: number;
 }
 
 export interface JevDecision {
   action: ActionType;
   confidence: number;
+  probability_up?: number | null;
   reasoning: string;
   model: string;
   latency_ms: number;
@@ -209,8 +220,12 @@ export interface TelemetryRecord {
   underlying_price?: number;
   target_price?: number;
   momentum_pct?: number;
-  spread?: number;
+  spread?: number | null;
   volume_24h?: number;
+  contract_up_ask?: number | null;
+  contract_down_ask?: number | null;
+  contract_quote_timestamp?: number | null;
+  contract_quote_source?: string;
   time_left_seconds?: number;
   atr_1m?: number;
   dvr_ratio?: number;
@@ -218,6 +233,7 @@ export interface TelemetryRecord {
   rsi_5m?: number;
   ema_trend?: string;
   order_book_imbalance?: number;
+  obi_available?: boolean;
   market_regime?: string;
   expiry_danger_flag?: boolean;
   btc_correlation_dir?: string;

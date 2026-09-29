@@ -28,11 +28,15 @@ def test_max_odds_cap_rejection():
         question="BTC Up or Down 5m",
         odds_yes=0.65,
         odds_no=0.35,
+        contract_up_ask=0.65,
+        contract_down_ask=0.35,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         underlying_price=84200.0,
         target_price=84100.0,
         time_left_seconds=200,
     )
-    decision = JevEvaluationResult(action="UP", confidence=0.85, reasoning="Bullish")
+    decision = JevEvaluationResult(action="UP", confidence=0.85, probability_up=0.85, reasoning="Bullish")
 
     res = guard.validate_and_size_order(decision, ctx)
     assert res.approved is False
@@ -51,16 +55,50 @@ def test_min_odds_floor_rejection():
         question="BTC Up or Down 5m",
         odds_yes=0.01,
         odds_no=0.99,
+        contract_up_ask=0.01,
+        contract_down_ask=0.99,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         underlying_price=84000.0,
         target_price=84100.0,
         time_left_seconds=200,
     )
-    decision = JevEvaluationResult(action="UP", confidence=0.85, reasoning="Reversal hope")
+    decision = JevEvaluationResult(action="UP", confidence=0.85, probability_up=0.85, reasoning="Reversal hope")
 
     res = guard.validate_and_size_order(decision, ctx)
     assert res.approved is False
     assert "below minimum odds floor" in res.reason
     assert guard._rejection_counts["EXTREME_ODDS_RISK"] > 0
+
+
+def test_ev_uses_outcome_probability_not_model_confidence():
+    """High conviction must not turn a negative outcome-probability edge into a trade."""
+    guard = RiskGuard(confidence_threshold=0.80, min_odds_floor=0.10, max_odds_cap=0.90)
+    ctx = MarketContext(
+        market_id="BTCUSDT-5M-PROBABILITY-TEST",
+        symbol="BTCUSDT",
+        question="BTC Up or Down 5m",
+        odds_yes=0.99,
+        odds_no=0.01,
+        contract_up_ask=0.70,
+        contract_down_ask=0.30,
+        contract_quote_timestamp=time.time(),
+        underlying_price=84200.0,
+        target_price=84100.0,
+        time_left_seconds=200,
+    )
+    decision = JevEvaluationResult(
+        action="UP",
+        confidence=0.99,
+        probability_up=0.65,
+        reasoning="High conviction, but P(UP) is below the executable quote.",
+    )
+
+    result = guard.validate_and_size_order(decision, ctx)
+
+    assert result.approved is False
+    assert "EV is -0.050" in result.reason
+    assert guard._rejection_counts["NEGATIVE_EV_RISK"] == 1
 
 
 def test_time_window_filter_rejection():
@@ -74,12 +112,16 @@ def test_time_window_filter_rejection():
         question="BTC Up or Down 5m",
         odds_yes=0.52,
         odds_no=0.48,
+        contract_up_ask=0.52,
+        contract_down_ask=0.48,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         underlying_price=84200.0,
         target_price=84100.0,
         time_left_seconds=75,
         expiry_danger_flag=False,
     )
-    decision = JevEvaluationResult(action="UP", confidence=0.85, reasoning="Bullish")
+    decision = JevEvaluationResult(action="UP", confidence=0.85, probability_up=0.85, reasoning="Bullish")
 
     res = guard.validate_and_size_order(decision, ctx)
     assert res.approved is False
@@ -191,7 +233,7 @@ def test_fifteen_min_confluence_and_contradiction():
 
 
 def test_asymmetric_odds_penalty():
-    """Verify that heuristic applies asymmetric odds penalty when contract price > 0.60."""
+    """The heuristic only applies its price penalty to an executable contract quote."""
     async def _run():
         client = JevClient(api_key="")
 
@@ -203,6 +245,10 @@ def test_asymmetric_odds_penalty():
             timeframe="15m",
             odds_yes=0.68,
             odds_no=0.32,
+            contract_up_ask=0.68,
+            contract_down_ask=0.32,
+            contract_quote_timestamp=time.time(),
+            contract_quote_source="test_quote",
             underlying_price=85200.0,
             target_price=85100.0,
             price_diff=100.0,
@@ -214,7 +260,7 @@ def test_asymmetric_odds_penalty():
             momentum_pct=0.10,
         )
         res_exp = await client.evaluate_market(ctx_expensive)
-        assert "Asymmetric Odds Penalty" in res_exp.reasoning
+        assert "Quote Price Penalty" in res_exp.reasoning
 
     asyncio.run(_run())
 
@@ -231,16 +277,18 @@ def test_unsupported_prediction_asset_rejection():
         timeframe="15m",
         odds_yes=0.50,
         odds_no=0.50,
+        contract_up_ask=0.50,
+        contract_down_ask=0.50,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         underlying_price=135.0,
         target_price=134.0,
         time_left_seconds=500,
     )
-    decision = JevEvaluationResult(action="DOWN", confidence=0.88, reasoning="Bearish momentum")
+    decision = JevEvaluationResult(action="DOWN", confidence=0.88, probability_up=0.12, reasoning="Bearish momentum")
 
     res = guard.validate_and_size_order(decision, ctx_sol)
     assert res.approved is False
     assert "has no binary prediction contracts on Binance" in res.reason
     assert "Supported: BNBUSDT, BTCUSDT, ETHUSDT" in res.reason
     assert guard._rejection_counts["UNSUPPORTED_PREDICTION_ASSET"] == 1
-
-

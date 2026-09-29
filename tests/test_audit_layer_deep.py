@@ -40,7 +40,7 @@ def test_jev_client_markdown_json_parsing():
         "choices": [
             {
                 "message": {
-                    "content": '```json\n{\n  "action": "UP",\n  "confidence": 0.88,\n  "reasoning": "Strong momentum and OBI support"\n}\n```'
+                    "content": '```json\n{\n  "action": "UP",\n  "confidence": 0.88,\n  "probability_up": 0.87,\n  "reasoning": "Strong momentum and OBI support"\n}\n```'
                 }
             }
         ]
@@ -49,6 +49,7 @@ def test_jev_client_markdown_json_parsing():
     result = client._parse_api_response(data_with_fence, elapsed_ms=15.0)
     assert result.action == "UP"
     assert result.confidence == 0.88
+    assert result.probability_up == 0.87
     assert "Strong momentum" in result.reasoning
 
     # 2. Markdown fence without json tag ``` { ... } ``` and leading/trailing thoughts
@@ -56,7 +57,7 @@ def test_jev_client_markdown_json_parsing():
         "choices": [
             {
                 "message": {
-                    "content": 'Here is my prediction decision:\n```\n{"action": "DOWN", "confidence": 0.91, "reasoning": "Bearish EMA alignment"}\n```\nEnd of decision.'
+                    "content": 'Here is my prediction decision:\n```\n{"action": "DOWN", "confidence": 0.91, "probability_up": 0.09, "reasoning": "Bearish EMA alignment"}\n```\nEnd of decision.'
                 }
             }
         ]
@@ -64,6 +65,7 @@ def test_jev_client_markdown_json_parsing():
     result2 = client._parse_api_response(data_with_wrapper, elapsed_ms=20.0)
     assert result2.action == "DOWN"
     assert result2.confidence == 0.91
+    assert result2.probability_up == 0.09
     assert "Bearish EMA" in result2.reasoning
 
 

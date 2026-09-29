@@ -541,6 +541,18 @@ class TradingBotCoordinator:
         if self.bot_status != "RUNNING" or self.is_paused:
             return
 
+        # Reject stale or incomplete live inputs before spending an AI request or
+        # performing a Binance pre-flight inquiry.
+        if market.is_stale:
+            return
+        if not self.binance_client.paper_trading:
+            if market.spot_data_age_ms is None or market.spot_data_age_ms > 5000:
+                logger.warning("[AI SKIPPED] Spot event timestamp is missing or stale for %s.", market.market_id)
+                return
+            if not market.indicator_data_ready or not market.momentum_available or not market.obi_available:
+                logger.warning("[AI SKIPPED] Indicator or spot top-of-book data is incomplete for %s.", market.market_id)
+                return
+
         # Supported Asset Filter: In live trading, only evaluate coins that Binance Prediction Markets actually supports
         if not self.binance_client.paper_trading:
             supported_syms = self.binance_client.get_supported_prediction_symbols()
@@ -610,10 +622,33 @@ class TradingBotCoordinator:
         self._eval_in_progress.add(market.market_id)
 
         try:
+            # Supply the model with executable contract prices, independently from
+            # the spot-derived probability estimate carried in odds_yes/odds_no.
+            quote_cost = max(
+                1.5,
+                min(self.risk_guard.max_position_size_usdt,
+                    self.risk_guard.default_order_contracts * 0.50),
+            )
+            quote_snapshot = await self.binance_client.get_prediction_quote_snapshot(
+                symbol=market.symbol,
+                timeframe=market.timeframe,
+                estimated_cost_usdt=quote_cost,
+            )
+            if not quote_snapshot:
+                logger.warning(
+                    "[AI SKIPPED] Could not obtain fresh UP and DOWN execution quotes for %s; no synthetic quote fallback is used.",
+                    market.market_id,
+                )
+                return
+            market.contract_up_ask = float(quote_snapshot["up_ask"])
+            market.contract_down_ask = float(quote_snapshot["down_ask"])
+            market.contract_quote_timestamp = float(quote_snapshot["timestamp"])
+            market.contract_quote_source = str(quote_snapshot["source"])
+
             logger.info(
                 f"[AI EVALUATION TRIGGERED: Every {self.eval_interval_seconds}s] Symbol: {market.symbol} | TF: {market.timeframe} | "
                 f"Round: {market.market_id} | TimeLeft: {market.time_left_seconds}s | Spot: ${market.underlying_price:,.2f} | Beat: ${market.target_price:,.2f} | "
-                f"DVR: {market.dvr_ratio:+.2f}sigma | OBI: {market.order_book_imbalance:+.2f} | Trend: {market.ema_trend} | RSI: {market.rsi_5m:.1f}"
+                f"DVR: {market.dvr_ratio:+.2f} expected-travel units | Spot top-of-book imbalance: {market.order_book_imbalance:+.2f} | Trend: {market.ema_trend} | RSI: {market.rsi_5m:.1f}"
             )
 
             # Step 0: Fetch historical win/loss performance feedback (Approach 3: Hybrid)
@@ -629,6 +664,12 @@ class TradingBotCoordinator:
 
             # Step 1: AI Evaluation via Jev AI Decision Engine
             decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
+            fallback_blocked = decision.is_mock and not self.binance_client.paper_trading
+            if fallback_blocked:
+                logger.error(
+                    "[LIVE EXECUTION BLOCKED] Jev AI used the local fallback for %s; live orders require a valid remote AI response.",
+                    market.market_id,
+                )
 
             pre_flight = None
             pre_verified_quote = None
@@ -636,7 +677,11 @@ class TradingBotCoordinator:
             order_result: Optional[OrderResult] = None
 
             # Step 2: Pre-Flight Binance Verification & Risk Guard Validation with Strict Mutual Exclusion Lock
-            if decision.action in ("UP", "DOWN", "BUY_YES", "BUY_NO") and decision.confidence >= self.risk_guard.confidence_threshold:
+            if (
+                not fallback_blocked
+                and decision.action in ("UP", "DOWN", "BUY_YES", "BUY_NO")
+                and decision.confidence >= self.risk_guard.confidence_threshold
+            ):
                 async with self._order_execution_lock:
                     if self.bot_status != "RUNNING" or self.is_paused:
                         logger.info("[ORDER ABORTED] Bot was stopped before the order lock was acquired.")
@@ -668,7 +713,11 @@ class TradingBotCoordinator:
                         return
                     else:
                         # Estimate preliminary cost for pre-flight quote inquiry based on Smart Hybrid recovery sizing
-                        est_odds = market.odds_yes if decision.action in ("UP", "BUY_YES") else market.odds_no
+                        est_odds = (
+                            market.contract_up_ask
+                            if decision.action in ("UP", "BUY_YES")
+                            else market.contract_down_ask
+                        ) or 0.50
                         mult = self.risk_guard.martingale_multiplier ** market.martingale_step if (self.risk_guard.martingale_enabled and market.martingale_step > 0) else 1.0
                         if self.risk_guard.martingale_enabled and market.martingale_step > 0:
                             if self.risk_guard.martingale_mode == "SMART_HYBRID":
@@ -786,6 +835,19 @@ class TradingBotCoordinator:
                                             f"[QUOTE CAP BACKOFF] Market {market.market_id} is heavily overpriced (${order_result.price:.3f} >= $0.70). "
                                             f"Applying 180s evaluation backoff on this round."
                                         )
+            elif fallback_blocked:
+                risk_result = RiskEvaluationResult(
+                    approved=False,
+                    reason="LIVE_EXECUTION_BLOCKED: Jev AI API unavailable; local heuristic fallback cannot place live orders",
+                    adjusted_contracts=0,
+                    confidence=decision.confidence,
+                    market_id=market.market_id,
+                    action=decision.action,
+                    martingale_step=market.martingale_step,
+                    stage_label=market.martingale_stage,
+                    multiplier=1.0,
+                    effective_threshold=market.effective_hurdle,
+                )
             else:
                 open_positions = len(self.binance_client.get_positions())
                 risk_result = self.risk_guard.validate_and_size_order(
@@ -816,11 +878,16 @@ class TradingBotCoordinator:
                 "rsi_5m": getattr(market, "rsi_5m", 50.0),
                 "ema_trend": getattr(market, "ema_trend", "NEUTRAL_CHOP"),
                 "order_book_imbalance": getattr(market, "order_book_imbalance", 0.0),
+                "obi_available": market.obi_available,
                 "market_regime": getattr(market, "market_regime", "RANGING"),
                 "expiry_danger_flag": getattr(market, "expiry_danger_flag", False),
                 "btc_correlation_dir": getattr(market, "btc_correlation_dir", "FLAT"),
                 "spread": market.spread,
                 "volume_24h": market.volume_24h,
+                "contract_up_ask": market.contract_up_ask,
+                "contract_down_ask": market.contract_down_ask,
+                "contract_quote_timestamp": market.contract_quote_timestamp,
+                "contract_quote_source": market.contract_quote_source,
                 "time_left_seconds": market.time_left_seconds,
                 "decision": decision.model_dump(),
                 "risk_validation": risk_result.model_dump(),
@@ -1442,15 +1509,23 @@ async def manual_trade_endpoint(req: ManualTradeRequest) -> Dict[str, Any]:
             raise HTTPException(status_code=409, detail="The active market has invalid spot data")
 
     clean_side = "UP" if req.side in ("UP", "BUY_YES") else "DOWN"
-    current_price = float(market.get("odds_yes" if clean_side == "UP" else "odds_no", 0.0))
     time_left = int(market.get("time_left_seconds", 0))
     timeframe = str(market.get("timeframe", "15m")).lower()
-    if not (0.0 < current_price < 1.0):
-        raise HTTPException(status_code=409, detail="The active market has invalid odds")
+    quote_snapshot = await bot.binance_client.get_prediction_quote_snapshot(
+        symbol=symbol,
+        timeframe=timeframe,
+        estimated_cost_usdt=max(1.5, req.contracts * 0.50),
+    )
+    if not quote_snapshot:
+        raise HTTPException(status_code=503, detail="Binance could not provide fresh UP/DOWN execution quotes")
+    current_price = float(quote_snapshot["up_ask"] if clean_side == "UP" else quote_snapshot["down_ask"])
+    if not math.isfinite(current_price) or not (0.0 < current_price < 1.0):
+        raise HTTPException(status_code=409, detail="Binance returned an invalid execution quote")
     if not (bot.risk_guard.min_odds_floor <= current_price <= bot.risk_guard.max_odds_cap):
         raise HTTPException(status_code=409, detail="The active market odds are outside the configured risk limits")
-    spread = float(market.get("spread", 1.0))
-    if not math.isfinite(spread) or spread < 0.0 or spread > 0.06:
+    spread_value = market.get("spread")
+    spread = float(spread_value) if spread_value is not None else None
+    if spread is not None and (not math.isfinite(spread) or spread < 0.0 or spread > 0.06):
         raise HTTPException(status_code=409, detail="The active market spread exceeds the configured safety limit")
     effective_min_time = (
         max(bot.risk_guard.min_time_left_seconds, 120)

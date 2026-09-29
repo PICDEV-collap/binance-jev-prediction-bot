@@ -528,6 +528,11 @@ class RollingCandleAggregator:
             "ema_9": round(ema_9, 2),
             "ema_21": round(ema_21, 2),
             "ema_50": round(ema_50, 2),
+            "one_minute_sample_count": len(closes_1m),
+            "five_minute_sample_count": len(closes_5m),
+            # EMA(50) needs a full window and RSI needs at least 15 closes.
+            "indicator_data_ready": len(closes_1m) >= 50 and len(closes_5m) >= 15,
+            "momentum_available": len(closes_1m) >= 5,
         }
 
     def compute_round_metrics(
@@ -638,4 +643,3 @@ class RollingCandleAggregator:
             round_id=round_id,
             timestamp=timestamp,
         )
-

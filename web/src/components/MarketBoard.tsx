@@ -249,7 +249,7 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
                       <span>{upPct.toFixed(0)}%</span>
                     </div>
                     <div className="text-[11px] font-mono text-emerald-300/80 font-semibold uppercase tracking-wider group-hover:text-emerald-300">
-                      Up ({market.odds_yes.toFixed(3)})
+                      Model estimate · Buy {market.contract_up_ask != null ? `$${market.contract_up_ask.toFixed(3)}` : 'quote unavailable'}
                     </div>
                   </div>
 
@@ -273,7 +273,7 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
                       <span>{downPct.toFixed(0)}%</span>
                     </div>
                     <div className="text-[11px] font-mono text-rose-300/80 font-semibold uppercase tracking-wider group-hover:text-rose-300">
-                      Down ({market.odds_no.toFixed(3)})
+                      Model estimate · Buy {market.contract_down_ask != null ? `$${market.contract_down_ask.toFixed(3)}` : 'quote unavailable'}
                     </div>
                   </div>
 
@@ -325,7 +325,7 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
 
                 {/* Bottom Metadata: Volume & Set Target Action */}
                 <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 pt-1">
-                  <span>Pool: ${(market.volume_24h / 1000).toFixed(0)}k</span>
+                  <span>Spot 24h quote volume: ${(market.volume_24h / 1000).toFixed(0)}k</span>
                   
                   {onSetAiTarget && (
                     <button

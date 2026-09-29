@@ -28,7 +28,12 @@ class MarketContext(BaseModel):
     timeframe: str = "15m"  # "5m", "15m", "1h", "1d"
     odds_yes: float = Field(..., ge=0.0, le=1.0)  # UP Odds
     odds_no: float = Field(..., ge=0.0, le=1.0)   # DOWN Odds
-    spread: float = 0.01
+    # ``odds_yes/no`` are model-generated directional estimates, not executable contract prices.
+    spread: Optional[float] = None  # Real prediction-contract spread is unavailable from this feed.
+    contract_up_ask: Optional[float] = None
+    contract_down_ask: Optional[float] = None
+    contract_quote_timestamp: Optional[float] = None
+    contract_quote_source: str = "unavailable"
     volume_24h: float = 0.0
     time_left_seconds: int = 300
     underlying_price: float = 0.0  # Current Price
@@ -45,7 +50,7 @@ class MarketContext(BaseModel):
 
     # --- Enriched Quantitative & Volatility Features ---
     atr_1m: float = 0.0
-    dvr_ratio: float = 0.0             # Distance-to-Volatility Ratio in sigma
+    dvr_ratio: float = 0.0             # Distance-to-expected-travel ratio, not a statistical sigma
     strike_diff_bps: float = 0.0       # Normalized distance to strike in basis points ((spot - strike) / strike * 10000)
     strike_diff_pct: float = 0.0       # Normalized distance to strike in percentage ((spot - strike) / strike * 100)
     strike_velocity_bps_s: float = 0.0 # Velocity of distance to strike (bps / second)
@@ -62,6 +67,13 @@ class MarketContext(BaseModel):
     btc_correlation_dir: str = "FLAT"  # BULLISH, BEARISH, FLAT
     is_stale: bool = False             # Flagged True if network/data silence exceeds tolerance threshold
     strike_confirmed: bool = False     # Flagged True ONLY when Price to Beat (startPrice) is confirmed from Binance SAPI
+    spot_source_timestamp_ms: Optional[int] = None
+    spot_data_age_ms: Optional[float] = None
+    indicator_data_ready: bool = False
+    one_minute_sample_count: int = 0
+    five_minute_sample_count: int = 0
+    momentum_available: bool = False
+    obi_available: bool = False
 
     @property
     def odds_up(self) -> float:
@@ -76,6 +88,9 @@ class JevEvaluationResult(BaseModel):
     """Structured decision returned by Jev AI (Strictly binary UP or DOWN)."""
     action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"]
     confidence: float = Field(..., ge=0.0, le=1.0)
+    # Probability that UP settles true. RiskGuard converts this to the selected side's
+    # probability; confidence remains a separate conviction/hurdle signal.
+    probability_up: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     reasoning: str
     model: str = "jev-predict-v1"
     latency_ms: float = 0.0
@@ -171,10 +186,36 @@ class JevClient:
                 "Prioritize sustained directional persistence over minor 1m counter-ticks."
             )
 
+        quote_age_ms = (
+            max(0.0, (time.time() - context.contract_quote_timestamp) * 1000.0)
+            if context.contract_quote_timestamp is not None
+            else None
+        )
+        if context.contract_up_ask is not None and context.contract_down_ask is not None:
+            quote_age_text = f"{quote_age_ms:.0f}ms" if quote_age_ms is not None else "unknown"
+            contract_quote_line = (
+                f"Executable Binance buy quotes for this amount: UP ${context.contract_up_ask:.4f} | "
+                f"DOWN ${context.contract_down_ask:.4f} | source={context.contract_quote_source} | "
+                f"age={quote_age_text}\n"
+            )
+        else:
+            contract_quote_line = "Executable Binance buy quotes: unavailable; do not treat model estimates as market prices.\n"
+
+        data_quality_line = (
+            f"Data quality: spot age={context.spot_data_age_ms:.0f}ms | "
+            f"1m candles={context.one_minute_sample_count} | 5m candles={context.five_minute_sample_count} | "
+            f"indicators_ready={context.indicator_data_ready} | "
+            f"spot top-of-book OBI={'available' if context.obi_available else 'unavailable'} | "
+            f"momentum={'available' if context.momentum_available else 'unavailable'}\n"
+            if context.spot_data_age_ms is not None
+            else "Data quality: spot event timestamp unavailable.\n"
+        )
+
         ev_directive = (
-            "\n⚖️ ASYMMETRIC VALUE & EV RULE: Binary contracts with odds <= 0.60 yield positive risk-reward (pay <= $0.60 to win $1.00 net payout >= +66.7%). "
-            "Do NOT assign high confidence to overpriced odds (> 0.60) unless there is overwhelming multi-factor confluence (EV edge >= +5%). "
-            "When Trend and Order Book Imbalance (OBI) contradict each other, penalize confidence towards 0.50 (market chop/uncertainty)."
+            "\nExpected value rule: probability and conviction are separate. A low contract price alone does not imply positive EV. "
+            "Estimate P(UP) explicitly; compare the selected side's probability with its executable buy quote, allowing for fees and slippage. "
+            "Do not invent quote, spread, volume, or unavailable indicator values. "
+            "When trend and spot top-of-book imbalance conflict, lower conviction."
         )
 
         if "systemone" in self.endpoint:
@@ -185,9 +226,9 @@ class JevClient:
             elapsed_pct = max(0, min(100, int(((tf_secs - context.time_left_seconds) / tf_secs) * 100)))
 
             vel_str = f" | Velocity: {context.strike_velocity_bps_s:+.2f} bps/s ({context.strike_velocity_desc})" if (context.strike_velocity_bps_s != 0.0 or context.strike_velocity_desc != "STEADY_STAGNANT") else ""
-            dvr_line = f"Volatility & Strike Distance: ATR(1m) = ${context.atr_1m:.2f} | Strike Diff = {bps_str}{vel_str} | DVR = {context.dvr_ratio:+.2f}sigma\n" if context.atr_1m > 0 else f"Strike Distance: {bps_str}{vel_str}\n"
+            dvr_line = f"Volatility & Strike Distance: ATR(1m) = ${context.atr_1m:.2f} | Strike Diff = {bps_str}{vel_str} | DVR = {context.dvr_ratio:+.2f} expected-travel units (ATR scaled by square-root time, not calibrated sigma)\n" if context.atr_1m > 0 else f"Strike Distance: {bps_str}{vel_str}\n"
             pa_line = f"Price Action & Macro Trend: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend (5m/15m) = {context.macro_trend_15m} | Session: {context.market_session}\n"
-            micro_line = f"Order Flow / Microstructure: Order Book Imbalance (OBI) = {context.order_book_imbalance:+.2f} | BTC Trend: {context.btc_correlation_dir}\n"
+            micro_line = f"Spot top-of-book imbalance = {context.order_book_imbalance:+.2f} ({'available' if context.obi_available else 'unavailable'}) | BTC short-term direction = {context.btc_correlation_dir}\n"
             tech_line = f"Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f} | Regime = {context.market_regime}\n"
             danger_line = "⚠️ EXPIRY DANGER ZONE ACTIVE: Under 60s remaining and price is inside volatility noise buffer. Exercise extreme caution.\n" if context.expiry_danger_flag else ""
             
@@ -196,10 +237,11 @@ class JevClient:
                 f"Market: {clean_sym} Up or Down {context.timeframe} (ID: {context.market_id})\n"
                 f"Symbol: {context.symbol} | Timeframe: {context.timeframe}\n"
                 f"Current Price: ${context.underlying_price:,.2f} | Price to Beat: ${context.target_price:,.2f} (Diff: {diff_str} | {bps_str})\n"
-                f"Current Market Odds: UP {context.odds_yes:.3f} ({context.odds_yes*100:.1f}%) | "
-                f"DOWN {context.odds_no:.3f} ({context.odds_no*100:.1f}%)\n"
-                f"Spread: {context.spread:.3f} | 24h Volume: ${context.volume_24h:,.0f}\n"
-                f"Momentum: {context.momentum_pct:+.3f}%\n"
+                f"Model-derived directional estimate (not a contract price): UP {context.odds_yes:.3f} | DOWN {context.odds_no:.3f}\n"
+                f"{contract_quote_line}"
+                f"Underlying spot 24h quote volume: ${context.volume_24h:,.0f}\n"
+                f"Approx. 5m spot momentum: {context.momentum_pct:+.3f}% ({'available' if context.momentum_available else 'unavailable'})\n"
+                f"{data_quality_line}"
                 f"{dvr_line}"
                 f"{pa_line}"
                 f"{micro_line}"
@@ -226,6 +268,10 @@ class JevClient:
                     "settle_above_price_to_beat": {
                         "type": "noul",
                         "instructions": "Will the underlying market price settle greater than or equal to the Price to Beat at expiration?"
+                    },
+                    "probability_up": {
+                        "type": "noul",
+                        "instructions": "Give your explicit probability from 0 to 1 that the underlying price settles UP. This is a forecast probability, separate from confidence."
                     }
                 }
             }
@@ -251,14 +297,20 @@ class JevClient:
                                 },
                                 "confidence": {
                                     "type": "number",
-                                    "description": "Confidence score from 0.50 to 1.0"
+                                    "description": "Analytical conviction from 0.50 to 1.0; do not use this as the outcome probability"
+                                },
+                                "probability_up": {
+                                    "type": "number",
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "description": "Explicit probability that the underlying price settles UP, distinct from conviction"
                                 },
                                 "reasoning": {
                                     "type": "string",
                                     "description": "Concise quantitative rationale for UP or DOWN decision"
                                 }
                             },
-                            "required": ["action", "confidence", "reasoning"],
+                            "required": ["action", "confidence", "probability_up", "reasoning"],
                             "additionalProperties": False
                         }
                     }
@@ -271,14 +323,14 @@ class JevClient:
                             "specialized in binary prediction markets. Binary decision mode is strictly active: "
                             "you MUST predict either UP or DOWN. "
                             "TIMEFRAME PERSISTENCE: For 15m markets, give priority to macro trend structure and order flow over transient noise. "
-                            "ASYMMETRIC VALUE & EV: Binary payouts require favorable odds (<= 0.60) to maintain positive expectancy. "
+                            "EXPECTED VALUE: A low quote alone does not imply positive expectancy. Estimate P(UP) separately from conviction and compare it with the executable quote. "
                             "Demand multi-factor confluence (EMA trend, OBI flow, and DVR) before assigning high confidence (>= 0.65). "
                             "When signals conflict (e.g. Trend vs OBI contradiction), penalize confidence towards neutral (0.50). "
                             "FEEDBACK DIRECTIVE: If a recent track record is provided, use it to gauge current market regime consistency. "
                             "MARTINGALE RECOVERY RULES: When Martingale Recovery is active, an escalating conviction hurdle is enforced. "
                             "Demand higher analytical momentum and price distance conviction before outputting high confidence. "
                             "AVOID GAMBLER'S FALLACY: Past outcomes do NOT guarantee an alternation of UP or DOWN. "
-                            "Output ONLY a valid JSON object matching the schema with action, confidence, and reasoning."
+                            "Output ONLY a valid JSON object matching the schema with action, confidence, probability_up, and reasoning."
                         )
                     },
                     {
@@ -287,22 +339,24 @@ class JevClient:
                             f"Evaluate prediction market opportunity:\n"
                             f"Market: {context.question} (ID: {context.market_id})\n"
                             f"Symbol: {context.symbol} | Timeframe: {context.timeframe}\n"
-                            f"Current Odds - UP: {context.odds_yes:.3f} | DOWN: {context.odds_no:.3f}\n"
-                            f"Spread: {context.spread:.4f} | 24h Volume: ${context.volume_24h:,.0f}\n"
+                            f"Model-derived directional estimate (not a contract price): UP {context.odds_yes:.3f} | DOWN {context.odds_no:.3f}\n"
+                            f"{contract_quote_line}"
+                            f"Underlying spot 24h quote volume: ${context.volume_24h:,.0f}\n"
                             f"Round Progress: {elapsed_pct}% elapsed ({context.time_left_seconds}s remaining)\n"
                             f"Underlying Spot: ${context.underlying_price:,.2f} | Target (Strike): ${context.target_price:,.2f} (Diff: {diff_str} | {bps_str})\n"
                             f"Quantitative Signals:\n"
-                            f"- Strike Distance: {bps_str}{vel_str} | DVR = {context.dvr_ratio:+.2f}sigma | ATR(1m) = ${context.atr_1m:.2f}\n"
+                            f"- Strike Distance: {bps_str}{vel_str} | DVR = {context.dvr_ratio:+.2f} expected-travel units | ATR(1m) = ${context.atr_1m:.2f}\n"
                             f"- Price Action & Macro: Recent 1m Candles = {context.recent_candles_summary} | Macro Trend = {context.macro_trend_15m} | Session = {context.market_session}\n"
-                            f"- Microstructure: OBI (Order Book Imbalance) = {context.order_book_imbalance:+.2f} | BTC Trend = {context.btc_correlation_dir}\n"
+                            f"- Microstructure: Spot top-of-book imbalance = {context.order_book_imbalance:+.2f} ({'available' if context.obi_available else 'unavailable'}) | BTC short-term direction = {context.btc_correlation_dir}\n"
                             f"- Technicals: Trend = {context.ema_trend} | RSI(1m) = {context.rsi_1m:.1f} | RSI(5m) = {context.rsi_5m:.1f}\n"
-                            f"- 5m Momentum: {context.momentum_pct:+.2f}%\n"
+                            f"- Approx. 5m spot momentum: {context.momentum_pct:+.2f}% ({'available' if context.momentum_available else 'unavailable'})\n"
+                            f"{data_quality_line}"
                             f"- Danger Warning: {'EXPIRY DANGER ZONE (<60s and within noise)' if context.expiry_danger_flag else 'None'}\n"
                             f"{recent_track_record_line}"
                             f"{martingale_directive}"
                             f"{tf_directive}"
                             f"{ev_directive}\n"
-                            f"Determine whether to predict UP or DOWN."
+                            f"Determine whether to predict UP or DOWN and return probability_up as an explicit probability, separate from confidence."
                         )
                     }
                 ]
@@ -349,39 +403,38 @@ class JevClient:
                 answers = data.get("answers", {})
                 action_ans = answers.get("action", {})
                 raw_action = str(action_ans.get("choice", "UP")).upper()
-                if raw_action in ["DOWN", "BUY_NO"]:
-                    action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"] = "DOWN"
-                else:
-                    action = "UP"
-
+                if raw_action not in {"UP", "DOWN", "BUY_YES", "BUY_NO"}:
+                    raise ValueError(f"Unsupported action: {raw_action}")
+                action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"] = (
+                    "DOWN" if raw_action in {"DOWN", "BUY_NO"} else "UP"
+                )
                 probs = action_ans.get("probabilities", {})
-                yes_ans = answers.get("settle_above_price_to_beat", answers.get("settle_above_strike", {}))
-                yes_prob = float(yes_ans.get("noul", context.odds_yes if context else 0.50))
-
-                odds_yes = context.odds_yes if context else 0.50
-                odds_no = context.odds_no if context else 0.50
-
-                if action in ["UP", "BUY_YES"]:
-                    prob_choice = max(yes_prob, probs.get("UP", 0.50))
-                    confidence = round(max(0.50, min(1.0, float(prob_choice))), 3)
-                    edge = yes_prob - odds_yes
-                    reasoning = (
-                        f"Binary UP conviction: Model P(UP) {yes_prob:.1%} vs market odds ({odds_yes:.1%}) "
-                        f"with {edge*100:+.1f}% edge. Model confidence: {confidence*100:.1f}%."
-                    )
+                yes_ans = answers.get(
+                    "probability_up",
+                    answers.get("settle_above_price_to_beat", answers.get("settle_above_strike", {})),
+                )
+                if isinstance(yes_ans, dict):
+                    yes_prob = float(yes_ans["noul"])
                 else:
-                    prob_down = 1.0 - yes_prob
-                    prob_choice = max(prob_down, probs.get("DOWN", 0.50))
-                    confidence = round(max(0.50, min(1.0, float(prob_choice))), 3)
-                    edge = prob_down - odds_no
-                    reasoning = (
-                        f"Binary DOWN conviction: Model P(DOWN) {prob_down:.1%} vs market odds ({odds_no:.1%}) "
-                        f"with {edge*100:+.1f}% edge. Model confidence: {confidence*100:.1f}%."
-                    )
+                    yes_prob = float(yes_ans)
+                if not math.isfinite(yes_prob) or not 0.0 <= yes_prob <= 1.0:
+                    raise ValueError("probability_up must be finite and between 0 and 1")
+                if (action == "UP" and yes_prob < 0.5) or (action == "DOWN" and yes_prob >= 0.5):
+                    raise ValueError("action conflicts with probability_up")
+
+                raw_confidence = probs.get(raw_action, action_ans.get("confidence", 0.50))
+                confidence = float(raw_confidence)
+                if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                    raise ValueError("confidence must be finite and between 0 and 1")
+                reasoning = (
+                    f"Binary {action} forecast: P(UP) {yes_prob:.1%}; "
+                    f"analytical conviction {confidence:.1%}."
+                )
 
                 return JevEvaluationResult(
                     action=action,
                     confidence=confidence,
+                    probability_up=yes_prob,
                     reasoning=reasoning,
                     model=data.get("model", self.model),
                     latency_ms=round(elapsed_ms, 2),
@@ -413,15 +466,24 @@ class JevClient:
             parsed = json.loads(cleaned) if cleaned else {}
             if not isinstance(parsed, dict):
                 parsed = {}
-            raw_action = str(parsed.get("action", "UP")).upper()
-            action = "DOWN" if raw_action in ["DOWN", "BUY_NO"] else "UP"
-            confidence = float(parsed.get("confidence", 0.55))
-            confidence = max(0.50, min(1.0, confidence))
+            raw_action = str(parsed.get("action", "")).upper()
+            if raw_action not in {"UP", "DOWN", "BUY_YES", "BUY_NO"}:
+                raise ValueError(f"Unsupported or missing action: {raw_action}")
+            action = "DOWN" if raw_action in {"DOWN", "BUY_NO"} else "UP"
+            probability_up = float(parsed["probability_up"])
+            if not math.isfinite(probability_up) or not 0.0 <= probability_up <= 1.0:
+                raise ValueError("probability_up must be finite and between 0 and 1")
+            if (action == "UP" and probability_up < 0.5) or (action == "DOWN" and probability_up >= 0.5):
+                raise ValueError("action conflicts with probability_up")
+            confidence = float(parsed["confidence"])
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                raise ValueError("confidence must be finite and between 0 and 1")
             reasoning = parsed.get("reasoning", f"Binary {action} conviction evaluated via Jev AI structured engine.")
 
             return JevEvaluationResult(
                 action=action,
                 confidence=confidence,
+                probability_up=probability_up,
                 reasoning=reasoning,
                 model=self.model,
                 latency_ms=round(elapsed_ms, 2),
@@ -429,14 +491,14 @@ class JevClient:
             )
         except Exception as err:
             logger.error(f"Failed to parse Jev AI structured payload: {err}")
-            fallback_action = "UP" if (context and context.odds_yes >= 0.50) else "DOWN"
             return JevEvaluationResult(
-                action=fallback_action,
+                action="UP",
                 confidence=0.50,
-                reasoning=f"Parsing error ({err}). Defaulting to {fallback_action}.",
-                model=self.model,
+                probability_up=None,
+                reasoning=f"Invalid structured response ({type(err).__name__}); no actionable forecast.",
+                model="jev-invalid-response",
                 latency_ms=round(elapsed_ms, 2),
-                is_mock=False
+                is_mock=True
             )
 
     async def _evaluate_heuristic(
@@ -546,9 +608,12 @@ class JevClient:
 
         theoretical_prob = max(0.05, min(0.95, theoretical_prob))
 
-        # Edge calculation: discrepancy between theoretical probability and market odds
-        edge_yes = theoretical_prob - context.odds_yes
-        edge_no = (1.0 - theoretical_prob) - context.odds_no
+        # Compare the forecast with actual executable quotes when present. The
+        # spot-derived odds fields are not contract prices and must not be used as EV.
+        quote_up = context.contract_up_ask
+        quote_down = context.contract_down_ask
+        edge_yes = theoretical_prob - quote_up if quote_up is not None else 0.0
+        edge_no = (1.0 - theoretical_prob) - quote_down if quote_down is not None else 0.0
 
         # Binary decision: strictly UP or DOWN based on expectancy / probability
         feedback_note = confluence_note
@@ -570,25 +635,23 @@ class JevClient:
             danger_modifier = 0.60
             feedback_note += " [⚠️ GAMMA RISK: Expiry Danger Zone near Strike]"
 
-        if theoretical_prob >= 0.50 or edge_yes >= edge_no:
+        if theoretical_prob >= 0.50:
             action: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"] = "UP"
-            chosen_odds = context.odds_yes
+            chosen_quote = quote_up
             chosen_edge = edge_yes
             prob_chosen = theoretical_prob
         else:
             action = "DOWN"
             prob_chosen = 1.0 - theoretical_prob
-            chosen_odds = context.odds_no
+            chosen_quote = quote_down
             chosen_edge = edge_no
 
-        # Asymmetric Odds modifier:
-        # Penalize confidence if paying > 0.60 odds (poor payout risk/reward)
-        # Boost confidence slightly if odds <= 0.55 and positive EV edge >= 0.05
+        # Small conviction adjustment is allowed only when an executable quote exists.
         odds_modifier = 1.0
-        if chosen_odds > 0.60:
+        if chosen_quote is not None and chosen_quote > 0.60:
             odds_modifier = 0.90
-            feedback_note += " [Asymmetric Odds Penalty: Price > 0.60]"
-        elif chosen_odds <= 0.55 and chosen_edge >= 0.05:
+            feedback_note += " [Quote Price Penalty: Executable price > 0.60]"
+        elif chosen_quote is not None and chosen_quote <= 0.55 and chosen_edge >= 0.05:
             odds_modifier = 1.03
 
         # Contradiction modifier: dampen confidence when trend opposes order flow
@@ -607,22 +670,25 @@ class JevClient:
             else:
                 feedback_note += f" [⚠️ {context.martingale_stage} Recovery: Edge {chosen_edge*100:+.1f}% below recovery hurdle]"
 
-        dvr_info = f"DVR: {context.dvr_ratio:+.2f}sigma, OBI: {context.order_book_imbalance:+.2f}, Trend: {context.ema_trend}"
+        dvr_info = f"DVR: {context.dvr_ratio:+.2f} expected-travel units, spot top-of-book imbalance: {context.order_book_imbalance:+.2f}, Trend: {context.ema_trend}"
         if action == "UP":
             reasoning = (
-                f"Binary UP conviction: Theoretical P(UP) {theoretical_prob:.1%} (Market Odds: {context.odds_yes:.1%}, "
-                f"Edge: {edge_yes*100:+.1f}%). {dvr_info} with {time_left}s remaining.{feedback_note}"
+                f"Binary UP forecast: P(UP) {theoretical_prob:.1%}; executable buy quote "
+                f"{f'${quote_up:.3f}' if quote_up is not None else 'unavailable'}; "
+                f"estimated quote edge {edge_yes*100:+.1f}%. {dvr_info} with {time_left}s remaining.{feedback_note}"
             )
         else:
             reasoning = (
-                f"Binary DOWN conviction: Theoretical P(DOWN) {prob_chosen:.1%} (Market Odds: {context.odds_no:.1%}, "
-                f"Edge: {edge_no*100:+.1f}%). {dvr_info} with {time_left}s remaining.{feedback_note}"
+                f"Binary DOWN forecast: P(DOWN) {prob_chosen:.1%}; executable buy quote "
+                f"{f'${quote_down:.3f}' if quote_down is not None else 'unavailable'}; "
+                f"estimated quote edge {edge_no*100:+.1f}%. {dvr_info} with {time_left}s remaining.{feedback_note}"
             )
 
         self._update_stats(elapsed_ms)
         return JevEvaluationResult(
             action=action,
             confidence=round(confidence, 3),
+            probability_up=round(theoretical_prob, 5),
             reasoning=reasoning,
             model="jev-heuristic-fallback",
             latency_ms=round(elapsed_ms, 2),

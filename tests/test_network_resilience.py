@@ -40,6 +40,10 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
             timeframe="5m",
             odds_yes=0.60,
             odds_no=0.40,
+            contract_up_ask=0.60,
+            contract_down_ask=0.40,
+            contract_quote_timestamp=time.time(),
+            contract_quote_source="test_quote",
             spread=0.01,
             volume_24h=1500000.0,
             time_left_seconds=240,
@@ -53,6 +57,7 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
         self.strong_bull_decision = JevEvaluationResult(
             action="UP",
             confidence=0.88,
+            probability_up=0.88,
             reasoning="Strong upward momentum across 5m and 1m indicators.",
             model="jev-latest",
             latency_ms=120.0,
@@ -176,11 +181,12 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
 
     def test_negative_ev_rejection_and_positive_ev_approval(self):
         """Verify Expected Value (EV) Gate rejects overpriced bets and approves positive edge bets."""
-        # Case 1: Overpriced bet (Market price 0.85, Confidence 0.82 -> EV = 0.82 - 0.85 = -0.03)
-        overpriced_market = self.fresh_market.model_copy(update={"odds_yes": 0.85})
+        # Case 1: Overpriced execution quote (P(UP) 0.82, quote 0.85 -> EV = -0.03)
+        overpriced_market = self.fresh_market.model_copy(update={"contract_up_ask": 0.85})
         decision = JevEvaluationResult(
             action="UP",
             confidence=0.82,
+            probability_up=0.82,
             reasoning="Moderate edge, but price in market is very expensive.",
             model="jev-latest",
             latency_ms=100.0,
@@ -194,8 +200,8 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
         self.assertIn("Expected Value", res_neg.reason)
         self.assertGreater(self.risk_guard._rejection_counts["NEGATIVE_EV_RISK"], 0)
 
-        # Case 2: Positive edge bet (Market price 0.55, Confidence 0.85 -> EV = 0.85 - 0.55 = +0.30 >= 0.02)
-        cheap_market = self.fresh_market.model_copy(update={"odds_yes": 0.55})
+        # Case 2: Positive edge quote (P(UP) 0.82, quote 0.55 -> EV = +0.27)
+        cheap_market = self.fresh_market.model_copy(update={"contract_up_ask": 0.55})
         res_pos = self.risk_guard.validate_and_size_order(
             decision=decision,
             market=cheap_market,
@@ -212,10 +218,13 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
             "time_left_seconds": 120,
             "atr_1m": 30.0,
             "odds_yes": 0.04,
+            "contract_up_ask": 0.04,
+            "contract_down_ask": 0.96,
         })
         chase_decision = JevEvaluationResult(
             action="UP",
             confidence=0.85,
+            probability_up=0.85,
             reasoning="AI hallucinating reversal while remaining time is only 2 minutes.",
             model="jev-latest",
             latency_ms=100.0,
@@ -232,4 +241,3 @@ class TestNetworkResilienceAndBinanceOfficial(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

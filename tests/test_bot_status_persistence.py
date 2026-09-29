@@ -11,6 +11,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import pytest
 import asyncio
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from config import Settings
@@ -187,7 +188,7 @@ def test_martingale_multiplier_small_base_contract_scaling():
     guard.record_settlement_result(won=False, pnl=-0.50, symbol="BTCUSDT")
     assert guard.get_symbol_martingale_step("BTCUSDT") == 1
 
-    decision = JevEvaluationResult(action="BUY_YES", confidence=0.88, reasoning="Conviction bounce")
+    decision = JevEvaluationResult(action="BUY_YES", confidence=0.88, probability_up=0.88, reasoning="Conviction bounce")
     market = MarketContext(
         market_id="round_001",
         symbol="BTCUSDT",
@@ -196,6 +197,10 @@ def test_martingale_multiplier_small_base_contract_scaling():
         target_price=0.50,
         odds_yes=0.50,
         odds_no=0.50,
+        contract_up_ask=0.50,
+        contract_down_ask=0.50,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         spread=0.01,
         time_left_seconds=300,
     )

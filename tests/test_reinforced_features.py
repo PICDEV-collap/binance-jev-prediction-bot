@@ -12,6 +12,7 @@ Tests:
 """
 
 import sys
+import time
 from pathlib import Path
 
 # Ensure project root is in sys.path
@@ -258,6 +259,10 @@ def test_risk_guard_gates():
         question="BTC Up or Down",
         odds_yes=0.55,
         odds_no=0.45,
+        contract_up_ask=0.55,
+        contract_down_ask=0.45,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         underlying_price=84250.0,
         target_price=84100.0,
         price_diff=150.0,
@@ -265,7 +270,7 @@ def test_risk_guard_gates():
         ema_trend="STRONG_UPTREND",
         order_book_imbalance=0.30,
     )
-    decision = JevEvaluationResult(action="UP", confidence=0.88, reasoning="Strong bullish signal")
+    decision = JevEvaluationResult(action="UP", confidence=0.88, probability_up=0.88, reasoning="Strong bullish signal")
 
     # Test approved base trade
     res_base = guard.validate_and_size_order(decision, ctx_base)

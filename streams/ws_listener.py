@@ -107,7 +107,6 @@ class BinanceWSListener:
         self._last_heartbeat_time: float = 0.0
         self._last_event_time: float = 0.0
         self._active_markets: Dict[str, MarketContext] = {}
-        self._price_history: Dict[str, List[tuple[float, float]]] = {}
         self._round_base_prices: Dict[str, float] = {}
         self._official_strike_prices: Dict[str, float] = {}
         self._official_strike_details: Dict[str, Dict[str, Any]] = {}
@@ -379,58 +378,48 @@ class BinanceWSListener:
         except (ValueError, TypeError):
             return []
 
-        # Volume quote asset (q = quote volume, v = base volume)
+        # ``q`` is the underlying spot pair's rolling 24h quote volume.
         try:
-            volume_24h = float(payload.get("q", payload.get("v", 1500000.0)))
+            volume_24h = float(payload.get("q", 0.0))
         except (ValueError, TypeError):
-            volume_24h = 1500000.0
+            volume_24h = 0.0
 
-        # 24h price change percentage
-        try:
-            change_24h_pct = float(payload.get("P", 0.0))
-        except (ValueError, TypeError):
-            change_24h_pct = 0.0
-
-        # Calculate real rolling momentum from live price history
         now = time.time()
-        history = self._price_history.setdefault(symbol, [])
-        history.append((now, mark_price))
-        cutoff = now - 300.0
-        while len(history) > 1 and history[0][0] < cutoff:
-            history.pop(0)
+        source_timestamp_ms: Optional[int] = None
+        raw_source_timestamp = payload.get("E", payload.get("C"))
+        if raw_source_timestamp is not None:
+            try:
+                source_timestamp_ms = int(raw_source_timestamp)
+            except (ValueError, TypeError):
+                source_timestamp_ms = None
+        spot_data_age_ms = (
+            max(0.0, now * 1000.0 - source_timestamp_ms)
+            if source_timestamp_ms is not None
+            else None
+        )
 
-        if len(history) > 1 and history[0][1] > 0:
-            momentum_pct = round(((mark_price - history[0][1]) / history[0][1]) * 100.0, 3)
-        else:
-            momentum_pct = round(change_24h_pct / 48.0, 3)
-
-        # Realistic bid/ask spread for binary prediction contract
-        if "BTC" in symbol:
-            base_spread = 0.012
-        elif "ETH" in symbol or "BNB" in symbol:
-            base_spread = 0.015
-        elif "SOL" in symbol:
-            base_spread = 0.018
-        else:
-            base_spread = 0.020
-
-        # Extract best bid / ask quantities for Order Book Imbalance (OBI)
+        # These fields are spot top-of-book quantities, not prediction-contract depth.
+        has_top_of_book = payload.get("B") is not None and payload.get("A") is not None
         try:
-            bid_qty = float(payload.get("B", payload.get("bidQty", 10.0)))
-            ask_qty = float(payload.get("A", payload.get("askQty", 10.0)))
+            bid_qty = float(payload.get("B", 0.0))
+            ask_qty = float(payload.get("A", 0.0))
         except (ValueError, TypeError):
-            bid_qty, ask_qty = 10.0, 10.0
+            bid_qty, ask_qty = 0.0, 0.0
+            has_top_of_book = False
+        obi_available = has_top_of_book and (bid_qty + ask_qty) > 0
 
         # Update in-memory candle aggregator
         self.candle_aggregator.update_tick(
             symbol=symbol,
             price=mark_price,
-            volume=float(payload.get("v", 0.0)),
+            # ``v`` is a rolling 24h cumulative volume on @ticker, not a per-tick delta.
+            # Do not add it repeatedly to locally-built candle volume.
+            volume=0.0,
             timestamp=now
         )
 
         if symbol == "BTCUSDT":
-            self._btc_momentum = momentum_pct
+            self._btc_momentum = 0.0
 
         clean_symbol = symbol.replace("USDT", "")
         results: List[MarketContext] = []
@@ -443,6 +432,9 @@ class BinanceWSListener:
             ask_qty=ask_qty,
             btc_momentum_pct=self._btc_momentum,
         )
+        momentum_pct = float(base_features.get("momentum_pct", 0.0))
+        if symbol == "BTCUSDT":
+            self._btc_momentum = momentum_pct
 
         for tf, round_period in TIMEFRAMES:
             round_idx = int(now // round_period)
@@ -490,7 +482,7 @@ class BinanceWSListener:
             price_diff = round(mark_price - strike, 4) if strike_confirmed else 0.0
             target_price = strike if strike_confirmed else 0.0
 
-            # Realistic Binance Up/Down implied odds:
+            # This is a model-derived directional estimate, not a live contract quote.
             diff_ratio = ((mark_price - strike) / strike) if strike > 0 else 0.0
             vol = 0.004 * math.sqrt(max(10, time_left) / max(60, round_period))
             z = (diff_ratio + (momentum_pct * 0.0005)) / max(0.0001, vol)
@@ -517,7 +509,7 @@ class BinanceWSListener:
                     timeframe=tf,
                     odds_yes=odds_up,
                     odds_no=odds_down,
-                    spread=base_spread,
+                    spread=None,
                     volume_24h=volume_24h,
                     time_left_seconds=time_left,
                     underlying_price=mark_price,
@@ -541,6 +533,14 @@ class BinanceWSListener:
                     expiry_danger_flag=metrics["expiry_danger_flag"],
                     btc_correlation_dir=metrics["btc_correlation_dir"],
                     strike_confirmed=strike_confirmed,
+                    timestamp=now,
+                    spot_source_timestamp_ms=source_timestamp_ms,
+                    spot_data_age_ms=spot_data_age_ms,
+                    indicator_data_ready=bool(base_features["indicator_data_ready"]),
+                    one_minute_sample_count=int(base_features["one_minute_sample_count"]),
+                    five_minute_sample_count=int(base_features["five_minute_sample_count"]),
+                    momentum_available=bool(base_features["momentum_available"]),
+                    obi_available=obi_available,
                 )
             )
 
@@ -566,8 +566,8 @@ class BinanceWSListener:
                 candles_1m: List[Candle] = []
                 candles_5m: List[Candle] = []
 
-                # Fetch 1m klines (30 candles)
-                async with session.get(f"{base_url}?symbol={sym}&interval=1m&limit=30") as resp_1m:
+                # Fetch enough candles to warm EMA(50), RSI(14), and macro features.
+                async with session.get(f"{base_url}?symbol={sym}&interval=1m&limit=100") as resp_1m:
                     if resp_1m.status == 200:
                         raw_1m = await resp_1m.json()
                         for k in raw_1m:
@@ -582,8 +582,7 @@ class BinanceWSListener:
                                 )
                             )
 
-                # Fetch 5m klines (20 candles)
-                async with session.get(f"{base_url}?symbol={sym}&interval=5m&limit=20") as resp_5m:
+                async with session.get(f"{base_url}?symbol={sym}&interval=5m&limit=100") as resp_5m:
                     if resp_5m.status == 200:
                         raw_5m = await resp_5m.json()
                         for k in raw_5m:

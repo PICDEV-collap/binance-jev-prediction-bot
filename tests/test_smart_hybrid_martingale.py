@@ -5,6 +5,7 @@ max position budget enforcement, winning reset, and switching modes.
 """
 
 import pytest
+import time
 from engine.risk_guard import RiskGuard
 from engine.jev_client import JevEvaluationResult, MarketContext
 
@@ -69,7 +70,7 @@ def test_smart_hybrid_vs_fixed_multiplier_sizing():
     hybrid_guard.record_settlement_result(won=False, pnl=-1.50, symbol="ETHUSDT")
     fixed_guard.record_settlement_result(won=False, pnl=-1.50, symbol="ETHUSDT")
 
-    decision = JevEvaluationResult(action="BUY_YES", confidence=0.88, reasoning="Strong bounce")
+    decision = JevEvaluationResult(action="BUY_YES", confidence=0.88, probability_up=0.88, reasoning="Strong bounce")
     market = MarketContext(
         market_id="round_eth_002",
         symbol="ETHUSDT",
@@ -78,6 +79,10 @@ def test_smart_hybrid_vs_fixed_multiplier_sizing():
         target_price=0.40,
         odds_yes=0.40,
         odds_no=0.60,
+        contract_up_ask=0.40,
+        contract_down_ask=0.60,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         spread=0.01,
         time_left_seconds=300,
         min_payout_multiplier=1.0,
@@ -119,7 +124,7 @@ def test_smart_hybrid_max_position_cap():
     # Accumulate a $8.00 loss
     guard.record_settlement_result(won=False, pnl=-8.00, symbol="BTCUSDT")
 
-    decision = JevEvaluationResult(action="BUY_YES", confidence=0.90, reasoning="Extreme edge")
+    decision = JevEvaluationResult(action="BUY_YES", confidence=0.90, probability_up=0.90, reasoning="Extreme edge")
     market = MarketContext(
         market_id="round_btc_003",
         symbol="BTCUSDT",
@@ -128,6 +133,10 @@ def test_smart_hybrid_max_position_cap():
         target_price=0.50,
         odds_yes=0.50,
         odds_no=0.50,
+        contract_up_ask=0.50,
+        contract_down_ask=0.50,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         spread=0.01,
         time_left_seconds=300,
         min_payout_multiplier=1.0,
@@ -137,7 +146,7 @@ def test_smart_hybrid_max_position_cap():
     assert res.approved is True
     # At odds 0.50, max contracts for $10 budget = int(10.0 / 0.50) = 20 contracts max
     assert res.adjusted_contracts <= 20
-    assert (res.adjusted_contracts * market.odds_yes) <= 10.0
+    assert (res.adjusted_contracts * market.contract_up_ask) <= 10.0
 
 
 def test_dynamic_mode_switching():
@@ -179,7 +188,7 @@ def test_smart_hybrid_pnl_covers_accumulated_loss_at_prediction_odds():
     assert guard.get_symbol_martingale_step("BNBUSDT") == 2
     assert guard.get_symbol_accumulated_loss("BNBUSDT") == 2.89
 
-    decision = JevEvaluationResult(action="DOWN", confidence=0.92, reasoning="Strong bear continuation")
+    decision = JevEvaluationResult(action="DOWN", confidence=0.92, probability_up=0.08, reasoning="Strong bear continuation")
     market = MarketContext(
         market_id="BNBUSDT-5M-TEST",
         symbol="BNBUSDT",
@@ -188,6 +197,10 @@ def test_smart_hybrid_pnl_covers_accumulated_loss_at_prediction_odds():
         target_price=0.569,
         odds_yes=0.431,
         odds_no=0.569,
+        contract_up_ask=0.431,
+        contract_down_ask=0.569,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         spread=0.01,
         time_left_seconds=250,
         min_payout_multiplier=1.0,
@@ -197,7 +210,7 @@ def test_smart_hybrid_pnl_covers_accumulated_loss_at_prediction_odds():
     assert res.approved is True
 
     # Mathematical verification:
-    # Profit per contract = 1.00 - 0.569 = 0.431
+    # Profit per contract = 1.00 - the DOWN execution quote 0.569 = 0.431
     # Expected profit on win = contracts * 0.431
     # Expected profit MUST be strictly greater than accumulated loss ($2.89)
     expected_profit_on_win = res.adjusted_contracts * (1.00 - market.target_price)
@@ -263,7 +276,7 @@ def test_martingale_max_step_loss_resets_pnl_and_step_hybrid():
     assert guard.metrics["martingale"]["recovery_cycles_failed"] == 1
 
     # Verify that the NEXT order is sized strictly as Base order (10 contracts)
-    decision = JevEvaluationResult(action="BUY_YES", confidence=0.82, reasoning="Fresh cycle bounce")
+    decision = JevEvaluationResult(action="BUY_YES", confidence=0.82, probability_up=0.82, reasoning="Fresh cycle bounce")
     market = MarketContext(
         market_id="round_eth_fresh_001",
         symbol="ETHUSDT",
@@ -272,6 +285,10 @@ def test_martingale_max_step_loss_resets_pnl_and_step_hybrid():
         target_price=0.50,
         odds_yes=0.50,
         odds_no=0.50,
+        contract_up_ask=0.50,
+        contract_down_ask=0.50,
+        contract_quote_timestamp=time.time(),
+        contract_quote_source="test_quote",
         spread=0.01,
         time_left_seconds=300,
         min_payout_multiplier=1.0,
@@ -346,5 +363,4 @@ def test_reconcile_from_closed_positions_with_max_step_loss():
     # Step should be 1 (ไม้แก้ 1 for the new cycle), and accumulated loss should only be the new trade's loss ($2.00)!
     assert guard.get_symbol_martingale_step("ETHUSDT") == 1
     assert guard.get_symbol_accumulated_loss("ETHUSDT") == 2.00
-
 
