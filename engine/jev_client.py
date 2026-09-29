@@ -99,6 +99,7 @@ class JevEvaluationResult(BaseModel):
     model: str = "jev-predict-v1"
     latency_ms: float = 0.0
     is_mock: bool = False
+    fallback_reason: Optional[str] = None
     timestamp: float = Field(default_factory=time.time)
 
 
@@ -167,7 +168,11 @@ class JevClient:
 
         # If no API key configured, use local intelligent heuristic model
         if not self.api_key:
-            return await self._evaluate_heuristic(context, start_time)
+            return await self._evaluate_heuristic(
+                context,
+                start_time,
+                fallback_reason="missing_api_key",
+            )
 
         if self._session is None or self._session.closed:
             await self.start()
@@ -263,7 +268,11 @@ class JevClient:
                 "questions": {
                     "action": {
                         "type": "choice",
-                        "instructions": f"Predict strictly whether Current Price will settle UP or DOWN at {context.timeframe} expiration (binary prediction)",
+                        "instructions": (
+                            f"Predict strictly whether Current Price will settle UP or DOWN at {context.timeframe} expiration. "
+                            "The action must agree with probability_up: UP requires probability_up >= 0.50; "
+                            "DOWN requires probability_up < 0.50. Correct either field before responding if they conflict."
+                        ),
                         "criteria": {
                             "UP": "High conviction that Current Price will settle greater than or equal to Price to Beat at round expiration",
                             "DOWN": "High conviction that Current Price will settle strictly below Price to Beat at round expiration"
@@ -275,7 +284,10 @@ class JevClient:
                     },
                     "probability_up": {
                         "type": "noul",
-                        "instructions": "Give your explicit probability from 0 to 1 that the underlying price settles UP. This is a forecast probability, separate from confidence."
+                        "instructions": (
+                            "Give your explicit probability from 0 to 1 that the underlying price settles UP. "
+                            "This is separate from confidence and must agree with action: UP is >= 0.50; DOWN is < 0.50."
+                        )
                     }
                 }
             }
@@ -330,6 +342,8 @@ class JevClient:
                             "EXPECTED VALUE: A low quote alone does not imply positive expectancy. Estimate P(UP) separately from conviction and compare it with the executable quote. "
                             "Demand multi-factor confluence (EMA trend, OBI flow, and DVR) before assigning high confidence (>= 0.65). "
                             "When signals conflict (e.g. Trend vs OBI contradiction), penalize confidence towards neutral (0.50). "
+                            "CONSISTENCY: action UP requires probability_up >= 0.50; action DOWN requires probability_up < 0.50. "
+                            "Before returning JSON, verify these fields agree and correct the response if they do not. "
                             "FEEDBACK DIRECTIVE: If a recent track record is provided, use it to gauge current market regime consistency. "
                             "MARTINGALE RECOVERY RULES: When Martingale Recovery is active, an escalating conviction hurdle is enforced. "
                             "Demand higher analytical momentum and price distance conviction before outputting high confidence. "
@@ -378,21 +392,33 @@ class JevClient:
                     self._update_stats(elapsed_ms)
                     return parsed_result
                 else:
-                    error_text = await resp.text()
+                    await resp.read()
                     logger.warning(
-                        f"Jev AI API error HTTP {resp.status}: {error_text[:200]}. "
+                        f"Jev AI API returned HTTP {resp.status}. "
                         f"Falling back to local heuristic engine."
                     )
-                    return await self._evaluate_heuristic(context, start_time)
+                    return await self._evaluate_heuristic(
+                        context,
+                        start_time,
+                        fallback_reason=f"api_http_{resp.status}",
+                    )
 
         except asyncio.TimeoutError as te:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             logger.warning(f"Jev AI API request timed out ({elapsed_ms:.1f}ms): {te!r}. Falling back to heuristic.")
-            return await self._evaluate_heuristic(context, start_time)
+            return await self._evaluate_heuristic(
+                context,
+                start_time,
+                fallback_reason="api_timeout",
+            )
         except Exception as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             logger.error(f"Jev AI client exception ({elapsed_ms:.1f}ms): {type(e).__name__} - {e}. Falling back to heuristic.")
-            return await self._evaluate_heuristic(context, start_time)
+            return await self._evaluate_heuristic(
+                context,
+                start_time,
+                fallback_reason="api_client_error",
+            )
 
     def _parse_api_response(
         self,
@@ -494,7 +520,16 @@ class JevClient:
                 is_mock=False
             )
         except Exception as err:
-            logger.error(f"Failed to parse Jev AI structured payload: {err}")
+            fallback_reason = (
+                "action_probability_conflict"
+                if isinstance(err, ValueError) and str(err) == "action conflicts with probability_up"
+                else "invalid_structured_response"
+            )
+            logger.error(
+                "Rejected Jev AI structured response (%s): %s",
+                fallback_reason,
+                err,
+            )
             return JevEvaluationResult(
                 action="UP",
                 confidence=0.50,
@@ -502,13 +537,15 @@ class JevClient:
                 reasoning=f"Invalid structured response ({type(err).__name__}); no actionable forecast.",
                 model="jev-invalid-response",
                 latency_ms=round(elapsed_ms, 2),
-                is_mock=True
+                is_mock=True,
+                fallback_reason=fallback_reason,
             )
 
     async def _evaluate_heuristic(
         self,
         context: MarketContext,
-        start_time: float
+        start_time: float,
+        fallback_reason: Optional[str] = None,
     ) -> JevEvaluationResult:
         """
         Deterministic/Bayesian heuristic decision engine.
@@ -696,7 +733,8 @@ class JevClient:
             reasoning=reasoning,
             model="jev-heuristic-fallback",
             latency_ms=round(elapsed_ms, 2),
-            is_mock=True
+            is_mock=True,
+            fallback_reason=fallback_reason,
         )
 
     def _update_stats(self, elapsed_ms: float) -> None:

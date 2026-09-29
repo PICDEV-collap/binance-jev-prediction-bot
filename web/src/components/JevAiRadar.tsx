@@ -72,6 +72,14 @@ const JevAiRadarComponent: React.FC<JevAiRadarProps> = ({
             </h2>
             <p className="text-xs text-slate-400 font-mono">
               Binary Prediction Core ({decision?.model ?? 'jev-binary-v1'})
+              {decision?.is_mock && (
+                <span
+                  className="ml-2 inline-flex rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold text-amber-300"
+                  title={decision.fallback_reason?.replaceAll('_', ' ') ?? 'Remote AI response was not validated'}
+                >
+                  LOCAL FALLBACK
+                </span>
+              )}
             </p>
           </div>
         </div>

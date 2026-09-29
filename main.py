@@ -693,8 +693,9 @@ class TradingBotCoordinator:
             fallback_blocked = decision.is_mock and not self.binance_client.paper_trading
             if fallback_blocked:
                 logger.error(
-                    "[LIVE EXECUTION BLOCKED] Jev AI used the local fallback for %s; live orders require a valid remote AI response.",
+                    "[LIVE EXECUTION BLOCKED] Jev AI fallback for %s (reason=%s); live orders require a valid remote AI response.",
                     market.market_id,
+                    decision.fallback_reason or "unknown",
                 )
 
             pre_flight = None
@@ -864,7 +865,10 @@ class TradingBotCoordinator:
             elif fallback_blocked:
                 risk_result = RiskEvaluationResult(
                     approved=False,
-                    reason="LIVE_EXECUTION_BLOCKED: Jev AI API unavailable; local heuristic fallback cannot place live orders",
+                    reason=(
+                        "LIVE_EXECUTION_BLOCKED: Jev AI fallback "
+                        f"({decision.fallback_reason or 'unknown'}); local heuristic fallback cannot place live orders"
+                    ),
                     adjusted_contracts=0,
                     confidence=decision.confidence,
                     market_id=market.market_id,

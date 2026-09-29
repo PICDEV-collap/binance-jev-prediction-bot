@@ -69,6 +69,28 @@ def test_jev_client_markdown_json_parsing():
     assert "Bearish EMA" in result2.reasoning
 
 
+def test_jev_client_rejects_conflicting_systemone_action_and_probability():
+    """Conflicting remote fields must fail closed with a precise fallback reason."""
+    client = JevClient(api_key="mock_key")
+    result = client._parse_api_response(
+        {
+            "answers": {
+                "action": {
+                    "choice": "UP",
+                    "probabilities": {"UP": 0.55},
+                },
+                "probability_up": {"noul": 0.49},
+            },
+            "model": "jev-latest",
+        },
+        elapsed_ms=12.0,
+    )
+
+    assert result.is_mock is True
+    assert result.fallback_reason == "action_probability_conflict"
+    assert result.model == "jev-invalid-response"
+
+
 def test_pending_settlement_not_terminal():
     """Verify that 'not claimable' or 'not settled' error does NOT mark positions as claimed."""
     client = BinanceClient(api_key="k", api_secret="s", paper_trading=False)

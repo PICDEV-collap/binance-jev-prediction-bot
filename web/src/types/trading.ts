@@ -52,6 +52,7 @@ export interface JevDecision {
   model: string;
   latency_ms: number;
   is_mock?: boolean;
+  fallback_reason?: string | null;
   timestamp: number;
 }
 
