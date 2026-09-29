@@ -9,13 +9,17 @@ while serving a real-time Telemetry & Control API for the Web Dashboard.
 
 from __future__ import annotations
 import asyncio
+import hashlib
+import hmac
 import logging
+from logging.handlers import RotatingFileHandler
 import math
+import secrets
 import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Set, Optional
+from typing import Dict, Any, List, Set, Optional, Literal
 
 # Ensure clean UTF-8 encoding on Windows console and streams to prevent garbled text
 if sys.platform == "win32":
@@ -28,9 +32,10 @@ if sys.platform == "win32":
         pass
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from config import settings
 from engine.binance_client import BinanceClient, OrderResult
@@ -45,7 +50,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8", mode="a"),
+        RotatingFileHandler(
+            "bot.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
     ]
 )
 logger = logging.getLogger("main_engine")
@@ -53,58 +63,92 @@ logger = logging.getLogger("main_engine")
 
 class ConfigUpdateRequest(BaseModel):
     # Risk & Martingale
-    confidence_threshold: float | None = None
-    default_order_contracts: int | None = None
+    confidence_threshold: float | None = Field(default=None, ge=0.5, le=0.99, allow_inf_nan=False)
+    default_order_contracts: int | None = Field(default=None, ge=1, le=500)
     martingale_enabled: bool | None = None
-    martingale_mode: str | None = None
-    martingale_multiplier: float | None = None
-    martingale_max_steps: int | None = None
-    martingale_confidence_step: float | None = None
-    martingale_max_confidence: float | None = None
+    martingale_mode: Literal["SMART_HYBRID", "FIXED_MULTIPLIER"] | None = None
+    martingale_multiplier: float | None = Field(default=None, ge=1.1, le=4.0, allow_inf_nan=False)
+    martingale_max_steps: int | None = Field(default=None, ge=1, le=6)
+    martingale_confidence_step: float | None = Field(default=None, ge=0.01, le=0.10, allow_inf_nan=False)
+    martingale_max_confidence: float | None = Field(default=None, ge=0.85, le=0.99, allow_inf_nan=False)
 
     # Exposure & Circuit Breaker Limits
-    max_position_size_usdt: float | None = None
-    cooldown_seconds: int | None = None
-    max_daily_loss_usdt: float | None = None
-    max_concurrent_positions: int | None = None
-    max_odds_cap: float | None = None
-    min_odds_floor: float | None = None
-    min_ev_edge: float | None = None
-    min_time_left_seconds: int | None = None
-    max_time_left_seconds: int | None = None
-    slippage_bps: int | None = None
+    max_position_size_usdt: float | None = Field(default=None, ge=5.0, allow_inf_nan=False)
+    cooldown_seconds: int | None = Field(default=None, ge=5, le=86400)
+    max_daily_loss_usdt: float | None = Field(default=None, ge=10.0, allow_inf_nan=False)
+    max_concurrent_positions: int | None = Field(default=None, ge=1, le=24)
+    max_odds_cap: float | None = Field(default=None, ge=0.30, le=0.90, allow_inf_nan=False)
+    min_odds_floor: float | None = Field(default=None, ge=0.01, le=0.50, allow_inf_nan=False)
+    min_ev_edge: float | None = Field(default=None, ge=0.01, le=0.25, allow_inf_nan=False)
+    min_time_left_seconds: int | None = Field(default=None, ge=30, le=86400)
+    max_time_left_seconds: int | None = Field(default=None, ge=60, le=86400)
+    slippage_bps: int | None = Field(default=None, ge=0, le=1000)
 
     # Target Market & Strategy
-    target_symbol: str | None = None
-    target_timeframe: str | None = None
-    eval_interval_seconds: int | None = None
+    target_symbol: str | None = Field(default=None, min_length=3, max_length=20)
+    target_timeframe: Literal["ALL", "all", "5m", "15m", "1h", "1d"] | None = None
+    eval_interval_seconds: int | None = Field(default=None, ge=10, le=900)
 
     # Operating Environment & Credentials
     paper_trading: bool | None = None
-    binance_api_key: str | None = None
-    binance_api_secret: str | None = None
-    jev_ai_api_key: str | None = None
-    jev_ai_model: str | None = None
+    binance_api_key: str | None = Field(default=None, max_length=256)
+    binance_api_secret: str | None = Field(default=None, max_length=256)
+    jev_ai_api_key: str | None = Field(default=None, max_length=512)
+    jev_ai_model: str | None = Field(default=None, min_length=1, max_length=100)
     persist_to_env: bool | None = False
 
 
 class TargetMarketRequest(BaseModel):
-    target_symbol: str = "BTCUSDT"
-    target_timeframe: str = "15m"
+    target_symbol: str = Field(default="BTCUSDT", min_length=3, max_length=20)
+    target_timeframe: Literal["ALL", "all", "5m", "15m", "1h", "1d"] = "15m"
 
 
 class ManualTradeRequest(BaseModel):
-    market_id: str
-    symbol: str
-    side: str  # "UP" or "DOWN"
-    contracts: int = 10
-    target_price: float
-    strike_price: float | None = None
+    market_id: str = Field(min_length=1, max_length=128)
+    symbol: str = Field(min_length=3, max_length=20)
+    side: Literal["UP", "DOWN", "BUY_YES", "BUY_NO"]
+    contracts: int = Field(default=10, ge=1, le=500)
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
+DASHBOARD_SESSION_TTL_SECONDS = 12 * 60 * 60
+_dashboard_sessions: Dict[str, tuple[str, float]] = {}
+_login_attempts: Dict[str, List[float]] = {}
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _authenticated_username(token: str) -> Optional[str]:
+    if not token:
+        return None
+    return _username_for_digest(_token_digest(token))
+
+
+def _username_for_digest(digest: str) -> Optional[str]:
+    now = time.time()
+    session = _dashboard_sessions.get(digest)
+    if session is None:
+        return None
+    username, expires_at = session
+    if expires_at <= now:
+        _dashboard_sessions.pop(digest, None)
+        return None
+    return username
+
+
+def _bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        return ""
+    scheme, separator, credentials = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return ""
+    return credentials.strip()
 
 
 def persist_env_key(key: str, value: str) -> None:
@@ -141,8 +185,11 @@ class TradingBotCoordinator:
 
     def __init__(self) -> None:
         self.start_time = time.time()
-        persisted_status = getattr(settings, "bot_status", "RUNNING").upper()
+        persisted_status = getattr(settings, "bot_status", "STOPPED").upper()
         self.bot_status: str = "STOPPED" if persisted_status == "STOPPED" else "RUNNING"
+        if not settings.paper_trading:
+            self.bot_status = "STOPPED"
+            logger.info("[BOOT] Live mode requires an explicit operator start after every process restart.")
         self.is_paused: bool = (self.bot_status == "STOPPED")
         if self.is_paused:
             logger.info("[BOOT] Restored bot state from disk: STOPPED (trading paused)")
@@ -200,8 +247,9 @@ class TradingBotCoordinator:
             martingale_max_confidence=getattr(settings, "martingale_max_confidence", 0.95),
         )
 
-        # Decide whether to use mock stream if no API keys or explicitly enabled
-        use_mock_stream = settings.enable_mock_stream or not bool(settings.binance_api_key)
+        # Mock prices are only used when explicitly requested; missing trade credentials
+        # must never silently replace the configured market data source.
+        use_mock_stream = settings.enable_mock_stream
 
         self.ws_listener = BinanceWSListener(
             stream_url=settings.binance_prediction_ws_url,
@@ -215,6 +263,7 @@ class TradingBotCoordinator:
         # Telemetry storage
         self.recent_decisions: List[Dict[str, Any]] = []
         self.ws_clients: Set[WebSocket] = set()
+        self._ws_session_digests: Dict[WebSocket, str] = {}
         self._last_eval_time: Dict[str, float] = {}
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._background_tasks: Set[asyncio.Task] = set()
@@ -247,6 +296,8 @@ class TradingBotCoordinator:
         if self.bot_status != "RUNNING" or self.is_paused:
             return False
         if not self.binance_client.paper_trading:
+            if self.ws_listener.enable_mock_stream:
+                return False
             supported_syms = self.binance_client.get_supported_prediction_symbols()
             if market.symbol.upper() not in supported_syms:
                 return False
@@ -289,9 +340,11 @@ class TradingBotCoordinator:
         await self.jev_client.start()
         await self.binance_client.start()
         await self.ws_listener.start()
-        if not self.binance_client.paper_trading:
+        if not self.binance_client.paper_trading and self.binance_client.api_key and self.binance_client.api_secret:
             self._spawn_task(self.binance_client.fetch_live_balance(), name="init_balance")
             self._spawn_task(self._init_live_catalog(), name="init_catalog")
+        elif not self.binance_client.paper_trading:
+            logger.error("Live mode is configured without Binance credentials; trading remains stopped.")
         self._heartbeat_task = self._spawn_task(self._dashboard_heartbeat_loop(), name="heartbeat_loop")
 
     async def _init_live_catalog(self) -> None:
@@ -342,16 +395,21 @@ class TradingBotCoordinator:
                 markets = self.ws_listener.get_active_markets()
 
                 # If live trading with API keys, poll Binance live balance every 5s or immediately if not loaded
-                if not self.binance_client.paper_trading and (heartbeat_ticks % 5 == 0 or self.binance_client._live_balance_usdt <= 0.05):
+                if (
+                    not self.binance_client.paper_trading
+                    and self.binance_client.api_key
+                    and self.binance_client.api_secret
+                    and (heartbeat_ticks % 5 == 0 or self.binance_client._live_balance_usdt <= 0.05)
+                ):
                     self._spawn_task(self.binance_client.fetch_live_balance(), name="periodic_balance")
 
 
                 # Periodic server time re-sync every 60s to continuously prevent clock drift (-1021)
-                if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
+                if not self.binance_client.paper_trading and self.binance_client.api_key and self.binance_client.api_secret and (heartbeat_ticks % 60 == 0):
                     self._spawn_task(self.binance_client.sync_server_time(), name="periodic_sync_time")
 
                 # Periodic reconciliation of historical settled positions directly from Binance every 60s
-                if not self.binance_client.paper_trading and (heartbeat_ticks % 60 == 0):
+                if not self.binance_client.paper_trading and self.binance_client.api_key and self.binance_client.api_secret and (heartbeat_ticks % 60 == 0):
                     async def _reconcile_and_sync():
                         await self.binance_client.sync_historical_closed_positions()
                         self.risk_guard.reconcile_from_closed_positions(self.binance_client.get_closed_positions())
@@ -427,6 +485,10 @@ class TradingBotCoordinator:
                     disconnected: List[WebSocket] = []
                     for client in list(self.ws_clients):
                         try:
+                            if _username_for_digest(self._ws_session_digests.get(client, "")) is None:
+                                disconnected.append(client)
+                                await client.close(code=4401)
+                                continue
                             await asyncio.wait_for(client.send_json(msg), timeout=0.8)
                         except Exception:
                             disconnected.append(client)
@@ -437,8 +499,16 @@ class TradingBotCoordinator:
             except Exception as e:
                 logger.debug(f"Dashboard heartbeat notice: {e}")
 
-    def start_bot(self) -> None:
+    def start_bot(self) -> bool:
         """Start or resume trading execution."""
+        if not self.binance_client.paper_trading and self.ws_listener.enable_mock_stream:
+            logger.error("Refusing live trading while the synthetic market feed is enabled.")
+            return False
+        if not self.binance_client.paper_trading and not (
+            self.binance_client.api_key.strip() and self.binance_client.api_secret.strip()
+        ):
+            logger.error("Refusing to start live trading: Binance API key and secret are required.")
+            return False
         self.bot_status = "RUNNING"
         self.is_paused = False
         try:
@@ -447,6 +517,7 @@ class TradingBotCoordinator:
             logger.warning(f"Failed to persist BOT_STATUS to .env: {e}")
         logger.info("[OPERATOR COMMAND] Bot status changed to: RUNNING")
         self._spawn_task(self.broadcast_status(), name="broadcast_start")
+        return True
 
     def stop_bot(self) -> None:
         """Halt or freeze trading execution."""
@@ -567,6 +638,9 @@ class TradingBotCoordinator:
             # Step 2: Pre-Flight Binance Verification & Risk Guard Validation with Strict Mutual Exclusion Lock
             if decision.action in ("UP", "DOWN", "BUY_YES", "BUY_NO") and decision.confidence >= self.risk_guard.confidence_threshold:
                 async with self._order_execution_lock:
+                    if self.bot_status != "RUNNING" or self.is_paused:
+                        logger.info("[ORDER ABORTED] Bot was stopped before the order lock was acquired.")
+                        return
                     # Concurrency Guard inside Mutex: Eliminate cross-asset TOCTOU race conditions
                     current_open = self.binance_client.get_positions()
                     in_flight = len(getattr(self.binance_client, "_in_flight_orders", {}))
@@ -623,6 +697,11 @@ class TradingBotCoordinator:
                             spot_price=market.underlying_price,
                             max_concurrent_positions=self.risk_guard.max_concurrent_positions,
                         )
+
+                        # A stop request can arrive while the authoritative pre-flight call is in progress.
+                        if self.bot_status != "RUNNING" or self.is_paused:
+                            pre_flight.verified = False
+                            pre_flight.reason = "BOT_STOPPED: Operator halted trading during pre-flight verification"
 
                         if not pre_flight.verified:
                             logger.warning(
@@ -780,12 +859,17 @@ class TradingBotCoordinator:
         disconnected: List[WebSocket] = []
         for client in list(self.ws_clients):
             try:
+                if _username_for_digest(self._ws_session_digests.get(client, "")) is None:
+                    disconnected.append(client)
+                    await client.close(code=4401)
+                    continue
                 await asyncio.wait_for(client.send_json(message), timeout=0.8)
             except Exception:
                 disconnected.append(client)
 
         for dead_client in disconnected:
             self.ws_clients.discard(dead_client)
+            self._ws_session_digests.pop(dead_client, None)
 
     async def broadcast_status(self) -> None:
         """Broadcast updated system status immediately to all connected dashboard websockets."""
@@ -804,21 +888,38 @@ class TradingBotCoordinator:
         disconnected: List[WebSocket] = []
         for client in list(self.ws_clients):
             try:
+                if _username_for_digest(self._ws_session_digests.get(client, "")) is None:
+                    disconnected.append(client)
+                    await client.close(code=4401)
+                    continue
                 await asyncio.wait_for(client.send_json(msg), timeout=0.8)
             except Exception:
                 disconnected.append(client)
         for dead in disconnected:
             self.ws_clients.discard(dead)
+            self._ws_session_digests.pop(dead, None)
 
     def get_system_status(self) -> Dict[str, Any]:
         """Aggregate system telemetry for dashboard inspection."""
         uptime_seconds = int(time.time() - self.start_time)
+        trading_mode = (
+            "PAPER_TRADING" if self.binance_client.paper_trading
+            else "LIVE_TRADING" if (
+                self.binance_client.api_key.strip()
+                and self.binance_client.api_secret.strip()
+                and not self.ws_listener.enable_mock_stream
+            )
+            else "CONFIGURATION_ERROR"
+        )
+        account_summary = self.binance_client.get_account_summary()
+        if trading_mode == "CONFIGURATION_ERROR":
+            account_summary["mode"] = "CONFIGURATION_ERROR"
         return {
             "bot_status": self.bot_status,
             "is_paused": self.is_paused,
             "uptime_seconds": uptime_seconds,
             "uptime_formatted": f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s",
-            "trading_mode": "PAPER_TRADING" if self.binance_client.paper_trading else "LIVE_TRADING",
+            "trading_mode": trading_mode,
             "target_market": {
                 "target_symbol": self.target_symbol,
                 "target_timeframe": self.target_timeframe,
@@ -836,7 +937,7 @@ class TradingBotCoordinator:
             "ws_stream": self.ws_listener.metrics,
             "jev_ai": self.jev_client.stats,
             "risk_guard": self.risk_guard.metrics,
-            "account": self.binance_client.get_account_summary(),
+            "account": account_summary,
         }
 
 
@@ -862,13 +963,30 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for Next.js frontend
+# Enable only explicitly configured dashboard origins.
+dashboard_origins = [
+    origin.strip().rstrip("/")
+    for origin in settings.dashboard_allowed_origins.split(",")
+    if origin.strip()
+]
+@app.middleware("http")
+async def require_dashboard_session(request: Request, call_next):
+    """Protect every HTTP API route by default; only credential login is public."""
+    path = request.url.path
+    if path.startswith("/api/") and path != "/api/auth/login" and request.method != "OPTIONS":
+        username = _authenticated_username(_bearer_token(request.headers.get("Authorization")))
+        if username is None:
+            return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+        request.state.operator_username = username
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=dashboard_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -891,7 +1009,7 @@ async def get_decisions() -> List[Dict[str, Any]]:
 
 
 @app.get("/api/orders")
-async def get_orders(limit: int = 50) -> List[Dict[str, Any]]:
+async def get_orders(limit: int = Query(default=50, ge=1, le=200)) -> List[Dict[str, Any]]:
     """Get order execution history log."""
     return bot.binance_client.get_order_history(limit=limit)
 
@@ -1055,6 +1173,30 @@ async def get_config_endpoint() -> Dict[str, Any]:
 @app.post("/api/config")
 async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
     """Dynamically adjust risk thresholds, strategy targets, credentials, and operating mode from dashboard."""
+    next_max_odds = req.max_odds_cap if req.max_odds_cap is not None else bot.risk_guard.max_odds_cap
+    next_min_odds = req.min_odds_floor if req.min_odds_floor is not None else bot.risk_guard.min_odds_floor
+    next_min_time = req.min_time_left_seconds if req.min_time_left_seconds is not None else bot.risk_guard.min_time_left_seconds
+    next_max_time = req.max_time_left_seconds if req.max_time_left_seconds is not None else bot.risk_guard.max_time_left_seconds
+    if next_min_odds >= next_max_odds:
+        raise HTTPException(status_code=422, detail="Minimum odds must be lower than maximum odds")
+    if next_min_time > next_max_time:
+        raise HTTPException(status_code=422, detail="Minimum time left must not exceed maximum time left")
+
+    effective_api_key = (req.binance_api_key or bot.binance_client.api_key).strip()
+    effective_api_secret = (req.binance_api_secret or bot.binance_client.api_secret).strip()
+    if req.paper_trading is False and not (effective_api_key and effective_api_secret):
+        raise HTTPException(status_code=422, detail="Live trading requires both Binance API credentials")
+    if req.paper_trading is False and bot.ws_listener.enable_mock_stream:
+        raise HTTPException(status_code=422, detail="Disable ENABLE_MOCK_STREAM before enabling live trading")
+    if req.paper_trading is True and not bot.binance_client.paper_trading and bot.binance_client.get_positions():
+        raise HTTPException(status_code=409, detail="Settle or close live positions before switching to paper mode")
+    credentials_changed = any(
+        value is not None and bool(value.strip())
+        for value in (req.binance_api_key, req.binance_api_secret)
+    )
+    if (req.paper_trading is not None or credentials_changed) and bot._order_execution_lock.locked():
+        raise HTTPException(status_code=409, detail="Wait for the in-flight order to finish before changing live mode or credentials")
+
     bot.risk_guard.update_thresholds(
         confidence_threshold=req.confidence_threshold,
         max_position_size_usdt=req.max_position_size_usdt,
@@ -1099,23 +1241,31 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         bot.binance_client.paper_trading = req.paper_trading
         if prev_mode and not req.paper_trading:
             bot.binance_client.clear_paper_positions()
-            if bot.binance_client.api_key:
-                bot._spawn_task(bot.binance_client.sync_server_time(), name="switch_live_sync_time")
-                bot._spawn_task(bot.binance_client.fetch_live_balance(), name="switch_live_balance")
+            bot.stop_bot()
         logger.info(f"Updated Paper Trading mode to: {req.paper_trading}")
 
     if req.binance_api_key is not None and req.binance_api_key.strip():
         bot.binance_client.api_key = req.binance_api_key.strip()
         if bot.binance_client._session and not bot.binance_client._session.closed:
             bot.binance_client._session.headers["X-MBX-APIKEY"] = bot.binance_client.api_key
-        if not bot.binance_client.paper_trading:
-            bot._spawn_task(bot.binance_client.sync_server_time(), name="key_update_sync_time")
-            bot._spawn_task(bot.binance_client.fetch_live_balance(), name="key_update_live_balance")
         logger.info("Updated Binance API Key")
 
     if req.binance_api_secret is not None and req.binance_api_secret.strip():
         bot.binance_client.api_secret = req.binance_api_secret.strip()
         logger.info("Updated Binance API Secret")
+
+    if (
+        not bot.binance_client.paper_trading
+        and bot.binance_client.api_key.strip()
+        and bot.binance_client.api_secret.strip()
+        and (
+            req.paper_trading is False
+            or (req.binance_api_key is not None and bool(req.binance_api_key.strip()))
+            or (req.binance_api_secret is not None and bool(req.binance_api_secret.strip()))
+        )
+    ):
+        bot._spawn_task(bot.binance_client.sync_server_time(), name="live_config_sync_time")
+        bot._spawn_task(bot.binance_client.fetch_live_balance(), name="live_config_balance")
 
     if req.jev_ai_api_key is not None and req.jev_ai_api_key.strip():
         bot.jev_client.api_key = req.jev_ai_api_key.strip()
@@ -1142,23 +1292,66 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/auth/login")
-async def login_endpoint(req: LoginRequest) -> Dict[str, Any]:
-    """Authenticate dashboard operator identity."""
-    if req.username == settings.dashboard_username and req.password == settings.dashboard_password:
-        return {
-            "status": "success",
-            "token": settings.dashboard_auth_token,
-            "username": req.username,
-            "message": "Authentication successful"
-        }
-    from fastapi import HTTPException
-    raise HTTPException(status_code=401, detail="Invalid username or password")
+async def login_endpoint(req: LoginRequest, request: Request, response: Response):
+    """Authenticate an operator and issue a short-lived, revocable bearer token."""
+    now = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    for ip in list(_login_attempts):
+        recent = [stamp for stamp in _login_attempts[ip] if now - stamp < 60.0]
+        if recent:
+            _login_attempts[ip] = recent
+        else:
+            _login_attempts.pop(ip, None)
+    attempts = _login_attempts.get(client_ip, [])
+    if len(attempts) >= 5:
+        raise HTTPException(status_code=429, detail="Too many login attempts; try again in one minute")
+
+    expected_username = settings.dashboard_username.strip()
+    expected_password = settings.dashboard_password
+    if not expected_username or not expected_password:
+        raise HTTPException(status_code=503, detail="Dashboard credentials are not configured")
+
+    username_ok = hmac.compare_digest(req.username.encode("utf-8"), expected_username.encode("utf-8"))
+    password_ok = hmac.compare_digest(req.password.encode("utf-8"), expected_password.encode("utf-8"))
+    if not (username_ok and password_ok):
+        _login_attempts.setdefault(client_ip, []).append(now)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    _login_attempts.pop(client_ip, None)
+    for digest, (_, expires_at) in list(_dashboard_sessions.items()):
+        if expires_at <= now:
+            _dashboard_sessions.pop(digest, None)
+    token = secrets.token_urlsafe(32)
+    _dashboard_sessions[_token_digest(token)] = (expected_username, now + DASHBOARD_SESSION_TTL_SECONDS)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return {
+        "status": "success",
+        "token": token,
+        "username": expected_username,
+        "expires_in": DASHBOARD_SESSION_TTL_SECONDS,
+        "message": "Authentication successful",
+    }
+
+
+@app.get("/api/auth/session")
+async def session_endpoint(request: Request) -> Dict[str, Any]:
+    return {"status": "success", "username": request.state.operator_username}
+
+
+@app.post("/api/auth/logout")
+async def logout_endpoint(request: Request) -> Dict[str, str]:
+    token = _bearer_token(request.headers.get("Authorization"))
+    if token:
+        _dashboard_sessions.pop(_token_digest(token), None)
+    return {"status": "success", "message": "Session closed"}
 
 
 @app.post("/api/bot/start")
 async def start_bot_endpoint() -> Dict[str, Any]:
     """Web command to start/activate bot trading."""
-    bot.start_bot()
+    if not bot.start_bot():
+        raise HTTPException(status_code=409, detail="Live trading is not ready; check credentials and disable the mock feed")
     return {
         "bot_status": bot.bot_status,
         "message": "Trading bot activated successfully",
@@ -1180,14 +1373,11 @@ async def stop_bot_endpoint() -> Dict[str, Any]:
 @app.post("/api/pause")
 async def toggle_pause() -> Dict[str, Any]:
     """Pause or resume trading execution."""
-    bot.is_paused = not bot.is_paused
-    bot.bot_status = "STOPPED" if bot.is_paused else "RUNNING"
-    try:
-        persist_env_key("BOT_STATUS", bot.bot_status)
-    except Exception as e:
-        logger.warning(f"Failed to persist BOT_STATUS to .env: {e}")
-    logger.info(f"Trading bot state changed: {bot.bot_status} (paused={bot.is_paused})")
-    bot._spawn_task(bot.broadcast_status(), name="broadcast_toggle_pause")
+    if bot.is_paused:
+        if not bot.start_bot():
+            raise HTTPException(status_code=409, detail="Live trading is not ready; check credentials and disable the mock feed")
+    else:
+        bot.stop_bot()
     return {"bot_status": bot.bot_status, "is_paused": bot.is_paused}
 
 
@@ -1227,15 +1417,118 @@ async def set_target_endpoint(req: TargetMarketRequest) -> Dict[str, Any]:
 @app.post("/api/trade/manual")
 async def manual_trade_endpoint(req: ManualTradeRequest) -> Dict[str, Any]:
     """Manually place an UP or DOWN prediction order without waiting for AI."""
-    clean_side = "UP" if req.side.upper() in ("UP", "BUY_YES") else "DOWN"
-    order_result = await bot.binance_client.place_prediction_order(
-        market_id=req.market_id,
-        symbol=req.symbol,
-        side=clean_side,
-        contracts=req.contracts,
-        target_price=req.target_price,
-        strike_price=req.strike_price if req.strike_price is not None else 0.0,
+    if bot.bot_status != "RUNNING" or bot.is_paused:
+        raise HTTPException(status_code=409, detail="Trading is stopped; resume the bot before placing a manual order")
+
+    active_markets = {m["market_id"]: m for m in bot.ws_listener.get_active_markets()}
+    market = active_markets.get(req.market_id)
+    if market is None:
+        raise HTTPException(status_code=404, detail="Market is not active")
+    symbol = req.symbol.upper().strip()
+    if symbol != str(market.get("symbol", "")).upper():
+        raise HTTPException(status_code=422, detail="Market symbol does not match the active market")
+    strike_price = float(market.get("target_price", 0.0))
+    spot_price = float(market.get("underlying_price", 0.0))
+    if not bot.binance_client.paper_trading:
+        if bot.ws_listener.enable_mock_stream:
+            raise HTTPException(status_code=409, detail="Manual live orders are disabled while the synthetic market feed is enabled")
+        if not (bot.binance_client.api_key.strip() and bot.binance_client.api_secret.strip()):
+            raise HTTPException(status_code=409, detail="Live trading requires both Binance API credentials")
+        if bot.ws_listener.network_state == "OFFLINE":
+            raise HTTPException(status_code=503, detail="Live market data is offline")
+        if not market.get("strike_confirmed") or not math.isfinite(strike_price) or strike_price <= 0:
+            raise HTTPException(status_code=409, detail="Waiting for Binance's official strike price")
+        if not math.isfinite(spot_price) or spot_price <= 0:
+            raise HTTPException(status_code=409, detail="The active market has invalid spot data")
+
+    clean_side = "UP" if req.side in ("UP", "BUY_YES") else "DOWN"
+    current_price = float(market.get("odds_yes" if clean_side == "UP" else "odds_no", 0.0))
+    time_left = int(market.get("time_left_seconds", 0))
+    timeframe = str(market.get("timeframe", "15m")).lower()
+    if not (0.0 < current_price < 1.0):
+        raise HTTPException(status_code=409, detail="The active market has invalid odds")
+    if not (bot.risk_guard.min_odds_floor <= current_price <= bot.risk_guard.max_odds_cap):
+        raise HTTPException(status_code=409, detail="The active market odds are outside the configured risk limits")
+    spread = float(market.get("spread", 1.0))
+    if not math.isfinite(spread) or spread < 0.0 or spread > 0.06:
+        raise HTTPException(status_code=409, detail="The active market spread exceeds the configured safety limit")
+    effective_min_time = (
+        max(bot.risk_guard.min_time_left_seconds, 120)
+        if timeframe in ("15m", "1h", "1d")
+        else bot.risk_guard.min_time_left_seconds
     )
+    if not (effective_min_time <= time_left <= bot.risk_guard.max_time_left_seconds):
+        raise HTTPException(status_code=409, detail="The market is outside the configured trading window")
+    bot.risk_guard._check_and_reset_daily_window()
+    if bot.risk_guard._circuit_breaker_active or bot.risk_guard._daily_realized_loss >= bot.risk_guard.max_daily_loss_usdt:
+        raise HTTPException(status_code=409, detail="Daily loss circuit breaker is active")
+    if req.contracts * current_price > bot.risk_guard.max_position_size_usdt:
+        raise HTTPException(status_code=422, detail="Manual order exceeds the configured position size limit")
+
+    async with bot._order_execution_lock:
+        if bot.bot_status != "RUNNING" or bot.is_paused:
+            raise HTTPException(status_code=409, detail="Trading was stopped before pre-flight verification")
+        open_positions = bot.binance_client.get_positions()
+        in_flight = list(getattr(bot.binance_client, "_in_flight_orders", {}).values())
+        if req.market_id in bot.traded_rounds or any(p.get("market_id") == req.market_id for p in open_positions):
+            raise HTTPException(status_code=409, detail="A position already exists for this market round")
+        if any(order.get("market_id") == req.market_id for order in in_flight):
+            raise HTTPException(status_code=409, detail="An order is already in flight for this market round")
+        if len(open_positions) + len(in_flight) >= bot.risk_guard.max_concurrent_positions:
+            raise HTTPException(status_code=409, detail="Maximum concurrent positions reached")
+
+        pre_flight = await bot.binance_client.verify_pre_flight_readiness(
+            symbol=symbol,
+            market_id=req.market_id,
+            side=clean_side,
+            timeframe=timeframe,
+            estimated_cost_usdt=req.contracts * current_price,
+            strike_price=strike_price,
+            spot_price=spot_price,
+            max_concurrent_positions=bot.risk_guard.max_concurrent_positions,
+        )
+        if not pre_flight.verified:
+            raise HTTPException(status_code=409, detail=f"Pre-flight verification failed: {pre_flight.reason}")
+        if bot.bot_status != "RUNNING" or bot.is_paused:
+            raise HTTPException(status_code=409, detail="Trading was stopped during pre-flight verification")
+
+        execution_price = current_price
+        verified_quote = None
+        if not bot.binance_client.paper_trading:
+            if not pre_flight.quote_id or pre_flight.quoted_price is None or not pre_flight.token_id:
+                raise HTTPException(status_code=503, detail="Binance did not return a complete executable quote")
+            execution_price = float(pre_flight.quoted_price)
+            if not (0.0 < execution_price < 1.0):
+                raise HTTPException(status_code=409, detail="Binance returned an invalid execution price")
+            if not (bot.risk_guard.min_odds_floor <= execution_price <= bot.risk_guard.max_odds_cap):
+                raise HTTPException(status_code=409, detail="Binance quote is outside the configured odds limits")
+            if req.contracts * execution_price > bot.risk_guard.max_position_size_usdt:
+                raise HTTPException(status_code=422, detail="Quoted manual order exceeds the configured position size limit")
+            if pre_flight.live_balance_usdt < req.contracts * execution_price:
+                raise HTTPException(status_code=409, detail="Insufficient Binance balance for the quoted order")
+            verified_quote = {
+                "quote_id": pre_flight.quote_id,
+                "quoted_price": execution_price,
+                "token_id": pre_flight.token_id,
+            }
+
+        order_result = await bot.binance_client.place_prediction_order(
+            market_id=req.market_id,
+            symbol=symbol,
+            side=clean_side,
+            contracts=req.contracts,
+            target_price=execution_price,
+            strike_price=pre_flight.official_strike_price or strike_price,
+            spot_price=spot_price,
+            timeframe=timeframe,
+            pre_verified_quote=verified_quote,
+        )
+        if order_result.status in ("FILLED", "SIMULATED", "NEW"):
+            bot.traded_rounds.add(req.market_id)
+            bot.risk_guard.record_market_traded(req.market_id)
+        else:
+            raise HTTPException(status_code=409, detail=order_result.error_message or "Binance rejected the order")
+
     return {
         "status": "success",
         "order": order_result.model_dump(),
@@ -1260,12 +1553,25 @@ async def claim_winnings_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/evaluate/force")
-async def force_evaluate_endpoint(market_id: str) -> Dict[str, Any]:
+async def force_evaluate_endpoint(
+    market_id: str = Query(..., min_length=1, max_length=128),
+) -> Dict[str, Any]:
     """Force an immediate single AI evaluation on specific market round."""
+    if bot.bot_status != "RUNNING" or bot.is_paused:
+        raise HTTPException(status_code=409, detail="Trading is stopped")
     markets = {m["market_id"]: m for m in bot.ws_listener.get_active_markets()}
     if market_id not in markets:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Market not found in active streams")
+
+    if market_id in bot.traded_rounds or market_id in bot._eval_in_progress:
+        raise HTTPException(status_code=409, detail="This market round is already traded or being evaluated")
+    open_positions = bot.binance_client.get_positions()
+    in_flight_orders = getattr(bot.binance_client, "_in_flight_orders", {}).values()
+    if any(position.get("market_id") == market_id for position in open_positions) or any(
+        order.get("market_id") == market_id for order in in_flight_orders
+    ):
+        raise HTTPException(status_code=409, detail="An open position or order already exists for this market round")
 
     m_info = markets[market_id]
     ctx = MarketContext(
@@ -1286,7 +1592,6 @@ async def force_evaluate_endpoint(market_id: str) -> Dict[str, Any]:
         ask=m_info.get("ask", 0.51),
     )
     bot.evaluated_rounds.discard(market_id)
-    bot.traded_rounds.discard(market_id)
     bot.last_eval_time.pop(market_id, None)
     await bot.on_market_tick(ctx)
     return {"status": "success", "message": f"Forced evaluation executed for {market_id}"}
@@ -1294,10 +1599,23 @@ async def force_evaluate_endpoint(market_id: str) -> Dict[str, Any]:
 
 @app.websocket("/ws/stream")
 async def websocket_telemetry_endpoint(websocket: WebSocket) -> None:
-    """Real-time streaming WebSocket endpoint for Web Dashboard."""
+    """Authenticate the dashboard before sending any telemetry over WebSocket."""
     await websocket.accept()
-    bot.ws_clients.add(websocket)
+    token = ""
     try:
+        auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=8.0)
+        if not isinstance(auth_message, dict) or auth_message.get("type") != "AUTH":
+            await websocket.close(code=4401)
+            return
+        token = str(auth_message.get("token", ""))
+        if _authenticated_username(token) is None:
+            await websocket.close(code=4401)
+            return
+
+        session_digest = _token_digest(token)
+        bot.ws_clients.add(websocket)
+        bot._ws_session_digests[websocket] = session_digest
+
         # Send initial snapshot immediately upon connection
         open_pos = bot.binance_client.get_positions()
         closed_pos = bot.binance_client.get_closed_positions()
@@ -1316,12 +1634,18 @@ async def websocket_telemetry_endpoint(websocket: WebSocket) -> None:
         # Keep socket open and handle any incoming messages/pings
         while True:
             data = await websocket.receive_text()
+            if _username_for_digest(session_digest) is None:
+                await websocket.close(code=4401)
+                break
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
-        bot.ws_clients.discard(websocket)
+        pass
     except Exception:
+        logger.debug("Dashboard WebSocket closed after a connection error")
+    finally:
         bot.ws_clients.discard(websocket)
+        bot._ws_session_digests.pop(websocket, None)
 
 
 def run_main() -> None:

@@ -39,7 +39,9 @@ export const Header: React.FC<HeaderProps> = ({
   onResetCircuitBreaker,
   onLogout,
 }) => {
-  const isPaper = status?.trading_mode !== 'LIVE_TRADING';
+  const mode = status?.trading_mode ?? 'PAPER_TRADING';
+  const isPaper = mode === 'PAPER_TRADING';
+  const hasConfigurationError = mode === 'CONFIGURATION_ERROR';
   const circuitTripped = status?.risk_guard?.circuit_breaker_active ?? false;
   const wsState = status?.ws_stream?.state ?? (isConnected ? 'CONNECTED' : 'CONNECTING');
   const netHealth = status?.network_health;
@@ -96,12 +98,14 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Operating Mode Badge */}
           <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono font-medium ${
-            isPaper 
+            hasConfigurationError
+              ? 'bg-rose-500/10 border-rose-500/40 text-rose-300'
+              : isPaper
               ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' 
               : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300 shadow-sm shadow-emerald-500/20'
           }`}>
-            <span className={`w-2 h-2 rounded-full ${isPaper ? 'bg-amber-400' : 'bg-emerald-400'}`} />
-            <span>{isPaper ? 'PAPER' : 'LIVE'}</span>
+            <span className={`w-2 h-2 rounded-full ${hasConfigurationError ? 'bg-rose-400' : isPaper ? 'bg-amber-400' : 'bg-emerald-400'}`} />
+            <span>{hasConfigurationError ? 'LIVE CONFIG ERROR' : isPaper ? 'PAPER' : 'LIVE'}</span>
           </div>
 
           {/* Network Liveness & Health Indicator */}

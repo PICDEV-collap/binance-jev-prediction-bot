@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # --- Binance Prediction Trading & Network Resilience ---
     funding_source: str = Field(default="CEX", alias="FUNDING_SOURCE")  # "CEX" or "MPC"
-    slippage_bps: int = Field(default=200, alias="SLIPPAGE_BPS")        # 2% auto-slippage (strictly controlled to prevent high fills)
+    slippage_bps: int = Field(default=200, ge=0, le=1000, alias="SLIPPAGE_BPS")  # Max 10% execution slippage
     network_heartbeat_interval_seconds: float = Field(
         default=3.0,
         alias="NETWORK_HEARTBEAT_INTERVAL_SECONDS"
@@ -181,21 +181,21 @@ class Settings(BaseSettings):
     )
 
     # --- Operating Modes ---
-    bot_status: str = Field(default="RUNNING", alias="BOT_STATUS")
+    bot_status: str = Field(default="STOPPED", alias="BOT_STATUS")
     paper_trading: bool = Field(default=True, alias="PAPER_TRADING")
     enable_mock_stream: bool = Field(default=False, alias="ENABLE_MOCK_STREAM")
 
     # --- Telemetry & Server (Dedicated Port: 8899 to prevent collision) ---
-    telemetry_host: str = Field(default="0.0.0.0", alias="TELEMETRY_HOST")
+    telemetry_host: str = Field(default="127.0.0.1", alias="TELEMETRY_HOST")
     telemetry_port: int = Field(default=8899, alias="TELEMETRY_PORT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # --- Dashboard Access & Identity Protection ---
-    dashboard_username: str = Field(default="admin", alias="DASHBOARD_USERNAME")
-    dashboard_password: str = Field(default="trader2026", alias="DASHBOARD_PASSWORD")
-    dashboard_auth_token: str = Field(
-        default="jev-auth-secret-session-key-2026",
-        alias="DASHBOARD_AUTH_TOKEN"
+    dashboard_username: str = Field(default="", alias="DASHBOARD_USERNAME")
+    dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
+    dashboard_allowed_origins: str = Field(
+        default="http://localhost:3888,http://127.0.0.1:3888",
+        alias="DASHBOARD_ALLOWED_ORIGINS",
     )
 
     @property
@@ -205,6 +205,7 @@ class Settings(BaseSettings):
             not self.paper_trading
             and bool(self.binance_api_key.strip())
             and bool(self.binance_api_secret.strip())
+            and not self.enable_mock_stream
         )
 
     @property

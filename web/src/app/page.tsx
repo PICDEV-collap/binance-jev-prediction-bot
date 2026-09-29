@@ -137,22 +137,45 @@ export default function DashboardPage() {
 
   // Load custom server URL & authentication session from localStorage
   useEffect(() => {
+    let cancelled = false;
     if (typeof window !== 'undefined') {
+      const savedUrl = localStorage.getItem('bot_server_url');
+      const initialServerUrl = savedUrl || 'http://localhost:8899';
+      if (savedUrl) setServerUrl(savedUrl);
+
       const savedAuth = localStorage.getItem('quant_auth_session');
       if (savedAuth) {
         try {
           const parsed = JSON.parse(savedAuth);
-          if (parsed?.username) {
-            setOperator(parsed);
-            setIsAuthenticated(true);
+          if (parsed?.username && parsed?.token) {
+            const endpoint = `${initialServerUrl.replace(/\/$/, '')}/api/auth/session`;
+            fetch(endpoint, { headers: { Authorization: `Bearer ${parsed.token}` } })
+              .then(async (res) => {
+                if (!res.ok) throw new Error('Session expired');
+                const session = await res.json();
+                if (!cancelled) {
+                  setStatus(null);
+                  setMarkets([]);
+                  setSelectedMarketId(null);
+                  setRecords([]);
+                  setOrders([]);
+                  setOpenPositions([]);
+                  setClosedPositions([]);
+                  setBotStatus('STOPPED');
+                  setOperator({ username: session.username || parsed.username, token: parsed.token });
+                  setIsAuthenticated(true);
+                }
+              })
+              .catch(() => {
+                localStorage.removeItem('quant_auth_session');
+              });
+          } else {
+            localStorage.removeItem('quant_auth_session');
           }
         } catch {
           localStorage.removeItem('quant_auth_session');
         }
       }
-
-      const saved = localStorage.getItem('bot_server_url');
-      if (saved) setServerUrl(saved);
     }
 
     const demoRecord: TelemetryRecord = {
@@ -261,11 +284,14 @@ export default function DashboardPage() {
         total_fills: 1,
       },
     });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Connect to live backend WebSocket or fallback gracefully
   const connectWebSocket = useCallback(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || !isAuthenticated || !operator.token) return;
 
     // Prevent duplicate connections if socket is already open or currently connecting
     if (
@@ -295,6 +321,7 @@ export default function DashboardPage() {
 
       socket.onopen = () => {
         setIsConnected(true);
+        socket.send(JSON.stringify({ type: 'AUTH', token: operator.token }));
       };
 
       socket.onmessage = (event) => {
@@ -467,10 +494,16 @@ export default function DashboardPage() {
         }
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
         setIsConnected(false);
         if (wsRef.current === socket) {
           wsRef.current = null;
+        }
+        if (event.code === 4401) {
+          localStorage.removeItem('quant_auth_session');
+          setOperator({ username: 'admin', token: '' });
+          setIsAuthenticated(false);
+          return;
         }
         reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
       };
@@ -483,7 +516,7 @@ export default function DashboardPage() {
       setIsConnected(false);
       reconnectTimeoutRef.current = setTimeout(connectWebSocket, 5000);
     }
-  }, [serverUrl]);
+  }, [serverUrl, isAuthenticated, operator.token]);
 
   useEffect(() => {
     connectWebSocket();
@@ -503,20 +536,33 @@ export default function DashboardPage() {
     };
   }, [connectWebSocket]);
 
-  const getApiUrl = (endpoint: string) => {
+  const getApiUrl = useCallback((endpoint: string) => {
     return `${serverUrl.replace(/\/$/, '')}${endpoint}`;
-  };
+  }, [serverUrl]);
+
+  const authenticatedFetch = useCallback(async (endpoint: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers);
+    if (operator.token) headers.set('Authorization', `Bearer ${operator.token}`);
+    const response = await fetch(getApiUrl(endpoint), { ...init, headers });
+    if (response.status === 401) {
+      localStorage.removeItem('quant_auth_session');
+      setOperator({ username: 'admin', token: '' });
+      setIsAuthenticated(false);
+    }
+    return response;
+  }, [getApiUrl, operator.token]);
 
   // Periodic REST polling fallback to ensure 100% data sync even if WebSocket is disconnected/reconnecting
   useEffect(() => {
     let isCancelled = false;
 
     const fetchRestSnapshot = async () => {
+      if (!isAuthenticated || !operator.token) return;
       try {
         const [statusRes, posRes, marketsRes] = await Promise.all([
-          fetch(getApiUrl('/api/status')).catch(() => null),
-          fetch(getApiUrl('/api/positions')).catch(() => null),
-          fetch(getApiUrl('/api/markets')).catch(() => null),
+          authenticatedFetch('/api/status').catch(() => null),
+          authenticatedFetch('/api/positions').catch(() => null),
+          authenticatedFetch('/api/markets').catch(() => null),
         ]);
 
         if (isCancelled) return;
@@ -565,34 +611,7 @@ export default function DashboardPage() {
       isCancelled = true;
       clearInterval(pollInterval);
     };
-  }, [serverUrl]);
-
-  // Offline interactive simulator generator ONLY when both WebSocket AND REST backend are unavailable (e.g. standalone Vercel preview)
-  useEffect(() => {
-    if (isConnected) return;
-
-    const interval = setInterval(() => {
-      // Only simulate if no real backend has responded yet
-      if (status?.trading_mode === 'LIVE_TRADING') return;
-
-      setMarkets((prev) =>
-        prev.map((m) => {
-          const shift = (Math.random() - 0.5) * 0.015;
-          const newYes = Math.max(0.08, Math.min(0.92, Number((m.odds_yes + shift).toFixed(3))));
-          const newNo = Number((1.0 - newYes).toFixed(3));
-          const newTime = m.time_left_seconds > 5 ? m.time_left_seconds - 3 : 900;
-          return {
-            ...m,
-            odds_yes: newYes,
-            odds_no: newNo,
-            time_left_seconds: newTime,
-          };
-        })
-      );
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [isConnected, status]);
+  }, [serverUrl, isAuthenticated, operator.token, authenticatedFetch]);
 
   const handleSaveServerUrl = (newUrl: string) => {
     setServerUrl(newUrl);
@@ -603,6 +622,14 @@ export default function DashboardPage() {
 
   // Authentication Handlers
   const handleLoginSuccess = (user: { username: string; token: string }) => {
+    setStatus(null);
+    setMarkets([]);
+    setSelectedMarketId(null);
+    setRecords([]);
+    setOrders([]);
+    setOpenPositions([]);
+    setClosedPositions([]);
+    setBotStatus('STOPPED');
     setOperator(user);
     setIsAuthenticated(true);
     if (typeof window !== 'undefined') {
@@ -611,6 +638,10 @@ export default function DashboardPage() {
   };
 
   const handleLogout = () => {
+    if (operator.token) {
+      const headers = new Headers({ Authorization: `Bearer ${operator.token}` });
+      fetch(getApiUrl('/api/auth/logout'), { method: 'POST', headers }).catch(() => undefined);
+    }
     setIsAuthenticated(false);
     setOperator({ username: 'admin', token: '' });
     if (typeof window !== 'undefined') {
@@ -624,7 +655,7 @@ export default function DashboardPage() {
       if (typeof window !== 'undefined' && window.location.protocol === 'https:' && serverUrl.startsWith('http://')) {
         console.warn('Mixed Content Warning: Calling HTTP API from HTTPS origin may be blocked by browser.');
       }
-      const res = await fetch(getApiUrl('/api/bot/start'), { method: 'POST' });
+      const res = await authenticatedFetch('/api/bot/start', { method: 'POST' });
       if (res.ok) {
         const data = await res.json().catch(() => null);
         const newStatus = data?.bot_status === 'STOPPED' ? 'STOPPED' : 'RUNNING';
@@ -643,7 +674,7 @@ export default function DashboardPage() {
       if (typeof window !== 'undefined' && window.location.protocol === 'https:' && serverUrl.startsWith('http://')) {
         console.warn('Mixed Content Warning: Calling HTTP API from HTTPS origin may be blocked by browser.');
       }
-      const res = await fetch(getApiUrl('/api/bot/stop'), { method: 'POST' });
+      const res = await authenticatedFetch('/api/bot/stop', { method: 'POST' });
       if (res.ok) {
         const data = await res.json().catch(() => null);
         const newStatus = data?.bot_status === 'RUNNING' ? 'RUNNING' : 'STOPPED';
@@ -659,7 +690,8 @@ export default function DashboardPage() {
 
   const handleResetCircuitBreaker = async () => {
     try {
-      await fetch(getApiUrl('/api/circuit-breaker/reset'), { method: 'POST' });
+      const res = await authenticatedFetch('/api/circuit-breaker/reset', { method: 'POST' });
+      if (!res.ok) return;
       setStatus((prev) => {
         if (!prev) return null;
         return {
@@ -671,24 +703,14 @@ export default function DashboardPage() {
           },
         };
       });
-    } catch {
-      // Local fallback
-      setStatus((prev) => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          risk_guard: {
-            ...prev.risk_guard,
-            circuit_breaker_active: false,
-          },
-        };
-      });
+    } catch (error) {
+      console.error('Failed to reset the circuit breaker:', error);
     }
   };
 
   const handleSaveConfig = async (newConfig: BotConfig) => {
     try {
-      const res = await fetch(getApiUrl('/api/config'), {
+      const res = await authenticatedFetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newConfig),
@@ -697,57 +719,22 @@ export default function DashboardPage() {
         const data = await res.json();
         if (data.current_status) {
           setStatus(data.current_status);
-          return;
+        } else {
+          console.error('Configuration response did not include the updated system status.');
         }
+        return;
+      } else {
+        console.error('Failed to update configuration: Server responded with HTTP', res.status);
+        return;
       }
-    } catch {
-      console.log('Backend offline; simulated local config update');
+    } catch (error) {
+      console.error('Backend unavailable; configuration was not changed:', error);
     }
-
-    setStatus((prev) => {
-      if (!prev) return null;
-      return {
-        ...prev,
-        trading_mode: newConfig.paper_trading ? 'PAPER_TRADING' : 'LIVE_TRADING',
-        target_market: {
-          target_symbol: newConfig.target_symbol ?? prev.target_market?.target_symbol ?? 'BTCUSDT',
-          target_timeframe: newConfig.target_timeframe ?? prev.target_market?.target_timeframe ?? '15m',
-          evaluated_rounds_count: prev.target_market?.evaluated_rounds_count ?? 0,
-          evaluation_policy: newConfig.eval_interval_seconds ? `every_${newConfig.eval_interval_seconds}s` : prev.target_market?.evaluation_policy ?? 'every_60s',
-          eval_interval_seconds: newConfig.eval_interval_seconds ?? prev.target_market?.eval_interval_seconds ?? 60,
-        },
-        jev_ai: {
-          ...prev.jev_ai,
-          model: newConfig.jev_ai_model ?? prev.jev_ai.model,
-          has_api_key: newConfig.jev_ai_api_key ? true : prev.jev_ai.has_api_key,
-        },
-        risk_guard: {
-          ...prev.risk_guard,
-          confidence_threshold: newConfig.confidence_threshold,
-          max_position_size_usdt: newConfig.max_position_size_usdt,
-          default_order_contracts: newConfig.default_order_contracts ?? prev.risk_guard.default_order_contracts,
-          cooldown_seconds: newConfig.cooldown_seconds,
-          max_daily_loss_usdt: newConfig.max_daily_loss_usdt ?? prev.risk_guard.max_daily_loss_usdt,
-          max_concurrent_positions: newConfig.max_concurrent_positions ?? prev.risk_guard.max_concurrent_positions,
-          max_odds_cap: newConfig.max_odds_cap ?? prev.risk_guard.max_odds_cap,
-          min_odds_floor: newConfig.min_odds_floor ?? prev.risk_guard.min_odds_floor,
-          slippage_bps: newConfig.slippage_bps ?? prev.risk_guard.slippage_bps,
-          martingale: prev.risk_guard.martingale ? {
-            ...prev.risk_guard.martingale,
-            enabled: newConfig.martingale_enabled ?? prev.risk_guard.martingale.enabled,
-            multiplier: newConfig.martingale_multiplier ?? prev.risk_guard.martingale.multiplier,
-            max_steps: newConfig.martingale_max_steps ?? prev.risk_guard.martingale.max_steps,
-            confidence_step: newConfig.martingale_confidence_step ?? prev.risk_guard.martingale.confidence_step,
-            max_confidence: newConfig.martingale_max_confidence ?? prev.risk_guard.martingale.max_confidence,
-          } : undefined,
-        },
-      };
-    });
   };
 
-  const handleSetAiTarget = async (symbol: string, timeframe: string) => {
+  const handleSetAiTarget = useCallback(async (symbol: string, timeframe: string) => {
     try {
-      const res = await fetch(getApiUrl('/api/target'), {
+      const res = await authenticatedFetch('/api/target', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ target_symbol: symbol, target_timeframe: timeframe }),
@@ -774,11 +761,11 @@ export default function DashboardPage() {
     } catch (e) {
       console.error('Failed to set AI target:', e);
     }
-  };
+  }, [authenticatedFetch]);
 
   const handleManualTrade = async (market: MarketItem, side: 'UP' | 'DOWN') => {
     try {
-      const res = await fetch(getApiUrl('/api/trade/manual'), {
+      const res = await authenticatedFetch('/api/trade/manual', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -786,8 +773,6 @@ export default function DashboardPage() {
           symbol: market.symbol,
           side: side,
           contracts: 10,
-          target_price: side === 'UP' ? market.odds_yes : market.odds_no,
-          strike_price: market.target_price,
         }),
       });
       if (res.ok) {
@@ -901,7 +886,7 @@ export default function DashboardPage() {
         currentTargetSymbol={status?.target_market?.target_symbol ?? 'BTCUSDT'}
         currentTargetTimeframe={status?.target_market?.target_timeframe ?? '15m'}
         currentEvalIntervalSeconds={status?.target_market?.eval_interval_seconds ?? 60}
-        currentPaperTrading={status?.trading_mode !== 'LIVE_TRADING'}
+        currentPaperTrading={status ? status.trading_mode === 'PAPER_TRADING' : true}
         currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}
         currentMartingaleMode={(status?.risk_guard?.martingale?.mode as "SMART_HYBRID" | "FIXED_MULTIPLIER") ?? 'SMART_HYBRID'}
         currentMartingaleMultiplier={status?.risk_guard?.martingale?.multiplier ?? 2.0}

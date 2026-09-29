@@ -8,7 +8,7 @@ interface LiveTerminalLogProps {
   records: TelemetryRecord[];
 }
 
-export const LiveTerminalLog: React.FC<LiveTerminalLogProps> = ({ records }) => {
+const LiveTerminalLogView: React.FC<LiveTerminalLogProps> = ({ records }) => {
   const [isPaused, setIsPaused] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -107,3 +107,5 @@ export const LiveTerminalLog: React.FC<LiveTerminalLogProps> = ({ records }) => 
     </div>
   );
 };
+
+export const LiveTerminalLog = React.memo(LiveTerminalLogView);

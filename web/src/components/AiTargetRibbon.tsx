@@ -33,7 +33,7 @@ const TIMEFRAMES = [
   { label: '1 Day', value: '1d' },
 ];
 
-export const AiTargetRibbon: React.FC<AiTargetRibbonProps> = ({
+const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
   status,
   serverUrl,
   onTargetChanged,
@@ -158,3 +158,13 @@ export const AiTargetRibbon: React.FC<AiTargetRibbonProps> = ({
     </div>
   );
 };
+
+export const AiTargetRibbon = React.memo(
+  AiTargetRibbonView,
+  (previous, next) =>
+    previous.serverUrl === next.serverUrl &&
+    previous.onTargetChanged === next.onTargetChanged &&
+    previous.status?.target_market?.target_symbol === next.status?.target_market?.target_symbol &&
+    previous.status?.target_market?.target_timeframe === next.status?.target_market?.target_timeframe &&
+    previous.status?.target_market?.evaluated_rounds_count === next.status?.target_market?.evaluated_rounds_count
+);

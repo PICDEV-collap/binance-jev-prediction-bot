@@ -125,7 +125,7 @@ cp .env.example .env
 python main.py
 ```
 
-> **หมายเหตุ:** ระบบตั้งค่าเริ่มต้นเป็น `PAPER_TRADING=true` เพื่อความปลอดภัย คุณสามารถรันบอทเพื่อทดสอบได้ทันทีโดยไม่ต้องใส่ API Key ระบบจะจำลองข้อมูลตลาดและการเทรดให้โดยอัตโนมัติ
+> **หมายเหตุ:** ระบบตั้งค่าเริ่มต้นเป็น `PAPER_TRADING=true` และ `BOT_STATUS=STOPPED` เพื่อความปลอดภัย ก่อนเปิดหน้าแดชบอร์ดให้กำหนด `DASHBOARD_USERNAME` และ `DASHBOARD_PASSWORD` ที่ไม่ซ้ำใครใน `.env` การเทรดจำลองเปิดได้หลังจากเข้าสู่ระบบและสั่งเริ่มบอท โหมด Live จะหยุดไว้หลังเริ่มโปรเซสใหม่และต้องสั่งเริ่มจากผู้ควบคุมทุกครั้ง
 
 API & WebSocket Endpoints ของ Trading Core (พอร์ต **8899** ป้องกันการชนกับโปรเจกต์อื่น):
 - **Status API:** `http://localhost:8899/api/status`
@@ -164,7 +164,7 @@ npm run dev
 4. Framework Preset จะตรวจจับเป็น **Next.js** โดยอัตโนมัติ
 5. กด **Deploy**
 
-> **คุณสมบัติพิเศษสำหรับ Vercel Preview:** เมื่อ Deploy บน Vercel ในกรณีที่เครื่อง Server ของบอทไม่ได้เปิดอยู่ หน้าเว็บจะมี **Standalone Live Simulator Fallback** ในตัว ทำให้หน้าแดชบอร์ดมีข้อมูลตลาด การขยับของราคา อัตราต่อรอง และเกจ์วัดความมั่นใจของ AI ทำงานให้ผู้เข้าชมเห็นได้ตลอดเวลาอย่างสวยงาม
+> หน้า Dashboard ต้องเชื่อมต่อ Trading Core ที่รันแยกอยู่ การ Deploy บน Vercel เพียงอย่างเดียวไม่เปิดการเข้าถึงข้อมูลตลาดหรือคำสั่งควบคุม ต้องกำหนด origin ของหน้าเว็บใน `DASHBOARD_ALLOWED_ORIGINS` และเปิด Core ผ่าน reverse proxy ที่ใช้ HTTPS พร้อมจำกัดเครือข่าย
 
 ---
 
@@ -195,21 +195,21 @@ npm run dev
 | `MAX_POSITION_SIZE_USDT` | `50.0` | วงเงินเปิดสถานะสูงสุดต่อออเดอร์ (USDT) |
 | `COOLDOWN_SECONDS` | `45` | หน่วงเวลาป้องกันการยิงออเดอร์ซ้ำในตลาดเดิม (วินาที) |
 | `MAX_DAILY_LOSS_USDT` | `200.0` | ขีดจำกัดขาดทุนรายวันก่อนตัดการทำงาน |
+| `TELEMETRY_HOST` | `127.0.0.1` | ค่าเริ่มต้นผูก API ไว้กับเครื่องเดียว หากเปิดให้เข้าจากเครือข่ายให้ใช้ reverse proxy พร้อม HTTPS และจำกัด firewall |
 | `TELEMETRY_PORT` | `8899` | พอร์ตของ FastAPI & WebSocket สำหรับหน้า Dashboard (ป้องกันการชนกับพอร์ต 8000) |
 | `NEXT_PUBLIC_BOT_PORT` | `8899` | พอร์ตที่ Next.js Dashboard ใช้เชื่อมต่อไปยัง Python Core |
-| `DASHBOARD_USERNAME` | `admin` | ชื่อผู้ใช้สำหรับยืนยันตัวตนเข้าสู่หน้า Web Dashboard (Account Identify) |
-| `DASHBOARD_PASSWORD` | `trader2026` | รหัสผ่าน Master Key / PIN สำหรับปลดล็อคหน้าแดชบอร์ด |
+| `DASHBOARD_USERNAME` | ต้องกำหนดเอง | ชื่อผู้ใช้สำหรับยืนยันตัวตนเข้าสู่หน้า Web Dashboard |
+| `DASHBOARD_PASSWORD` | ต้องกำหนดเอง | รหัสผ่านที่ใช้ยืนยันตัวตนกับ API ฝั่งเซิร์ฟเวอร์ |
+| `DASHBOARD_ALLOWED_ORIGINS` | Local dashboard origins | รายการ origin ที่อนุญาต คั่นด้วย comma |
 
 ---
 
 ## 🔐 ระบบยืนยันตัวตนและการควบคุมบอทผ่านหน้าเว็บ (Web Operator Controls)
 
-1. **ระบบป้องกัน Account Identification:**
-   - เมื่อเข้าหน้าแดชบอร์ดครั้งแรก ระบบจะแสดงหน้าต่าง **Identity Access Gateway** บังคับให้ยืนยันตัวตนด้วย Username และ Master PIN ก่อนเข้าสู่ระบบควบคุม
-   - ค่าเริ่มต้น:
-     - **Username:** `admin`
-     - **Password:** `trader2026`
-   - เมื่อยืนยันตัวตนผ่าน ระบบจะจำกัด Session ไว้ในเบราว์เซอร์อย่างปลอดภัย พร้อมปุ่ม **Sign Out / Lock Desk** ที่แถบเมนูด้านบน
+1. **ระบบยืนยันตัวตนฝั่งเซิร์ฟเวอร์:**
+   - กำหนด `DASHBOARD_USERNAME` และ `DASHBOARD_PASSWORD` ใน `.env` ก่อนเริ่มระบบ หากยังไม่กำหนด ระบบจะปฏิเสธการเข้าสู่ระบบ
+   - Login จะออก bearer session แบบสุ่มที่หมดอายุใน 12 ชั่วโมง และจำกัดการลองรหัสผ่านผิด ระบบป้องกันทุก HTTP API และ WebSocket ด้วย session นี้
+   - ปุ่ม **Sign Out / Lock Desk** เพิกถอน session ปัจจุบัน
 
 2. **ปุ่มสั่งการ START / STOP บอทสดจากหน้าเว็บ:**
    - **START BOT (สีเขียว):** สั่งเริ่มทำงานหรือปลดล็อคให้บอทเริ่มดักจับราคาและส่งคำสั่งเทรดอัตโนมัติ

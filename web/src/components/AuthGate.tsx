@@ -31,7 +31,6 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
     setLoading(true);
     setErrorMsg(null);
 
-    // Try authenticating with backend API if reachable
     try {
       const endpoint = `${serverUrl.replace(/\/$/, '')}/api/auth/login`;
       const res = await fetch(endpoint, {
@@ -42,29 +41,20 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
 
       if (res.ok) {
         const data = await res.json();
+        if (!data?.token) {
+          setErrorMsg('The backend did not return a valid session. Please try again.');
+          return;
+        }
         onLoginSuccess({
           username: data.username || username,
-          token: data.token || 'session-token',
+          token: data.token,
         });
         return;
-      } else {
-        const data = await res.json().catch(() => null);
-        throw new Error(data?.detail || 'Invalid Operator Username or Password');
       }
-    } catch (err: any) {
-      // If backend is offline or network fails, verify against default institutional credentials
-      if (err.message && err.message.includes('Invalid Operator')) {
-        setErrorMsg(err.message);
-      } else if (username === 'admin' && (password === 'trader2026' || password === 'admin1234')) {
-        // Safe offline / preview authentication fallback
-        onLoginSuccess({
-          username: 'admin',
-          token: 'offline-preview-session-token',
-        });
-        return;
-      } else {
-        setErrorMsg('Authentication failed: Invalid Operator ID or Security PIN.');
-      }
+      const data = await res.json().catch(() => null);
+      setErrorMsg(data?.detail || 'Authentication failed. Check the configured operator credentials.');
+    } catch {
+      setErrorMsg('Cannot reach the trading backend. Offline preview does not grant operator access.');
     } finally {
       setLoading(false);
     }
@@ -176,7 +166,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ serverUrl, onLoginSuccess })
         <div className="mt-6 pt-5 border-t border-slate-900 text-center">
           <div className="flex items-center justify-center gap-1.5 text-[11px] font-mono text-slate-500">
             <Lock className="w-3 h-3 text-slate-400" />
-            <span>Encrypted Session • HMAC SHA-256 Protected</span>
+            <span>Backend verified • Short lived operator session</span>
           </div>
         </div>
 

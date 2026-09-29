@@ -115,7 +115,7 @@ export interface SystemStatus {
   is_paused: boolean;
   uptime_seconds: number;
   uptime_formatted: string;
-  trading_mode: 'PAPER_TRADING' | 'LIVE_TRADING';
+  trading_mode: 'PAPER_TRADING' | 'LIVE_TRADING' | 'CONFIGURATION_ERROR';
   ws_stream: {
     state: ConnectionStateType;
     stream_url: string;
@@ -268,4 +268,3 @@ export interface BotConfig {
   jev_ai_api_key?: string;
   persist_to_env?: boolean;
 }
-

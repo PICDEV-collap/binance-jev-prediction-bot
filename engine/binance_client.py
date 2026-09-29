@@ -6,6 +6,7 @@ persistent connection pooling, and high-fidelity paper trading simulation.
 
 from __future__ import annotations
 import asyncio
+from collections import deque
 import hashlib
 import hmac
 import logging
@@ -129,7 +130,7 @@ class BinanceClient:
         self.paper_trading = paper_trading
         self.slippage_tolerance = slippage_tolerance
         self.funding_source = funding_source
-        self.slippage_bps = slippage_bps
+        self.slippage_bps = max(0, min(1000, int(slippage_bps)))
         self.max_odds_cap = max_odds_cap
         self.min_odds_floor = min_odds_floor
         self.enable_early_take_profit = enable_early_take_profit
@@ -145,7 +146,7 @@ class BinanceClient:
         self._paper_balance_usdt: float = 1000.0  # Starting mock wallet
         self._paper_positions: Dict[str, PositionInfo] = {}
         self._closed_positions: List[ClosedPositionInfo] = []
-        self._order_history: List[OrderResult] = []
+        self._order_history: deque[OrderResult] = deque(maxlen=1000)
 
         # Live Binance Account Cache
         self._live_balance_usdt: float = 0.0
@@ -722,13 +723,14 @@ class BinanceClient:
     ) -> OrderResult:
         """
         Execute an order on Binance Prediction Markets.
-        If paper_trading is True or no API keys exist, runs high-speed paper simulator.
+        Paper simulation is available only when explicitly enabled. A live-mode client
+        without credentials fails closed instead of silently simulating an order.
         """
         start_time = time.perf_counter()
         client_order_id = f"JEV_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
 
         # --- Paper Trading Simulation Mode ---
-        if self.paper_trading or not (self.api_key and self.api_secret):
+        if self.paper_trading:
             return await self._simulate_order_execution(
                 market_id=market_id,
                 symbol=symbol,
@@ -742,6 +744,25 @@ class BinanceClient:
                 martingale_step=martingale_step,
                 stage=stage,
             )
+
+        if not (self.api_key.strip() and self.api_secret.strip()):
+            result = OrderResult(
+                order_id="REJECTED",
+                client_order_id=client_order_id,
+                market_id=market_id,
+                symbol=symbol,
+                side=side,
+                contracts=contracts,
+                price=target_price,
+                status="REJECTED",
+                latency_ms=round((time.perf_counter() - start_time) * 1000.0, 2),
+                martingale_step=martingale_step,
+                stage=stage,
+                error_message="Live trading requires both Binance API credentials",
+            )
+            self._total_orders_dispatched += 1
+            self._order_history.append(result)
+            return result
 
         # --- Live Execution Mode ---
         if self._session is None or self._session.closed:
@@ -1640,7 +1661,10 @@ class BinanceClient:
 
     def get_order_history(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the most recent order execution log."""
-        return [o.model_dump() for o in reversed(self._order_history[-limit:])]
+        if limit <= 0:
+            return []
+        recent = list(self._order_history)[-min(limit, self._order_history.maxlen or limit):]
+        return [o.model_dump() for o in reversed(recent)]
 
     def get_positions(self) -> List[Dict[str, Any]]:
         """Return currently held active open positions based on current trading mode."""
@@ -1657,6 +1681,8 @@ class BinanceClient:
 
     def get_closed_positions(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return historical settled/closed positions."""
+        if limit <= 0:
+            return []
         return [p.model_dump() for p in reversed(self._closed_positions[-limit:])]
 
     def get_recent_performance(self, symbol: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
@@ -1719,7 +1745,7 @@ class BinanceClient:
 
     async def fetch_live_balance(self) -> Optional[Dict[str, float]]:
         """Fetch real-time USDT wallet balance for Prediction trading."""
-        if self.paper_trading or not (self.api_key and self.api_secret):
+        if self.paper_trading:
             return None
         if self._session is None or self._session.closed:
             await self.start()
@@ -1843,7 +1869,11 @@ class BinanceClient:
             open_count = len(self._paper_positions)
 
         return {
-            "mode": "PAPER_TRADING" if self.paper_trading else "LIVE_TRADING",
+            "mode": (
+                "PAPER_TRADING" if self.paper_trading
+                else "LIVE_TRADING" if self.api_key.strip() and self.api_secret.strip()
+                else "CONFIGURATION_ERROR"
+            ),
             "balance_usdt": available_balance,
             "available_balance": available_balance,
             "total_equity": total_equity,
@@ -1860,7 +1890,7 @@ class BinanceClient:
 
     async def fetch_claimable_positions(self) -> List[str]:
         """Fetch pending claim outcome token IDs from Binance Prediction API."""
-        if self.paper_trading or not (self.api_key and self.api_secret):
+        if self.paper_trading:
             return []
         if self._session is None or self._session.closed:
             await self.start()
@@ -1995,7 +2025,7 @@ class BinanceClient:
         clean_sym = symbol.upper().strip()
 
         # Paper Trading Mode
-        if self.paper_trading or not (self.api_key and self.api_secret):
+        if self.paper_trading:
             has_dup = any(p.market_id == market_id for p in self._paper_positions.values())
             if has_dup:
                 return PreFlightVerificationResult(
@@ -2023,6 +2053,13 @@ class BinanceClient:
                 token_id="PAPER_TOKEN",
                 quote_id=f"PAPER_QUOTE_{int(time.time()*1000)}",
                 quoted_price=0.50,
+                latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
+            )
+
+        if not (self.api_key.strip() and self.api_secret.strip()):
+            return PreFlightVerificationResult(
+                verified=False,
+                reason="Live trading requires both Binance API credentials",
                 latency_ms=round((time.perf_counter() - start_t) * 1000.0, 2),
             )
 
