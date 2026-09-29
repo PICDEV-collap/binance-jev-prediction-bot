@@ -17,7 +17,8 @@ import math
 import random
 import time
 from enum import Enum
-from typing import Callable, Coroutine, Any, Optional, Dict, List, Set
+from typing import Callable, Coroutine, Any, Optional, Dict, List, Set, Iterable
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import websockets
@@ -25,10 +26,11 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from engine.jev_client import MarketContext
 from engine.indicators import RollingCandleAggregator, Candle
+from engine.symbols import DEFAULT_ACTIVE_SYMBOLS, normalize_active_symbols
 
 logger = logging.getLogger("ws_listener")
 
-SUPPORTED_SYMBOLS = ("BTCUSDT", "ETHUSDT", "BNBUSDT")
+SUPPORTED_SYMBOLS = DEFAULT_ACTIVE_SYMBOLS
 TIMEFRAMES: List[tuple[str, int]] = [
     ("5m", 300),
     ("15m", 900),
@@ -36,10 +38,26 @@ TIMEFRAMES: List[tuple[str, int]] = [
     ("1d", 86400),
 ]
 
-SPOT_COMBINED_STREAM_URL = (
-    "wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/bnbusdt@ticker"
-)
-REST_TICKER_API = "https://api.binance.com/api/v3/ticker/24hr?symbols=%5B%22BTCUSDT%22,%22ETHUSDT%22,%22BNBUSDT%22%5D"
+SPOT_COMBINED_STREAM_URL = "wss://stream.binance.com:9443/stream"
+REST_TICKER_API = "https://api.binance.com/api/v3/ticker/24hr"
+
+
+def _stream_url_for_symbols(template: str, symbols: Iterable[str]) -> str:
+    """Build a combined ticker stream URL, or retain a bare socket for SUBSCRIBE."""
+    parts = urlsplit(template)
+    path = parts.path or "/ws"
+    query_params = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key.lower() != "streams"]
+    if path.rstrip("/") == "/stream":
+        streams = "/".join(f"{symbol.lower()}@ticker" for symbol in symbols)
+        query_params.append(("streams", streams))
+    query = urlencode(query_params, doseq=True, safe="@/")
+    return urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+
+
+def _rest_ticker_url_for_symbols(symbols: Iterable[str]) -> str:
+    """Build a bounded REST ticker query for the current active pair universe."""
+    encoded_symbols = quote(json.dumps(list(symbols), separators=(",", ":")), safe="")
+    return f"{REST_TICKER_API}?symbols={encoded_symbols}"
 
 
 class ConnectionState(str, Enum):
@@ -66,14 +84,22 @@ class BinanceWSListener:
         ping_interval: int = 20,
         ping_timeout: int = 10,
         enable_mock_stream: bool = False,
+        active_symbols: Optional[Iterable[str]] = None,
     ) -> None:
-        # Default to high-reliability Spot combined stream if fstream was supplied
+        self.active_symbols = list(normalize_active_symbols(active_symbols or SUPPORTED_SYMBOLS))
+
+        # Keep spot as the preferred source, and retain the configured futures URL as fallback.
         if "fstream.binance.com" in stream_url:
-            self.stream_url = SPOT_COMBINED_STREAM_URL
-            self._fallback_stream_url = stream_url
+            primary_template = SPOT_COMBINED_STREAM_URL
+            fallback_template = stream_url
         else:
-            self.stream_url = stream_url
-            self._fallback_stream_url = SPOT_COMBINED_STREAM_URL
+            primary_template = stream_url
+            fallback_template = SPOT_COMBINED_STREAM_URL
+        self._primary_stream_template = primary_template
+        self._fallback_stream_template = fallback_template
+        self.stream_url = _stream_url_for_symbols(primary_template, self.active_symbols)
+        self._fallback_stream_url = _stream_url_for_symbols(fallback_template, self.active_symbols)
+        self._stream_config_version = 0
 
         self.on_market_event = on_market_event
         self.event_filter = event_filter
@@ -112,6 +138,41 @@ class BinanceWSListener:
         self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
         self._btc_momentum: float = 0.0
         self._background_tasks: Set[asyncio.Task] = set()
+
+    async def configure_active_symbols(self, symbols: Iterable[str]) -> bool:
+        """Replace the subscribed pair allowlist and reconnect the feed without restarting the bot."""
+        normalized = list(normalize_active_symbols(symbols))
+        if normalized == self.active_symbols:
+            return False
+
+        active = set(normalized)
+        removed = set(self.active_symbols) - active
+        self.active_symbols = normalized
+        self.stream_url = _stream_url_for_symbols(self._primary_stream_template, self.active_symbols)
+        self._fallback_stream_url = _stream_url_for_symbols(self._fallback_stream_template, self.active_symbols)
+        self._stream_config_version += 1
+
+        self._active_markets = {
+            key: market for key, market in self._active_markets.items()
+            if market.symbol in active
+        }
+        self.candle_aggregator.retain_symbols(active)
+        self._round_base_prices = {
+            key: price for key, price in self._round_base_prices.items()
+            if not any(key.startswith(f"{symbol}-") for symbol in removed)
+        }
+        self._official_strike_details = {
+            key: detail for key, detail in self._official_strike_details.items()
+            if str(detail.get("symbol", "")).upper() in active
+        }
+
+        if self._running:
+            self._spawn_task(self._bootstrap_kline_history())
+            if self._ws and not self._ws.closed:
+                await self._ws.close()
+
+        logger.info("Active Binance spot pairs updated: %s", ", ".join(self.active_symbols))
+        return True
 
     def update_official_strike_prices(
         self,
@@ -218,8 +279,13 @@ class BinanceWSListener:
         with exponential backoff and jitter.
         """
         target_url = self.stream_url
+        observed_config_version = self._stream_config_version
 
         while self._running:
+            if observed_config_version != self._stream_config_version:
+                target_url = self.stream_url
+                observed_config_version = self._stream_config_version
+                self._reconnect_attempts = 0
             try:
                 self.state = (
                     ConnectionState.CONNECTING
@@ -244,7 +310,7 @@ class BinanceWSListener:
                     logger.info("Successfully connected to Binance WebSocket Stream.")
 
                     # If URL does not already have streams specified, send subscription
-                    if "?" not in target_url:
+                    if "streams=" not in target_url.lower():
                         await self._send_subscriptions(ws)
 
                     # Message ingress loop
@@ -256,15 +322,22 @@ class BinanceWSListener:
             except (ConnectionClosed, WebSocketException) as ws_err:
                 self.state = ConnectionState.RECONNECTING
                 logger.warning(f"Binance WebSocket disconnected: {ws_err}")
-                # Switch to backup URL if primary fails repeatedly
-                if target_url != SPOT_COMBINED_STREAM_URL:
-                    logger.info("Flipping to Binance Spot Combined Stream fallback.")
-                    target_url = SPOT_COMBINED_STREAM_URL
+                # Alternate the configured primary and fallback URLs. Both URLs
+                # include the current active-pair subscription when applicable.
+                if target_url == self.stream_url:
+                    logger.info("Switching to configured Binance WebSocket fallback.")
+                    target_url = self._fallback_stream_url
+                else:
+                    target_url = self.stream_url
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 self.state = ConnectionState.RECONNECTING
                 logger.error(f"Unexpected WebSocket error: {exc}", exc_info=True)
+                if target_url == self.stream_url:
+                    target_url = self._fallback_stream_url
+                else:
+                    target_url = self.stream_url
 
             if self._running:
                 self._reconnect_attempts += 1
@@ -280,11 +353,7 @@ class BinanceWSListener:
         """Send subscription payload if connecting to a bare WebSocket."""
         subscribe_payload = {
             "method": "SUBSCRIBE",
-            "params": [
-                "btcusdt@ticker",
-                "ethusdt@ticker",
-                "bnbusdt@ticker",
-            ],
+            "params": [f"{symbol.lower()}@ticker" for symbol in self.active_symbols],
             "id": int(time.time()),
         }
         await ws.send(json.dumps(subscribe_payload))
@@ -359,7 +428,7 @@ class BinanceWSListener:
     def _normalize_market_data(self, payload: Dict[str, Any]) -> List[MarketContext]:
         """Convert Binance raw stream tick into standardized MarketContext for all active timeframes."""
         symbol = payload.get("s", payload.get("symbol", "")).upper()
-        if not symbol or symbol not in SUPPORTED_SYMBOLS:
+        if not symbol or symbol not in self.active_symbols:
             return []
 
         # Extract current market price (c=close/last, p=mark/last)
@@ -556,7 +625,7 @@ class BinanceWSListener:
         """
         logger.info("[KLINE BOOTSTRAP] Pre-fetching historical klines from Binance REST API...")
         base_url = "https://api.binance.com/api/v3/klines"
-        symbols_to_fetch = list(SUPPORTED_SYMBOLS)
+        symbols_to_fetch = list(self.active_symbols)
 
         for sym in symbols_to_fetch:
             if not self._running:
@@ -626,7 +695,7 @@ class BinanceWSListener:
                 silence_duration = time.time() - self._last_event_time
                 if silence_duration >= 3.5:
                     if self._http_session and not self._http_session.closed:
-                        async with self._http_session.get(REST_TICKER_API) as resp:
+                        async with self._http_session.get(_rest_ticker_url_for_symbols(self.active_symbols)) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 if isinstance(data, list):
@@ -642,22 +711,24 @@ class BinanceWSListener:
     async def _run_mock_stream_generator(self) -> None:
         """
         High-fidelity simulated market feed generator for testing and demonstration.
-        Emits realistic market ticks for BTC, ETH, and SOL prediction markets.
+        Emits ticks for the currently configured pair allowlist.
         """
         self.state = ConnectionState.CONNECTED
         logger.info("Mock Stream Generator activated: emitting synthetic prediction market ticks.")
 
-        symbols = [
-            ("BTCUSDT", 84000.0, "Will BTC close >= $84,100 at 15m expiration?"),
-            ("ETHUSDT", 2680.0, "Will ETH settle >= $2,690 at 15m expiration?"),
-            ("SOLUSDT", 114.5, "Will SOL hold >= $115.00 at 15m expiration?"),
-        ]
+        mock_base_prices = {
+            "BTCUSDT": 84000.0, "ETHUSDT": 2680.0, "BNBUSDT": 585.0,
+            "SOLUSDT": 114.5, "DOGEUSDT": 0.14, "XRPUSDT": 0.60,
+        }
 
         while self._running:
-            for symbol, base_price, question in symbols:
+            for symbol in list(self.active_symbols):
                 if not self._running:
                     break
 
+                base_price = mock_base_prices.get(symbol, 100.0)
+                clean_symbol = symbol.replace("USDT", "")
+                question = f"Will {clean_symbol} meet its 15m prediction-market target?"
                 pct_change = random.gauss(0.0001, 0.0015)
                 current_price = round(base_price * (1.0 + pct_change), 2)
                 target = round(base_price * 1.0015, 2)
@@ -819,7 +890,7 @@ class BinanceWSListener:
             m.is_stale = is_net_stale
             active_list.append(m)
 
-        sym_order = {s: i for i, s in enumerate(SUPPORTED_SYMBOLS)}
+        sym_order = {s: i for i, s in enumerate(self.active_symbols)}
         tf_order = {"5m": 0, "15m": 1, "1h": 2, "1d": 3}
 
         def sort_key(m: MarketContext):

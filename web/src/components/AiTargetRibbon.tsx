@@ -15,16 +15,8 @@ import { SystemStatus } from '../types/trading';
 
 interface AiTargetRibbonProps {
   status: SystemStatus | null;
-  serverUrl: string;
   onTargetChanged?: (symbol: string, timeframe: string) => void;
 }
-
-const SYMBOLS = [
-  { label: '🌐 All Active Pairs (BTC, ETH, BNB)', value: 'ALL' },
-  { label: 'BTC/USDT (Bitcoin)', value: 'BTCUSDT' },
-  { label: 'ETH/USDT (Ethereum)', value: 'ETHUSDT' },
-  { label: 'BNB/USDT (Binance Coin)', value: 'BNBUSDT' },
-];
 
 const TIMEFRAMES = [
   { label: '5 Minutes', value: '5m' },
@@ -35,11 +27,24 @@ const TIMEFRAMES = [
 
 const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
   status,
-  serverUrl,
   onTargetChanged,
 }) => {
   const currentSymbol = status?.target_market?.target_symbol || 'BTCUSDT';
   const currentTimeframe = status?.target_market?.target_timeframe || '15m';
+  const activeSymbols = Array.from(new Set([
+    ...(status?.target_market?.active_symbols ?? ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']),
+    ...(currentSymbol !== 'ALL' ? [currentSymbol] : []),
+  ])).sort();
+  const symbolOptions = [
+    {
+      label: `🌐 All Active Pairs (${activeSymbols.map((symbol) => symbol.replace(/USDT$/, '')).join(', ')})`,
+      value: 'ALL',
+    },
+    ...activeSymbols.map((symbol) => ({
+      label: `${symbol.replace(/USDT$/, '')}/USDT`,
+      value: symbol,
+    })),
+  ];
   const evaluatedCount = status?.target_market?.evaluated_rounds_count ?? 0;
   const isMultiAsset = currentSymbol === 'ALL';
 
@@ -50,19 +55,10 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
     setIsUpdating(true);
     setSuccessMsg(null);
     try {
-      const res = await fetch(`${serverUrl.replace(/\/$/, '')}/api/target`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          target_symbol: newSymbol,
-          target_timeframe: newTimeframe,
-        }),
-      });
-      if (res.ok) {
-        setSuccessMsg(newSymbol === 'ALL' ? `Multi-Asset Scan Active (${newTimeframe})` : `Switched to ${newSymbol} (${newTimeframe})`);
-        setTimeout(() => setSuccessMsg(null), 3000);
-        if (onTargetChanged) onTargetChanged(newSymbol, newTimeframe);
-      }
+      if (!onTargetChanged) return;
+      await onTargetChanged(newSymbol, newTimeframe);
+      setSuccessMsg(newSymbol === 'ALL' ? `Multi-Asset Scan Active (${newTimeframe})` : `Switched to ${newSymbol} (${newTimeframe})`);
+      setTimeout(() => setSuccessMsg(null), 3000);
     } catch (err) {
       console.error('Failed to update target:', err);
     } finally {
@@ -86,8 +82,8 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
                 Token-Efficient AI Engine (1 Eval / Round)
               </span>
               {isMultiAsset ? (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono font-semibold animate-pulse">
-                  🌐 Multi-Asset Scan Active (6 Pairs)
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono font-semibold animate-pulse">
+                  🌐 Multi-Asset Scan Active ({activeSymbols.length} Pairs)
                 </span>
               ) : (
                 <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-mono font-semibold">
@@ -113,7 +109,7 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
               onChange={(e) => handleUpdateTarget(e.target.value, currentTimeframe)}
               className="bg-slate-900 text-xs font-mono font-bold text-white px-2.5 py-1 rounded-lg border border-slate-700/80 focus:outline-none focus:border-emerald-500 cursor-pointer"
             >
-              {SYMBOLS.map((s) => (
+              {symbolOptions.map((s) => (
                 <option key={s.value} value={s.value}>
                   {s.label}
                 </option>
@@ -162,9 +158,9 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
 export const AiTargetRibbon = React.memo(
   AiTargetRibbonView,
   (previous, next) =>
-    previous.serverUrl === next.serverUrl &&
     previous.onTargetChanged === next.onTargetChanged &&
     previous.status?.target_market?.target_symbol === next.status?.target_market?.target_symbol &&
     previous.status?.target_market?.target_timeframe === next.status?.target_market?.target_timeframe &&
+    previous.status?.target_market?.active_symbols?.join(',') === next.status?.target_market?.active_symbols?.join(',') &&
     previous.status?.target_market?.evaluated_rounds_count === next.status?.target_market?.evaluated_rounds_count
 );

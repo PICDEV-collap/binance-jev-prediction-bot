@@ -16,11 +16,65 @@ import time
 import uuid
 from typing import Optional, Dict, Any, List, Set, Tuple
 from urllib.parse import urlencode
+from engine.symbols import normalize_symbol
 
 import aiohttp
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("binance_client")
+
+
+def _is_crypto_up_down_topic(topic: Dict[str, Any]) -> bool:
+    title = str(topic.get("title", "")).upper()
+    chart_type = str(topic.get("chartType", "")).upper()
+    return "UP OR DOWN" in title or "UP/DOWN" in title or chart_type == "CRYPTO_UP_DOWN"
+
+
+def _prediction_topic_symbol(topic: Dict[str, Any]) -> Optional[str]:
+    """Resolve a USDT pair from a Binance prediction topic without a fixed coin list."""
+    raw_symbol = str(topic.get("symbol", "")).strip().upper()
+    title = str(topic.get("title", "")).strip().upper()
+    candidates = [raw_symbol]
+    if raw_symbol and not raw_symbol.endswith("USDT"):
+        candidates.append(f"{raw_symbol}USDT")
+
+    direct_pair = re.search(r"\b([A-Z0-9]{2,20}USDT)\b", title)
+    if direct_pair:
+        candidates.append(direct_pair.group(1))
+
+    base_match = re.search(
+        r"\b([A-Z0-9]{2,20})(?:\s+PRICE)?\s+(?:UP\s+OR\s+DOWN|UP/DOWN)\b",
+        title,
+    )
+    if base_match:
+        base = base_match.group(1)
+        aliases = {
+            "BITCOIN": "BTC", "ETHEREUM": "ETH", "ETHER": "ETH",
+            "BINANCECOIN": "BNB", "SOLANA": "SOL", "DOGECOIN": "DOGE",
+            "RIPPLE": "XRP",
+        }
+        candidates.append(f"{aliases.get(base, base)}USDT")
+
+    for candidate in candidates:
+        try:
+            return normalize_symbol(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def _prediction_position_symbol(position: Dict[str, Any]) -> Optional[str]:
+    """Resolve the underlying pair from a Binance position or order-history record."""
+    title = str(position.get("marketTopicTitle") or position.get("marketTitle") or position.get("title") or "")
+    slug = str(position.get("slug", "")).replace("-", " ").replace("_", " ")
+    title = f"{title} {slug}".strip()
+    raw_symbol = (
+        position.get("symbol")
+        or position.get("marketSymbol")
+        or position.get("underlyingSymbol")
+        or ""
+    )
+    return _prediction_topic_symbol({"symbol": raw_symbol, "title": title})
 
 
 class OrderResult(BaseModel):
@@ -361,23 +415,18 @@ class BinanceClient:
 
     def get_supported_prediction_symbols(self) -> Set[str]:
         """
-        Dynamically return the set of cryptocurrency symbols that have active
-        binary prediction market contracts on Binance (discovered from marketTopics catalog).
-        Defaults to {"BTCUSDT", "ETHUSDT", "BNBUSDT"}.
+        Return pairs discovered in Binance's crypto Up/Down market catalog.
+        An empty catalog yields an empty set so live trading fails closed.
         """
         symbols: Set[str] = set()
         topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
         for t in topics:
-            title = str(t.get("title", ""))
-            sym = str(t.get("symbol", "")).upper()
-            if "Up or Down" in title or t.get("chartType") == "CRYPTO_UP_DOWN":
-                if sym and "USDT" in sym:
-                    symbols.add(sym)
-                for candidate in ["BTCUSDT", "ETHUSDT", "BNBUSDT"]:
-                    base = candidate.replace("USDT", "")
-                    if base in title.upper():
-                        symbols.add(candidate)
-        return symbols or {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+            if not _is_crypto_up_down_topic(t):
+                continue
+            symbol = _prediction_topic_symbol(t)
+            if symbol:
+                symbols.add(symbol)
+        return symbols
 
     def get_market_start_prices(self, now_ts: Optional[float] = None) -> Dict[str, float]:
         """
@@ -409,6 +458,9 @@ class BinanceClient:
         now_ms = (now_ts or time.time()) * 1000.0
 
         for t in topics:
+            if not _is_crypto_up_down_topic(t):
+                continue
+            title = str(t.get("title", "")).upper()
             try:
                 start_date = float(t.get("startDate", 0) or 0)
                 end_date = float(t.get("endDate", 0) or 0)
@@ -428,14 +480,9 @@ class BinanceClient:
             if start_price <= 0:
                 continue
 
-            title = str(t.get("title", ""))
-            sym = str(t.get("symbol", "")).upper()
-            if not sym or "USDT" not in sym:
-                for candidate in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]:
-                    base = candidate.replace("USDT", "")
-                    if base in title.upper():
-                        sym = candidate
-                        break
+            sym = _prediction_topic_symbol(t)
+            if not sym:
+                continue
 
             tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
             tf = tf_match.group(1).lower() if tf_match else "5m"
@@ -555,14 +602,14 @@ class BinanceClient:
         topics = await self.fetch_prediction_market_topics()
         now_ms = time.time() * 1000.0
         clean_symbol = symbol.upper().strip()
-        clean_base = clean_symbol.replace("USDT", "")
         clean_tf = timeframe.lower().strip()
 
         candidates: List[Dict[str, Any]] = []
         for topic in topics:
+            if not _is_crypto_up_down_topic(topic):
+                continue
             title = str(topic.get("title", ""))
-            topic_symbol = str(topic.get("symbol", "")).upper()
-            if not ((topic_symbol == clean_symbol) or (clean_base and clean_base in title.upper())):
+            if _prediction_topic_symbol(topic) != clean_symbol:
                 continue
             if not re.search(rf"\b{re.escape(clean_tf)}\b", title, re.IGNORECASE):
                 continue
@@ -876,7 +923,6 @@ class BinanceClient:
                     break
 
         clean_sym = symbol.upper().strip()
-        clean_base = clean_sym.replace("USDT", "")
 
         # Validate that symbol is offered on Binance Prediction Markets in live mode
         supported_syms = self.get_supported_prediction_symbols()
@@ -921,12 +967,12 @@ class BinanceClient:
                 candidates = []
 
                 for t in topic_list:
-                    t_sym = str(t.get("symbol", "")).upper()
+                    if not _is_crypto_up_down_topic(t):
+                        continue
                     t_title = str(t.get("title", ""))
 
-                    # Match symbol (e.g. BNBUSDT, BTCUSDT, or base symbol in title)
-                    sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
-                    if not sym_match:
+                    # Resolve exact pair identity so similarly named tokens cannot collide.
+                    if _prediction_topic_symbol(t) != clean_sym:
                         continue
 
                     # Match timeframe precisely (e.g. 5m, 15m, 1h, 1d)
@@ -2226,7 +2272,6 @@ class BinanceClient:
         # Step 3: Binance Market Topic & Official Strike Price Check
         topics = await self.fetch_prediction_market_topics()
         clean_tf = str(timeframe).lower().strip()
-        clean_base = clean_sym.replace("USDT", "")
         now_ms = time.time() * 1000.0
 
         matched_market = None
@@ -2234,6 +2279,8 @@ class BinanceClient:
         official_strike = strike_price
 
         for t in topics:
+            if not _is_crypto_up_down_topic(t):
+                continue
             # Exclude expired or future rounds
             end_date = t.get("endDate")
             if end_date and now_ms >= end_date:
@@ -2242,10 +2289,8 @@ class BinanceClient:
             if start_date and now_ms < start_date:
                 continue
 
-            t_sym = str(t.get("symbol", "")).upper()
             t_title = str(t.get("title", ""))
-            sym_match = (t_sym == clean_sym) or (clean_base in t_title.upper())
-            if not sym_match:
+            if _prediction_topic_symbol(t) != clean_sym:
                 continue
             tf_match = bool(re.search(rf"\b{clean_tf}\b", t_title, re.IGNORECASE))
             if not tf_match:
@@ -2679,7 +2724,10 @@ class BinanceClient:
             avg_price = float(item.get("avgPrice", 0.50) or 0.50)
 
             # Derive symbol and timeframe
-            sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
+            sym = _prediction_position_symbol(item)
+            if not sym:
+                logger.warning("Skipping Binance ended position with unrecognized prediction pair: %s", title)
+                continue
             tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
             if tf_match:
                 tf = tf_match.group(1).lower()
@@ -2771,7 +2819,10 @@ class BinanceClient:
                 title = str(sample_order.get("marketTopicTitle") or sample_order.get("marketTitle") or "")
                 slug = str(sample_order.get("slug", "")).lower()
                 side = str(sample_order.get("outcome", "UP")).upper()
-                sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
+                sym = _prediction_position_symbol(sample_order)
+                if not sym:
+                    logger.warning("Skipping Binance closed order with unrecognized prediction pair: %s", title)
+                    continue
                 tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
                 if tf_match:
                     tf = tf_match.group(1).lower()
@@ -2867,7 +2918,10 @@ class BinanceClient:
                 )
                 if not already_present:
                     title = str(op.get("marketTopicTitle") or op.get("marketTitle") or "")
-                    sym = "ETHUSDT" if "Ethereum" in title else "BTCUSDT" if "Bitcoin" in title else "BNBUSDT" if "BNB" in title else "BTCUSDT"
+                    sym = _prediction_position_symbol(op)
+                    if not sym:
+                        logger.warning("Skipping Binance ongoing position with unrecognized prediction pair: %s", title)
+                        continue
                     tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
                     if tf_match:
                         tf = tf_match.group(1).lower()

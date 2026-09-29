@@ -30,16 +30,6 @@ const TIMEFRAMES: { label: string; value: TimeFrameType }[] = [
   { label: '1d', value: '1d' },
 ];
 
-const ASSETS: { label: string; value: string }[] = [
-  { label: 'All Assets', value: 'all' },
-  { label: 'BTC', value: 'BTC' },
-  { label: 'ETH', value: 'ETH' },
-  { label: 'SOL', value: 'SOL' },
-  { label: 'BNB', value: 'BNB' },
-  { label: 'DOGE', value: 'DOGE' },
-  { label: 'XRP', value: 'XRP' },
-];
-
 const MarketBoardComponent: React.FC<MarketBoardProps> = ({
   markets,
   selectedMarketId,
@@ -51,6 +41,12 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
 }) => {
   const [selectedTf, setSelectedTf] = useState<TimeFrameType>('all');
   const [selectedAsset, setSelectedAsset] = useState<string>('all');
+  const assets = useMemo(() => [
+    { label: 'All Assets', value: 'all' },
+    ...Array.from(new Set(markets.map((market) => market.symbol.replace(/USDT$/, ''))))
+      .sort()
+      .map((symbol) => ({ label: symbol, value: symbol })),
+  ], [markets]);
 
   // Filter markets by timeframe and asset (memoized to avoid re-calculating on every tick)
   const filteredMarkets = useMemo(() => {
@@ -89,7 +85,7 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
             <button
               onClick={() => onSetAiTarget('ALL', selectedTf === 'all' ? (targetTimeframe || '5m') : selectedTf)}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 transition-all font-bold cursor-pointer"
-              title="Activate AI evaluation across all 6 pairs"
+              title="Activate AI evaluation across all active pairs"
             >
               <span>⚡ AI Scan All Pairs</span>
             </button>
@@ -129,7 +125,7 @@ const MarketBoardComponent: React.FC<MarketBoardProps> = ({
 
         {/* Asset Selector Chips */}
         <div className="flex items-center gap-1 bg-slate-950/60 p-1 rounded-xl border border-slate-800 overflow-x-auto">
-          {ASSETS.map((asset) => (
+          {assets.map((asset) => (
             <button
               key={asset.value}
               onClick={() => {

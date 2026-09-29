@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .jev_client import JevEvaluationResult, MarketContext
 from engine.indicators import check_unrealistic_velocity
+from engine.symbols import DEFAULT_ACTIVE_SYMBOLS
 
 logger = logging.getLogger("risk_guard")
 
@@ -132,7 +133,7 @@ class RiskGuard:
             "MISSING_OUTCOME_PROBABILITY": 0,
             "INVALID_OUTCOME_PROBABILITY": 0,
         }
-        self.supported_prediction_symbols: Set[str] = {"BTCUSDT", "ETHUSDT", "BNBUSDT"}
+        self.supported_prediction_symbols: Set[str] = set(DEFAULT_ACTIVE_SYMBOLS)
 
     def record_market_traded(self, market_id: str) -> None:
         """Mark market round as traded to enforce cooldown period."""
@@ -144,8 +145,7 @@ class RiskGuard:
 
     def set_supported_symbols(self, symbols: Set[str]) -> None:
         """Update the set of valid binary prediction market symbols."""
-        if symbols:
-            self.supported_prediction_symbols = {s.upper() for s in symbols}
+        self.supported_prediction_symbols = {s.upper() for s in symbols}
 
     def get_symbol_martingale_step(self, symbol: Optional[str] = None) -> int:
         """Get Martingale recovery step for a specific symbol or global fallback."""

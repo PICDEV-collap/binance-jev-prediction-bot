@@ -39,6 +39,8 @@ interface RiskControlsModalProps {
   currentSlippageBps?: number;
   currentTargetSymbol?: string;
   currentTargetTimeframe?: string;
+  currentActiveSymbols?: string[];
+  availableSymbols?: string[];
   currentEvalIntervalSeconds?: number;
   currentPaperTrading: boolean;
   currentMartingaleEnabled?: boolean;
@@ -67,6 +69,8 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   currentSlippageBps = 50,
   currentTargetSymbol = 'BTCUSDT',
   currentTargetTimeframe = '15m',
+  currentActiveSymbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'],
+  availableSymbols = currentActiveSymbols,
   currentEvalIntervalSeconds = 60,
   currentPaperTrading,
   currentMartingaleEnabled = true,
@@ -102,7 +106,9 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   const [maxConcurrentPositions, setMaxConcurrentPositions] = useState<number>(currentMaxConcurrentPositions);
   const [targetSymbol, setTargetSymbol] = useState<string>(currentTargetSymbol.toUpperCase());
   const [targetTimeframe, setTargetTimeframe] = useState<string>(currentTargetTimeframe.toLowerCase());
+  const [activeSymbols, setActiveSymbols] = useState<string[]>(currentActiveSymbols);
   const [evalIntervalSeconds, setEvalIntervalSeconds] = useState<number>(currentEvalIntervalSeconds);
+  const activeSymbolsKey = currentActiveSymbols.join(',');
 
   // Tab 3: Environment & Credentials State
   const [paperTrading, setPaperTrading] = useState<boolean>(currentPaperTrading);
@@ -123,6 +129,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
   // Async state
   const [saving, setSaving] = useState<boolean>(false);
   const [savedSuccess, setSavedSuccess] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   // Sync state from server on open
   useEffect(() => {
@@ -146,6 +153,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     setMaxConcurrentPositions(currentMaxConcurrentPositions);
     setTargetSymbol(currentTargetSymbol.toUpperCase());
     setTargetTimeframe(currentTargetTimeframe.toLowerCase());
+    setActiveSymbols(currentActiveSymbols);
     setEvalIntervalSeconds(currentEvalIntervalSeconds);
     setPaperTrading(currentPaperTrading);
     setCustomServerUrl(serverUrl);
@@ -177,6 +185,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         if (c.max_concurrent_positions !== undefined) setMaxConcurrentPositions(c.max_concurrent_positions);
         if (c.target_symbol !== undefined) setTargetSymbol(c.target_symbol);
         if (c.target_timeframe !== undefined) setTargetTimeframe(c.target_timeframe);
+        if (Array.isArray(c.active_symbols)) setActiveSymbols(c.active_symbols);
         if (c.eval_interval_seconds !== undefined) setEvalIntervalSeconds(c.eval_interval_seconds);
         if (c.paper_trading !== undefined) setPaperTrading(c.paper_trading);
         if (c.binance_api_key_masked) setBinanceKeyMasked(c.binance_api_key_masked);
@@ -212,6 +221,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
     currentMaxConcurrentPositions,
     currentTargetSymbol,
     currentTargetTimeframe,
+    activeSymbolsKey,
     currentEvalIntervalSeconds,
     currentPaperTrading,
   ]);
@@ -220,6 +230,8 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
+    setSavedSuccess(false);
     try {
       if (customServerUrl.trim()) {
         onSaveServerUrl(customServerUrl.trim());
@@ -243,6 +255,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
         max_concurrent_positions: maxConcurrentPositions,
         target_symbol: targetSymbol,
         target_timeframe: targetTimeframe,
+        active_symbols: activeSymbols,
         eval_interval_seconds: evalIntervalSeconds,
         paper_trading: paperTrading,
         jev_ai_model: jevAiModel,
@@ -267,12 +280,27 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
       }, 700);
     } catch (err) {
       console.error('Failed to update config:', err);
+      setSaveError(err instanceof Error ? err.message : 'บันทึกการตั้งค่าไม่สำเร็จ');
     } finally {
       setSaving(false);
     }
   };
 
-  const availableSymbols = ['ALL', 'BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+  const toggleActivePair = (symbol: string) => {
+    const isActive = activeSymbols.includes(symbol);
+    if (isActive) {
+      if (activeSymbols.length <= 1) return;
+      const nextSymbols = activeSymbols.filter((activeSymbol) => activeSymbol !== symbol);
+      setActiveSymbols(nextSymbols);
+      if (targetSymbol === symbol) setTargetSymbol(nextSymbols[0]);
+      return;
+    }
+    if (activeSymbols.length >= 24) return;
+    setActiveSymbols([...activeSymbols, symbol].sort());
+  };
+
+  const supportedPairOptions = Array.from(new Set([...availableSymbols, ...activeSymbols])).sort();
+  const targetSymbolOptions = ['ALL', ...activeSymbols];
   const availableTimeframes = ['ALL', '5m', '15m', '1h', '1d'];
   const availableModels = ['jev-latest', 'jev-1.13.0', 'jev-turbo', 'jev-predict-v1'];
 
@@ -854,6 +882,47 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                 </div>
               </div>
 
+              {/* Active Binance Prediction Pair Allowlist */}
+              <div className="p-3.5 rounded-xl bg-slate-900/60 border border-emerald-500/30 space-y-2.5">
+                <div className="flex items-center justify-between gap-2 text-xs font-mono">
+                  <span className="text-slate-200 font-semibold flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-emerald-400" />
+                    ACTIVE TRADING PAIRS
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-bold border border-emerald-500/30">
+                    {activeSymbols.length} / 24
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                  {supportedPairOptions.map((symbol) => {
+                    const checked = activeSymbols.includes(symbol);
+                    const disabled = !checked && activeSymbols.length >= 24;
+                    return (
+                      <label
+                        key={symbol}
+                        className={`flex items-center gap-2 px-2.5 py-2 rounded-lg border text-xs font-mono cursor-pointer transition-colors ${
+                          checked
+                            ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-200'
+                            : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:border-slate-700'
+                        } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          disabled={disabled || (checked && activeSymbols.length <= 1)}
+                          onChange={() => toggleActivePair(symbol)}
+                          className="accent-emerald-500"
+                        />
+                        <span>{symbol.replace('USDT', '/USDT')}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="text-[10px] leading-relaxed text-slate-500 font-mono">
+                  เลือกคู่ที่ Binance มี Prediction Market เพื่อเปิด feed ให้บอท คู่ที่เลือกจะถูกสแกนเมื่อเลือก AI target เป็น ALL
+                </p>
+              </div>
+
               {/* 4. Target Asset Selector */}
               <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 space-y-2">
                 <div className="flex items-center justify-between text-xs font-mono">
@@ -866,7 +935,7 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
                   </span>
                 </div>
                 <div className="grid grid-cols-3 sm:grid-cols-4 gap-1.5 pt-1">
-                  {availableSymbols.map((sym) => (
+                  {targetSymbolOptions.map((sym) => (
                     <button
                       key={sym}
                       type="button"
@@ -1150,6 +1219,11 @@ export const RiskControlsModal: React.FC<RiskControlsModalProps> = ({
           </div>
 
           <div className="flex items-center gap-2.5 ml-auto">
+            {saveError && (
+              <span role="alert" className="max-w-xs text-[10px] font-mono text-rose-300">
+                {saveError}
+              </span>
+            )}
             <button
               onClick={onClose}
               className="px-4 py-2 rounded-xl text-xs font-mono text-slate-400 hover:text-white transition-colors"

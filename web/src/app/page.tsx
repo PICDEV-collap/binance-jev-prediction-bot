@@ -709,27 +709,20 @@ export default function DashboardPage() {
   };
 
   const handleSaveConfig = async (newConfig: BotConfig) => {
-    try {
-      const res = await authenticatedFetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newConfig),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.current_status) {
-          setStatus(data.current_status);
-        } else {
-          console.error('Configuration response did not include the updated system status.');
-        }
-        return;
-      } else {
-        console.error('Failed to update configuration: Server responded with HTTP', res.status);
-        return;
-      }
-    } catch (error) {
-      console.error('Backend unavailable; configuration was not changed:', error);
+    const res = await authenticatedFetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newConfig),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = typeof data.detail === 'string' ? data.detail : `บันทึกไม่สำเร็จ (HTTP ${res.status})`;
+      throw new Error(detail);
     }
+    if (!data.current_status) {
+      throw new Error('เซิร์ฟเวอร์ไม่ได้ส่งสถานะหลังบันทึกการตั้งค่า');
+    }
+    setStatus(data.current_status);
   };
 
   const handleSetAiTarget = useCallback(async (symbol: string, timeframe: string) => {
@@ -828,7 +821,6 @@ export default function DashboardPage() {
         {/* AI Target Market & Token Saving Ribbon */}
         <AiTargetRibbon
           status={status}
-          serverUrl={serverUrl}
           onTargetChanged={handleSetAiTarget}
         />
 
@@ -885,6 +877,8 @@ export default function DashboardPage() {
         currentSlippageBps={status?.risk_guard?.slippage_bps ?? 50}
         currentTargetSymbol={status?.target_market?.target_symbol ?? 'BTCUSDT'}
         currentTargetTimeframe={status?.target_market?.target_timeframe ?? '15m'}
+        currentActiveSymbols={status?.target_market?.active_symbols ?? ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']}
+        availableSymbols={status?.target_market?.available_symbols ?? ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']}
         currentEvalIntervalSeconds={status?.target_market?.eval_interval_seconds ?? 60}
         currentPaperTrading={status ? status.trading_mode === 'PAPER_TRADING' : true}
         currentMartingaleEnabled={status?.risk_guard?.martingale?.enabled ?? true}

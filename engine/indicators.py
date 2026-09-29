@@ -16,7 +16,7 @@ import datetime
 import math
 import time
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Set
 
 
 @dataclass
@@ -354,6 +354,18 @@ class RollingCandleAggregator:
         self._history_5m: Dict[str, List[Candle]] = {}
         self._current_5m: Dict[str, Candle] = {}
         self._strike_history: Dict[str, List[Tuple[float, float]]] = {}
+
+    def retain_symbols(self, symbols: Set[str]) -> None:
+        """Drop accumulated market history for symbols outside the active universe."""
+        for history in (
+            self._current_1m,
+            self._history_1m,
+            self._history_5m,
+            self._current_5m,
+        ):
+            for symbol in list(history):
+                if symbol not in symbols:
+                    history.pop(symbol, None)
 
     def update_tick(self, symbol: str, price: float, volume: float = 0.0, timestamp: Optional[float] = None) -> None:
         """Process a price tick and update rolling 1m and 5m candles."""

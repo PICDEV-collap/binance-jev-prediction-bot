@@ -41,6 +41,7 @@ from config import settings
 from engine.binance_client import BinanceClient, OrderResult
 from engine.jev_client import JevClient, JevEvaluationResult, MarketContext
 from engine.risk_guard import RiskGuard, RiskEvaluationResult
+from engine.symbols import DEFAULT_ACTIVE_SYMBOLS, normalize_active_symbols
 from streams.ws_listener import BinanceWSListener, ConnectionState
 
 # Setup structured logging (Console + Persistent bot.log for background execution)
@@ -87,6 +88,7 @@ class ConfigUpdateRequest(BaseModel):
     # Target Market & Strategy
     target_symbol: str | None = Field(default=None, min_length=3, max_length=20)
     target_timeframe: Literal["ALL", "all", "5m", "15m", "1h", "1d"] | None = None
+    active_symbols: List[str] | None = Field(default=None, min_length=1, max_length=24)
     eval_interval_seconds: int | None = Field(default=None, ge=10, le=900)
 
     # Operating Environment & Credentials
@@ -197,8 +199,21 @@ class TradingBotCoordinator:
             logger.info("[BOOT] Restored bot state from disk: RUNNING (trading active)")
 
         # User-selected Target Pair & Timeframe for AI evaluation
+        configured_active_symbols = getattr(settings, "active_symbols", None)
+        if not isinstance(configured_active_symbols, (str, list, tuple, set)):
+            configured_active_symbols = None
+        self.active_symbols: List[str] = list(normalize_active_symbols(
+            configured_active_symbols or DEFAULT_ACTIVE_SYMBOLS
+        ))
         self.target_symbol: str = getattr(settings, "target_symbol", "BTCUSDT").upper()
         self.target_timeframe: str = getattr(settings, "target_timeframe", "15m").lower()
+        if self.target_symbol != "ALL" and self.target_symbol not in self.active_symbols:
+            logger.warning(
+                "Configured AI target %s is not in ACTIVE_SYMBOLS; using %s instead.",
+                self.target_symbol,
+                self.active_symbols[0],
+            )
+            self.target_symbol = self.active_symbols[0]
         self.eval_interval_seconds: int = getattr(settings, "eval_interval_seconds", 60)
         self.last_eval_time: Dict[str, float] = {}
         self.evaluated_rounds: Set[str] = set()
@@ -246,6 +261,7 @@ class TradingBotCoordinator:
             martingale_confidence_step=getattr(settings, "martingale_confidence_step", 0.04),
             martingale_max_confidence=getattr(settings, "martingale_max_confidence", 0.95),
         )
+        self.risk_guard.set_supported_symbols(set(self.active_symbols))
 
         # Mock prices are only used when explicitly requested; missing trade credentials
         # must never silently replace the configured market data source.
@@ -258,6 +274,7 @@ class TradingBotCoordinator:
             ping_interval=20,
             ping_timeout=10,
             enable_mock_stream=use_mock_stream,
+            active_symbols=self.active_symbols,
         )
 
         # Telemetry storage
@@ -294,6 +311,8 @@ class TradingBotCoordinator:
     def _should_evaluate_market(self, market: MarketContext) -> bool:
         """Fast non-allocating predicate to reject unselected symbols/timeframes before task spawning."""
         if self.bot_status != "RUNNING" or self.is_paused:
+            return False
+        if market.symbol.upper() not in self.active_symbols:
             return False
         if not self.binance_client.paper_trading:
             if self.ws_listener.enable_mock_stream:
@@ -539,6 +558,9 @@ class TradingBotCoordinator:
         3. Supports dual-sided prediction orders (UP / DOWN).
         """
         if self.bot_status != "RUNNING" or self.is_paused:
+            return
+
+        if market.symbol.upper() not in self.active_symbols:
             return
 
         # Reject stale or incomplete live inputs before spending an AI request or
@@ -998,6 +1020,10 @@ class TradingBotCoordinator:
             "target_market": {
                 "target_symbol": self.target_symbol,
                 "target_timeframe": self.target_timeframe,
+                "active_symbols": list(self.active_symbols),
+                "available_symbols": sorted(
+                    set(self.binance_client.get_supported_prediction_symbols()) | set(self.active_symbols)
+                ),
                 "evaluated_rounds_count": len(self.evaluated_rounds),
                 "evaluation_policy": f"every_{self.eval_interval_seconds}s",
                 "eval_interval_seconds": self.eval_interval_seconds,
@@ -1155,6 +1181,8 @@ def _persist_config_to_env(req: ConfigUpdateRequest) -> None:
         mapping["TARGET_SYMBOL"] = req.target_symbol.upper()
     if req.target_timeframe is not None:
         mapping["TARGET_TIMEFRAME"] = req.target_timeframe.lower()
+    if req.active_symbols is not None:
+        mapping["ACTIVE_SYMBOLS"] = ",".join(normalize_active_symbols(req.active_symbols))
     if req.eval_interval_seconds is not None:
         mapping["EVAL_INTERVAL_SECONDS"] = str(req.eval_interval_seconds)
     if req.paper_trading is not None:
@@ -1232,6 +1260,10 @@ async def get_config_endpoint() -> Dict[str, Any]:
             # Strategy Targets
             "target_symbol": bot.target_symbol,
             "target_timeframe": bot.target_timeframe,
+            "active_symbols": list(bot.active_symbols),
+            "available_symbols": sorted(
+                set(bot.binance_client.get_supported_prediction_symbols()) | set(bot.active_symbols)
+            ),
             "eval_interval_seconds": bot.eval_interval_seconds,
             # Mode & Credentials Status
             "paper_trading": bot.binance_client.paper_trading,
@@ -1248,6 +1280,56 @@ async def get_config_endpoint() -> Dict[str, Any]:
 @app.post("/api/config")
 async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
     """Dynamically adjust risk thresholds, strategy targets, credentials, and operating mode from dashboard."""
+    next_active_symbols = list(bot.active_symbols)
+    available_prediction_symbols = bot.binance_client.get_supported_prediction_symbols()
+    if req.active_symbols is not None:
+        try:
+            next_active_symbols = list(normalize_active_symbols(req.active_symbols))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        added_symbols = set(next_active_symbols) - set(bot.active_symbols)
+        if added_symbols:
+            try:
+                await bot.binance_client.fetch_prediction_market_topics(force_refresh=True)
+            except Exception as exc:
+                logger.warning("Could not refresh Binance pair catalog while updating active pairs: %s", exc)
+            available_prediction_symbols = bot.binance_client.get_supported_prediction_symbols()
+            unsupported = sorted(added_symbols - available_prediction_symbols)
+            if unsupported:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Binance has no supported active Prediction market for: {', '.join(unsupported)}",
+                )
+
+        removed_symbols = set(bot.active_symbols) - set(next_active_symbols)
+        held_symbols = {
+            str(position.get("symbol", "")).upper()
+            for position in bot.binance_client.get_positions()
+        }
+        positions_at_risk = sorted(removed_symbols & held_symbols)
+        if positions_at_risk:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Close or settle open positions before removing: {', '.join(positions_at_risk)}",
+            )
+
+    next_target_symbol = (
+        req.target_symbol.strip().upper()
+        if req.target_symbol is not None and req.target_symbol.strip()
+        else bot.target_symbol
+    )
+    if next_target_symbol == "ALL":
+        next_target_symbol = "ALL"
+    elif next_target_symbol not in next_active_symbols:
+        if req.target_symbol is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="The AI target pair must be selected in Active Trading Pairs first.",
+            )
+        next_target_symbol = next_active_symbols[0]
+        req.target_symbol = next_target_symbol
+
     next_max_odds = req.max_odds_cap if req.max_odds_cap is not None else bot.risk_guard.max_odds_cap
     next_min_odds = req.min_odds_floor if req.min_odds_floor is not None else bot.risk_guard.min_odds_floor
     next_min_time = req.min_time_left_seconds if req.min_time_left_seconds is not None else bot.risk_guard.min_time_left_seconds
@@ -1300,12 +1382,19 @@ async def update_config(req: ConfigUpdateRequest) -> Dict[str, Any]:
         bot.binance_client.min_odds_floor = req.min_odds_floor
 
     if req.target_symbol is not None and req.target_symbol.strip():
-        bot.target_symbol = req.target_symbol.upper().strip()
+        bot.target_symbol = next_target_symbol
         logger.info(f"Target symbol updated to: {bot.target_symbol}")
 
     if req.target_timeframe is not None and req.target_timeframe.strip():
         bot.target_timeframe = req.target_timeframe.lower().strip()
         logger.info(f"Target timeframe updated to: {bot.target_timeframe}")
+
+    if req.active_symbols is not None:
+        bot.active_symbols = next_active_symbols
+        settings.active_symbols = ",".join(next_active_symbols)
+        await bot.ws_listener.configure_active_symbols(next_active_symbols)
+        bot.risk_guard.set_supported_symbols(available_prediction_symbols | set(next_active_symbols))
+        logger.info("Trading pair allowlist updated: %s", ", ".join(next_active_symbols))
 
     if req.eval_interval_seconds is not None:
         bot.eval_interval_seconds = max(10, min(900, int(req.eval_interval_seconds)))
@@ -1469,6 +1558,10 @@ async def get_target_endpoint() -> Dict[str, Any]:
     return {
         "target_symbol": bot.target_symbol,
         "target_timeframe": bot.target_timeframe,
+        "active_symbols": list(bot.active_symbols),
+        "available_symbols": sorted(
+            set(bot.binance_client.get_supported_prediction_symbols()) | set(bot.active_symbols)
+        ),
         "evaluated_rounds_count": len(bot.evaluated_rounds),
         "policy": "1x_per_round",
     }
@@ -1477,7 +1570,13 @@ async def get_target_endpoint() -> Dict[str, Any]:
 @app.post("/api/target")
 async def set_target_endpoint(req: TargetMarketRequest) -> Dict[str, Any]:
     """Dynamically switch the targeted asset and timeframe for AI evaluation."""
-    bot.target_symbol = req.target_symbol.upper()
+    requested_symbol = req.target_symbol.upper().strip()
+    if requested_symbol != "ALL" and requested_symbol not in bot.active_symbols:
+        raise HTTPException(
+            status_code=422,
+            detail="The AI target pair must be selected in Active Trading Pairs first.",
+        )
+    bot.target_symbol = requested_symbol
     bot.target_timeframe = req.target_timeframe.lower()
     logger.info(f"[TARGET SWITCH] Target set to {bot.target_symbol} ({bot.target_timeframe})")
     return {

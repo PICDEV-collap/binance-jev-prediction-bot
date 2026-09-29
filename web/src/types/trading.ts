@@ -201,6 +201,8 @@ export interface SystemStatus {
   target_market?: {
     target_symbol: string;
     target_timeframe: string;
+    active_symbols?: string[];
+    available_symbols?: string[];
     evaluated_rounds_count: number;
     evaluation_policy: string;
     eval_interval_seconds?: number;
@@ -279,6 +281,7 @@ export interface BotConfig {
   slippage_bps?: number;
   target_symbol: string;
   target_timeframe: string;
+  active_symbols?: string[];
   eval_interval_seconds?: number;
   paper_trading: boolean;
   has_binance_key?: boolean;
