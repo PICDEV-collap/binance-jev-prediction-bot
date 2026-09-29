@@ -64,7 +64,7 @@ const MetricsBarComponent: React.FC<MetricsBarProps> = ({ status, openPositions 
   const isRecovering = martEnabled && martStep > 0;
 
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+    <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3 mb-0">
       
       {/* 1. Wallet Balance & Total Equity */}
       <div className="glass-panel rounded-xl p-3 border border-slate-800/80 hover:border-slate-700/80 transition-all">

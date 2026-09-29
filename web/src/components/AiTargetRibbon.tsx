@@ -2,13 +2,8 @@
 
 import React, { useState } from 'react';
 import { 
-  Cpu, 
-  Sparkles, 
+  Cpu,
   CheckCircle2, 
-  ArrowUpRight, 
-  ArrowDownRight, 
-  RefreshCw, 
-  ShieldAlert,
   Zap
 } from 'lucide-react';
 import { SystemStatus } from '../types/trading';
@@ -67,47 +62,40 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
   };
 
   return (
-    <div className="glass-panel rounded-2xl p-4 border border-emerald-500/30 bg-gradient-to-r from-emerald-950/20 via-slate-900/40 to-cyan-950/20 shadow-lg shadow-emerald-950/20 mb-6">
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-        
-        {/* Left: AI Token Efficiency Status */}
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center shrink-0">
+    <section aria-label="AI evaluation scope" className="glass-panel rounded-2xl p-4 sm:p-5 border-l-2 border-l-emerald-500 mb-0">
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-10 h-10 rounded-xl bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center shrink-0">
             <Cpu className="w-5 h-5 text-emerald-400" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs font-mono font-bold uppercase tracking-wider text-emerald-300 flex items-center gap-1.5">
-                <Zap className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
-                Token-Efficient AI Engine (1 Eval / Round)
+              <h2 className="text-sm font-semibold tracking-wide text-slate-100">AI evaluation scope</h2>
+              <span className={`text-[10px] px-2 py-1 rounded-full border font-mono font-semibold ${
+                isMultiAsset
+                  ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/25'
+                  : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/25'
+              }`}>
+                {isMultiAsset ? `Scanning ${activeSymbols.length} pairs` : `${currentSymbol.replace(/USDT$/, '')} only`}
               </span>
-              {isMultiAsset ? (
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono font-semibold animate-pulse">
-                  🌐 Multi-Asset Scan Active ({activeSymbols.length} Pairs)
-                </span>
-              ) : (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-mono font-semibold">
-                  99.9% Token Savings Active
-                </span>
-              )}
             </div>
-            <p className="text-xs text-slate-400 font-mono mt-0.5">
-              Strict binary decision: <span className="text-emerald-400 font-bold">UP ▲</span> vs <span className="text-rose-400 font-bold">DOWN ▼</span> • AI consulted <span className="text-emerald-300 font-bold">1 time per round</span>
+            <p className="text-xs text-slate-400 mt-1">
+              <Zap className="w-3 h-3 text-amber-400 inline mr-1" />
+              One AI evaluation per round <span className="text-slate-600 px-1">·</span>
+              <span className="text-emerald-400">UP</span> or <span className="text-rose-400">DOWN</span>
             </p>
           </div>
         </div>
 
-        {/* Right: Target Market Selectors */}
-        <div className="flex flex-wrap items-center gap-2.5">
-          
-          {/* Symbol Selector */}
-          <div className="flex items-center gap-1.5 bg-slate-950/80 p-1.5 rounded-xl border border-slate-800">
-            <span className="text-[11px] font-mono text-slate-500 px-1">Pair:</span>
+        <div className="flex flex-wrap items-end gap-2.5">
+          <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wider text-slate-500">
+            Trading pair
             <select
               value={currentSymbol}
               disabled={isUpdating}
               onChange={(e) => handleUpdateTarget(e.target.value, currentTimeframe)}
-              className="bg-slate-900 text-xs font-mono font-bold text-white px-2.5 py-1 rounded-lg border border-slate-700/80 focus:outline-none focus:border-emerald-500 cursor-pointer"
+              aria-label="AI target trading pair"
+              className="min-w-[190px] bg-[#080e18] text-xs font-medium text-slate-100 px-3 py-2.5 rounded-lg border border-slate-700/80 focus:outline-none focus:border-emerald-500 cursor-pointer disabled:opacity-60"
             >
               {symbolOptions.map((s) => (
                 <option key={s.value} value={s.value}>
@@ -115,16 +103,16 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
                 </option>
               ))}
             </select>
-          </div>
+          </label>
 
-          {/* Timeframe Selector */}
-          <div className="flex items-center gap-1.5 bg-slate-950/80 p-1.5 rounded-xl border border-slate-800">
-            <span className="text-[11px] font-mono text-slate-500 px-1">Timeframe:</span>
+          <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wider text-slate-500">
+            Timeframe
             <select
               value={currentTimeframe}
               disabled={isUpdating}
               onChange={(e) => handleUpdateTarget(currentSymbol, e.target.value)}
-              className="bg-slate-900 text-xs font-mono font-bold text-cyan-300 px-2.5 py-1 rounded-lg border border-slate-700/80 focus:outline-none focus:border-cyan-500 cursor-pointer"
+              aria-label="AI target timeframe"
+              className="min-w-[140px] bg-[#080e18] text-xs font-medium text-slate-100 px-3 py-2.5 rounded-lg border border-slate-700/80 focus:outline-none focus:border-cyan-500 cursor-pointer disabled:opacity-60"
             >
               {TIMEFRAMES.map((t) => (
                 <option key={t.value} value={t.value}>
@@ -132,13 +120,12 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
                 </option>
               ))}
             </select>
-          </div>
+          </label>
 
-          {/* Evaluated Rounds Counter Badge */}
-          <div className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-950/80 border border-slate-800 text-xs font-mono text-slate-300">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-slate-400">Rounds Done:</span>
-            <span className="text-emerald-400 font-bold">{evaluatedCount}</span>
+          <div className="h-[38px] flex items-center gap-2 px-3 rounded-lg bg-[#080e18] border border-slate-800 text-xs font-mono text-slate-300">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            <span className="text-slate-400">Rounds evaluated</span>
+            <span className="text-slate-100 font-semibold tabular-nums">{evaluatedCount}</span>
           </div>
 
           {successMsg && (
@@ -149,9 +136,8 @@ const AiTargetRibbonView: React.FC<AiTargetRibbonProps> = ({
           )}
 
         </div>
-
       </div>
-    </div>
+    </section>
   );
 };
 

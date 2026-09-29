@@ -813,7 +813,7 @@ export default function DashboardPage() {
       />
 
       {/* Main Dashboard Layout */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 lg:px-8 py-6 space-y-6">
+      <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 sm:px-6 2xl:px-10 py-5 sm:py-6 space-y-5">
         
         {/* Top Executive Metrics Ribbon */}
         <MetricsBar status={status} openPositions={openPositions} />
@@ -825,10 +825,10 @@ export default function DashboardPage() {
         />
 
         {/* Core Trading & AI Intelligence Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 items-start">
           
           {/* Active Binance Markets Board */}
-          <div className="lg:col-span-7 flex flex-col">
+          <div className="xl:col-span-7 flex flex-col">
             <MarketBoard
               markets={markets}
               selectedMarketId={selectedMarketId}
@@ -841,7 +841,7 @@ export default function DashboardPage() {
           </div>
 
           {/* Jev AI Decision Engine Radar */}
-          <div className="lg:col-span-5 flex flex-col">
+          <div className="xl:col-span-5 flex flex-col">
             <JevAiRadar
               latestRecord={latestRecord}
               confidenceThreshold={currentThreshold}

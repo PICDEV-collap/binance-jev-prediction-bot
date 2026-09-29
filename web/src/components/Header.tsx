@@ -47,8 +47,8 @@ export const Header: React.FC<HeaderProps> = ({
   const netHealth = status?.network_health;
 
   return (
-    <header className="border-b border-slate-800/80 bg-[#080d1a]/90 backdrop-blur-md sticky top-0 z-50 px-4 lg:px-8 py-3.5">
-      <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+    <header className="border-b border-slate-800/90 bg-[#0a101a] sticky top-0 z-50 px-4 sm:px-6 2xl:px-10 py-3">
+      <div className="max-w-[1600px] mx-auto flex flex-col xl:flex-row xl:items-center justify-between gap-3">
         
         {/* Brand & Bot Identity */}
         <div className="flex items-center gap-3.5">
@@ -68,15 +68,15 @@ export const Header: React.FC<HeaderProps> = ({
 
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-base font-bold tracking-tight text-white flex items-center gap-1.5">
+              <h1 className="text-sm sm:text-base font-bold tracking-tight text-white flex items-center gap-1.5">
                 <span>BINANCE PREDICTION BOT</span>
                 <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
                   JEV AI CORE
                 </span>
               </h1>
             </div>
-            <p className="text-xs text-slate-400 font-mono flex items-center gap-2 mt-0.5">
-              <span>Event-Driven High-Frequency Engine</span>
+            <p className="text-[11px] sm:text-xs text-slate-400 font-mono flex items-center gap-2 mt-0.5">
+              <span>Event-Driven Trading Engine</span>
               <span>•</span>
               <span className="text-slate-500">v1.0.0</span>
             </p>
@@ -84,7 +84,7 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Real-time Status Badges & Controls */}
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap xl:justify-end items-center gap-2">
           
           {/* Bot State Indicator */}
           <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono font-bold ${

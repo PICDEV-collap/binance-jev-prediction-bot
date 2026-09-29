@@ -9,27 +9,26 @@
   }
 
   body {
-    background-color: #06090e;
+    background-color: #070b12;
     color: #f1f5f9;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
     overflow-x: hidden;
   }
 }
 
-/* Custom Glassmorphism & Cyber Card Utilities */
-.glass-panel {
-  background: rgba(15, 23, 42, 0.75);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-}
+@layer components {
+  /* Opaque cards stay crisp and avoid expensive blur layers. */
+  .glass-panel {
+    background: #0d1420;
+    border: 1px solid #1e293b;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  }
 
-.glass-panel-glow {
-  background: rgba(15, 23, 42, 0.85);
-  backdrop-filter: blur(20px);
-  border: 1px solid rgba(16, 185, 129, 0.2);
-  box-shadow: 0 0 25px -5px rgba(16, 185, 129, 0.15);
+  .glass-panel-glow {
+    background: #0e1923;
+    border: 1px solid rgba(16, 185, 129, 0.28);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
+  }
 }
 
 /* Custom Scrollbar for terminal & tables */
@@ -66,4 +65,15 @@
 
 .animate-pulse-slow {
   animation: ping-slow 3s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
