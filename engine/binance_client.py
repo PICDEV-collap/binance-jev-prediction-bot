@@ -17,6 +17,7 @@ import uuid
 from typing import Optional, Dict, Any, List, Set, Tuple
 from urllib.parse import urlencode
 from engine.symbols import normalize_symbol
+from engine.oracle import round_window, start_price, topic_id
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -263,6 +264,14 @@ class BinanceClient:
         self._active_account_type: str = "CeDeFi"
         self._prediction_market_cache: Dict[str, Any] = {}
         self._prediction_cache_timestamp: float = 0.0
+        self._prediction_catalog_lock = asyncio.Lock()
+        self._prediction_retry_at: float = 0.0
+        self._prediction_detail_cache: Dict[str, Dict[str, Any]] = {}
+        self.oracle_sync_status: Dict[str, Any] = {
+            "state": "STARTING", "reason": "Waiting for Binance market data",
+            "http_status": None, "api_code": None, "confirmed_rounds": 0,
+            "last_success_at": None, "retry_at": None,
+        }
         # Permanent in-memory cache for resolved market oracle strike and settlement prices
         self._market_oracle_cache: Dict[int, Tuple[float, float]] = {}
         self._background_tasks: Set[asyncio.Task] = set()
@@ -379,88 +388,181 @@ class BinanceClient:
         ).hexdigest()
         return f"{query_str}&signature={signature}"
 
-    async def _fetch_market_page(self, offset: int = 0, limit: int = 100) -> Tuple[List[Dict[str, Any]], int, bool]:
-        """Fetch a single page of prediction market topics."""
-        sapi_host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
-        query_params = {
-            "offset": offset,
-            "limit": limit,
-            "recvWindow": self.recv_window,
-            "timestamp": self._get_timestamp(),
-        }
-        signed_query = self._sign_payload(query_params)
-        url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/market/list?{signed_query}"
+    def _market_data_failure(self, state, reason, http_status=None, api_code=None, delay=5):
+        self._prediction_retry_at = time.monotonic() + delay
+        self.oracle_sync_status.update(
+            state=state, reason=reason, http_status=http_status, api_code=api_code,
+            retry_at=time.time() + delay,
+        )
+        # Never log signed URLs, API keys, or an untrusted response message.
+        logger.warning("[ORACLE SYNC] %s (HTTP=%s, code=%s); retry in %ss",
+                       reason, http_status, api_code, delay)
 
-        try:
-            assert self._session is not None
-            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    topics = data.get("marketTopics", [])
-                    total = data.get("total", 0)
-                    has_more = data.get("hasMore", False)
-                    return topics, total, has_more
-                else:
-                    data = {}
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        pass
-                    if data.get("code") == -1021 or "ahead of the server's time" in str(data.get("msg", "")).lower():
-                        logger.warning("Detected time drift (-1021) in market page. Re-syncing Binance server time...")
-                        await self.sync_server_time()
-                        query_params["timestamp"] = self._get_timestamp()
-                        signed_query = self._sign_payload(query_params)
-                        retry_url = f"{sapi_host}/sapi/v1/w3w/wallet/prediction/market/list?{signed_query}"
-                        async with self._session.get(retry_url, timeout=aiohttp.ClientTimeout(total=6.0)) as r_resp:
-                            if r_resp.status == 200:
-                                r_data = await r_resp.json()
-                                return r_data.get("marketTopics", []), r_data.get("total", 0), r_data.get("hasMore", False)
-                    logger.debug(f"Failed to fetch market page offset {offset}: HTTP {resp.status}")
-        except Exception as e:
-            logger.debug(f"Exception fetching market page offset {offset}: {e}")
-        return [], 0, False
-
-    async def fetch_prediction_market_topics(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        """Fetch full catalog of prediction market topics across all pages with high-speed concurrent fetching."""
-        now = time.time()
-        now_ms = now * 1000.0
-        # Return cache if still fresh (valid for 30 seconds), UNLESS any active crypto round in cache has expired
-        if not force_refresh and self._prediction_market_cache and (now - self._prediction_cache_timestamp < 30.0):
-            cached_topics = self._prediction_market_cache.get("marketTopics", [])
-            has_expired = False
-            for t in cached_topics:
-                title = str(t.get("title", ""))
-                if "Up or Down" in title and any(k in title for k in ("5m", "15m")):
-                    end_d = t.get("endDate")
-                    if end_d and end_d <= now_ms:
-                        has_expired = True
-                        break
-            if not has_expired:
-                return cached_topics
-
+    async def _request_prediction_market(self, path, parameters):
+        if time.monotonic() < self._prediction_retry_at:
+            return None
+        if not self.api_key or not self.api_secret:
+            self._market_data_failure("API_AUTH_ERROR", "Binance market data requires a configured API key and secret", delay=60)
+            return None
         if self._session is None or self._session.closed:
             await self.start()
+        host = "https://api.binance.com" if "fapi.binance.com" in self.base_url else self.base_url
+        for attempt in range(2):
+            query = {**parameters, "recvWindow": self.recv_window, "timestamp": self._get_timestamp()}
+            url = f"{host}{path}?{self._sign_payload(query)}"
+            try:
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=6.0)) as response:
+                    status = response.status
+                    retry_after = response.headers.get("Retry-After", "60")
+                    try:
+                        data = await response.json()
+                    except (ValueError, aiohttp.ContentTypeError):
+                        data = None
+                code = data.get("code") if isinstance(data, dict) else None
+                if code == -1021 and attempt == 0:
+                    await self.sync_server_time()
+                    continue
+                if status == 200 and isinstance(data, dict) and code in (None, 0, "000000", "0"):
+                    payload = data.get("data", data)
+                    if isinstance(payload, dict):
+                        if time.monotonic() >= self._prediction_retry_at:
+                            self.oracle_sync_status.update(state="SYNCING", reason="Fetching current Binance oracle rounds",
+                                                          http_status=200, api_code=None, retry_at=None)
+                        return payload
+                if status in (401, 403) or code in (-2014, -2015, -1022):
+                    self._market_data_failure("API_AUTH_ERROR", "Binance rejected market data access; check API key, permissions and IP allowlist", status, code, 60)
+                elif status in (418, 429):
+                    try:
+                        delay = max(60, min(86400, int(retry_after)))
+                    except (TypeError, ValueError):
+                        delay = 60
+                    self._market_data_failure("RATE_LIMITED", "Binance market data rate limit reached", status, code, delay)
+                else:
+                    self._market_data_failure("API_ERROR", "Binance market data request failed or returned an invalid response", status, code)
+                return None
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                self._market_data_failure("NETWORK_ERROR", "Could not reach Binance prediction market data")
+                return None
+        return None
 
-        # Fetch first page (offset 0, limit 100)
-        first_topics, total, has_more = await self._fetch_market_page(0, 100)
-        all_topics = list(first_topics)
+    async def _fetch_market_page(self, offset: int = 0, limit: int = 100) -> Tuple[List[Dict[str, Any]], int, bool]:
+        data = await self._request_prediction_market(
+            "/sapi/v1/w3w/wallet/prediction/market/list",
+            {"offset": offset, "limit": limit, "l1Category": "crypto", "l2Category": "up-down"},
+        )
+        if data is None:
+            return [], 0, False
+        topics = data.get("marketTopics")
+        if not isinstance(topics, list):
+            self._market_data_failure("INVALID_RESPONSE", "Binance market list is missing marketTopics", 200)
+            return [], 0, False
+        try:
+            total = max(0, int(data.get("total", len(topics))))
+        except (TypeError, ValueError):
+            self._market_data_failure("INVALID_RESPONSE", "Binance market list has invalid pagination", 200)
+            return [], 0, False
+        return [topic for topic in topics if isinstance(topic, dict)], total, bool(data.get("hasMore", False))
 
-        # If more topics exist, fetch remaining pages concurrently in batches
-        if has_more and total > 100:
-            offsets = list(range(100, min(total + 100, 2500), 100))
-            page_tasks = [self._fetch_market_page(off, 100) for off in offsets]
-            results = await asyncio.gather(*page_tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, tuple) and res[0]:
-                    all_topics.extend(res[0])
+    async def _hydrate_oracle_details(self, topics):
+        now_ms = time.time() * 1000
+        # Fixed oracle values are reusable only within the same dated topic.
+        self._prediction_detail_cache = {
+            identifier: detail for identifier, detail in self._prediction_detail_cache.items()
+            if (window := round_window(detail)) and window[0] <= now_ms < window[1]
+        }
+        candidates = {}
+        for topic in topics:
+            window = round_window(topic)
+            if not _is_crypto_up_down_topic(topic) or not window or not window[0] <= now_ms < window[1]:
+                continue
+            identifier = topic_id(topic)
+            if not identifier.isdigit() or int(identifier) <= 0 or start_price(topic) is not None:
+                continue
+            symbol = _prediction_topic_symbol(topic)
+            if not symbol:
+                continue
+            timeframe = self._oracle_timeframe(topic)
+            if not timeframe:
+                continue
+            key = (symbol, timeframe)
+            previous = candidates.get(key)
+            if previous is None or window[0] > round_window(previous)[0]:
+                candidates[key] = topic
+        # Bound both requests in flight and the active detail universe.
+        semaphore = asyncio.Semaphore(4)
+        async def hydrate(topic):
+            identifier = topic_id(topic)
+            async with semaphore:
+                detail = self._prediction_detail_cache.get(identifier)
+                if detail is None:
+                    detail = await self._request_prediction_market(
+                        "/sapi/v1/w3w/wallet/prediction/market/detail", {"marketTopicId": int(identifier)},
+                    )
+                if not detail:
+                    return
+                if topic_id(detail) != identifier or round_window(detail) != round_window(topic):
+                    logger.warning("[ORACLE SYNC] Discarded a market detail with mismatched topic or round")
+                    return
+                if _prediction_topic_symbol(detail) not in (None, _prediction_topic_symbol(topic)):
+                    logger.warning("[ORACLE SYNC] Discarded a market detail with mismatched symbol")
+                    return
+                if start_price(detail) is None:
+                    return
+                self._prediction_detail_cache[identifier] = detail
+                topic.update({key: value for key, value in detail.items() if value is not None})
+        await asyncio.gather(*(hydrate(topic) for topic in list(candidates.values())[:96]))
 
-        if all_topics:
-            self._prediction_market_cache = {"marketTopics": all_topics}
-            self._prediction_cache_timestamp = now
-            return all_topics
+    @staticmethod
+    def _oracle_timeframe(topic):
+        window = round_window(topic)
+        if window:
+            seconds = (window[1] - window[0]) / 1000
+            for timeframe, period in (("5m", 300), ("15m", 900), ("1h", 3600), ("1d", 86400)):
+                if abs(seconds - period) <= 1:
+                    return timeframe
+        return _prediction_timeframe(topic, default="")
 
-        return self._prediction_market_cache.get("marketTopics", [])
+    async def fetch_prediction_market_topics(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        # Coalesce simultaneous heartbeat and tick-triggered syncs into one fetch.
+        request_started = time.monotonic()
+        async with self._prediction_catalog_lock:
+            now = time.time()
+            cached = self._prediction_market_cache.get("marketTopics", [])
+            if time.monotonic() < self._prediction_retry_at:
+                return cached
+            if getattr(self, "_last_catalog_fetch_completed", 0) > request_started:
+                return cached
+            has_expired = any(
+                _is_crypto_up_down_topic(topic) and (window := round_window(topic)) and window[1] <= now * 1000
+                for topic in cached
+            )
+            if not force_refresh and cached and not has_expired and now - self._prediction_cache_timestamp < 30:
+                return cached
+            first_topics, total, has_more = await self._fetch_market_page(0, 100)
+            all_topics = list(first_topics)
+            if has_more and total > 100:
+                # Serial pages respect backoff immediately if authorization or rate limits fail.
+                for offset in range(100, min(total, 2500), 100):
+                    topics, _, more = await self._fetch_market_page(offset, 100)
+                    all_topics.extend(topics)
+                    if not more:
+                        break
+            if all_topics:
+                await self._hydrate_oracle_details(all_topics)
+                self._prediction_market_cache = {"marketTopics": all_topics}
+                self._prediction_cache_timestamp = now
+                confirmed = len({(detail["symbol"], detail["timeframe"]) for detail in self.get_detailed_oracle_strikes().values()})
+                self.oracle_sync_status["confirmed_rounds"] = confirmed
+                if time.monotonic() >= self._prediction_retry_at:
+                    self.oracle_sync_status.update(
+                        state="READY" if confirmed else "WAITING_FOR_PRICE",
+                        reason="Current Binance oracle prices received" if confirmed else "No confirmed startPrice for current rounds",
+                        last_success_at=time.time(), retry_at=None,
+                    )
+            elif self.oracle_sync_status["state"] == "SYNCING":
+                self.oracle_sync_status.update(state="WAITING_FOR_MARKET", reason="Binance returned no crypto market topics", confirmed_rounds=0)
+            self._last_catalog_fetch_completed = time.monotonic()
+            return self._prediction_market_cache.get("marketTopics", [])
 
     def get_supported_prediction_symbols(self) -> Set[str]:
         """
@@ -476,6 +578,16 @@ class BinanceClient:
             if symbol:
                 symbols.add(symbol)
         return symbols
+
+    def get_oracle_sync_status(self) -> Dict[str, Any]:
+        status = dict(self.oracle_sync_status)
+        status["confirmed_rounds"] = len({
+            (detail["symbol"], detail["timeframe"])
+            for detail in self.get_detailed_oracle_strikes().values()
+        })
+        if status["state"] == "READY" and not status["confirmed_rounds"]:
+            status.update(state="WAITING_FOR_PRICE", reason="Waiting for confirmed prices for the new round")
+        return status
 
     def get_market_start_prices(self, now_ts: Optional[float] = None) -> Dict[str, float]:
         """
@@ -504,47 +616,39 @@ class BinanceClient:
         details: Dict[str, Dict[str, Any]] = {}
         symbol_rounds: Dict[str, Dict[str, Any]] = {}
         topics = self._prediction_market_cache.get("marketTopics", []) if self._prediction_market_cache else []
-        now_ms = (now_ts or time.time()) * 1000.0
+        now_ms = (time.time() if now_ts is None else now_ts) * 1000.0
 
         for t in topics:
             if not _is_crypto_up_down_topic(t):
                 continue
-            title = str(t.get("title", "")).upper()
-            try:
-                start_date = float(t.get("startDate", 0) or 0)
-                end_date = float(t.get("endDate", 0) or 0)
-            except (TypeError, ValueError):
+            window = round_window(t)
+            if window is None or not window[0] <= now_ms < window[1]:
                 continue
-            if start_date <= 0 or end_date <= start_date or not (start_date <= now_ms < end_date):
-                continue
-
-            variant = t.get("variantData") or {}
-            start_price_str = variant.get("startPrice")
-            if not start_price_str:
-                continue
-            try:
-                start_price = float(start_price_str)
-            except (ValueError, TypeError):
-                continue
-            if start_price <= 0:
+            start_date, end_date = window
+            start_price_value = start_price(t)
+            if start_price_value is None:
                 continue
 
             sym = _prediction_topic_symbol(t)
             if not sym:
                 continue
 
-            tf_match = re.search(r"\b(5m|15m|1h|1d)\b", title, re.IGNORECASE)
-            tf = tf_match.group(1).lower() if tf_match else "5m"
+            tf = self._oracle_timeframe(t)
+            if not tf:
+                continue
 
-            market_ids = [str(m.get("marketId")) for m in t.get("markets", []) if m.get("marketId")]
+            markets = t.get("markets")
+            if not isinstance(markets, list):
+                markets = []
+            market_ids = [str(m.get("marketId")) for m in markets if isinstance(m, dict) and m.get("marketId")]
             info = {
                 "symbol": sym,
                 "timeframe": tf,
-                "start_price": start_price,
+                "start_price": start_price_value,
                 "start_time_sec": (start_date / 1000.0) if start_date else 0.0,
                 "end_time_sec": (end_date / 1000.0) if end_date else 0.0,
                 "market_ids": market_ids,
-                "topic_id": str(t.get("topicId") or t.get("marketTopicId") or ""),
+                "topic_id": topic_id(t),
             }
             if sym:
                 key = f"{sym}-{tf}"

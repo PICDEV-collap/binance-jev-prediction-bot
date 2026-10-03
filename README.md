@@ -1,6 +1,7 @@
 # Binance Prediction Markets Event-Driven Trading Bot + Jev AI Decision Engine
 
 Runtime performance controls, measurements, and history pagination: [Performance guide](docs/performance.md).
+Price to Beat detail synchronization and API access diagnostics: [Oracle sync guide](docs/oracle-sync.md).
 
 ![Architecture](https://img.shields.io/badge/Architecture-Event--Driven-emerald?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue?style=flat-square)

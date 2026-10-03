@@ -128,6 +128,15 @@ export interface ClosedPositionItem {
 }
 
 export interface SystemStatus {
+  oracle_sync?: {
+    state: string;
+    reason: string;
+    http_status: number | null;
+    api_code: number | null;
+    confirmed_rounds: number;
+    last_success_at: number | null;
+    retry_at: number | null;
+  };
   is_paused: boolean;
   uptime_seconds: number;
   uptime_formatted: string;

@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -p 3888",
     "build": "next build",
-    "start": "next start -p 3888",
+    "start": "node scripts/start-production.cjs",
     "lint": "next lint"
   },
   "dependencies": {

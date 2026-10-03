@@ -296,6 +296,8 @@ class TradingBotCoordinator:
     def _trigger_fast_oracle_sync(self) -> None:
         """Trigger immediate proactive refresh of Binance prediction topics to obtain startPrice."""
         now = time.time()
+        if time.monotonic() < self.binance_client._prediction_retry_at:
+            return
         if (now - getattr(self, "_last_fast_oracle_sync", 0.0)) < 2.0:
             return
         self._last_fast_oracle_sync = now
@@ -439,7 +441,7 @@ class TradingBotCoordinator:
                     self._spawn_task(_reconcile_and_sync(), name="periodic_sync_closed")
 
                 # Periodic / Proactive refresh of official Price to Beat (startPrice) from Binance topics
-                needs_fast_oracle_sync = any(not getattr(m, "strike_confirmed", False) for m in (markets or []))
+                needs_fast_oracle_sync = any(not m.get("strike_confirmed", False) for m in (markets or []))
                 if (needs_fast_oracle_sync and heartbeat_ticks % 3 == 0) or (heartbeat_ticks % 15 == 0):
                     async def _sync_oracle_strikes():
                         try:
@@ -591,12 +593,16 @@ class TradingBotCoordinator:
         # Price to Beat Oracle Gate: Ensure strike is officially confirmed by Binance for this round
         if not getattr(market, "strike_confirmed", False) or getattr(market, "target_price", 0.0) <= 0:
             now = time.time()
-            if (now - self._last_oracle_log.get(market.market_id, 0.0)) >= 10.0:
+            oracle = self.binance_client.oracle_sync_status
+            blocked = oracle["state"] in ("API_AUTH_ERROR", "RATE_LIMITED", "API_ERROR", "NETWORK_ERROR", "INVALID_RESPONSE")
+            if (now - self._last_oracle_log.get(market.market_id, 0.0)) >= (60.0 if blocked else 10.0):
                 self._last_oracle_log[market.market_id] = now
-                logger.warning(
-                    f"[WAITING FOR BINANCE ORACLE] Round {market.market_id} ({market.symbol} {market.timeframe}) "
-                    f"has not received official Price to Beat (startPrice) from Binance. Waiting for Chainlink oracle..."
-                )
+                if blocked:
+                    logger.warning("[ORACLE ACCESS BLOCKED] Round %s: %s (HTTP=%s, code=%s)",
+                                   market.market_id, oracle["reason"], oracle["http_status"], oracle["api_code"])
+                else:
+                    logger.warning("[WAITING FOR BINANCE ORACLE] Round %s (%s %s) has no confirmed startPrice for the current round",
+                                   market.market_id, market.symbol, market.timeframe)
             self._trigger_fast_oracle_sync()
             return
 
@@ -1081,6 +1087,7 @@ class TradingBotCoordinator:
                 "is_stale": self.ws_listener.metrics.get("is_stale", False),
             },
             "ws_stream": self.ws_listener.metrics,
+            "oracle_sync": self.binance_client.get_oracle_sync_status(),
             "performance": {**self.performance.snapshot(), "ingress": self.ws_listener.performance.snapshot(), "ai_in_progress": len(self._eval_in_progress), "ai_capacity": self.max_ai_concurrency, "dashboard_pending": sum(len(x.events) + (x.state is not None) for x in self._dashboard_senders.values())},
             "jev_ai": self.jev_client.stats,
             "risk_guard": self.risk_guard.metrics,

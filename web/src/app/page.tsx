@@ -849,6 +849,17 @@ export default function DashboardPage() {
 
       {/* Main Dashboard Layout */}
       <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 sm:px-6 2xl:px-10 py-5 sm:py-6 space-y-5">
+        {status?.oracle_sync && !['READY', 'STARTING', 'SYNCING'].includes(status.oracle_sync.state) && (
+          <div role="alert" className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            {status.oracle_sync.state === 'API_AUTH_ERROR'
+              ? 'Binance ปฏิเสธการเข้าถึงข้อมูลตลาด กรุณาตรวจ API Key สิทธิ์การเข้าถึง และ IP ที่อนุญาต บอตจะรอราคายืนยันก่อนประเมินหรือเปิดคำสั่ง'
+              : status.oracle_sync.state === 'RATE_LIMITED'
+                ? 'Binance จำกัดการเรียกข้อมูลชั่วคราว บอตจะลองใหม่อัตโนมัติและรอราคายืนยันก่อนเปิดคำสั่ง'
+                : ['API_ERROR', 'NETWORK_ERROR', 'INVALID_RESPONSE'].includes(status.oracle_sync.state)
+                  ? 'ดึงข้อมูลตลาด Binance ไม่สำเร็จ บอตจะลองใหม่อัตโนมัติและรอราคายืนยันก่อนเปิดคำสั่ง'
+                  : 'กำลังรอ Price to Beat ที่ยืนยันสำหรับรอบปัจจุบันจาก Binance'}
+          </div>
+        )}
         
         {/* Top Executive Metrics Ribbon */}
         <MetricsBar status={status} openPositions={openPositions} />
