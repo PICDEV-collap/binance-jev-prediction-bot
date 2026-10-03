@@ -26,6 +26,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from engine.jev_client import MarketContext
 from engine.indicators import RollingCandleAggregator, Candle
+from engine.performance import PerformanceMetrics
 from engine.symbols import DEFAULT_ACTIVE_SYMBOLS, normalize_active_symbols
 
 logger = logging.getLogger("ws_listener")
@@ -138,6 +139,9 @@ class BinanceWSListener:
         self.candle_aggregator: RollingCandleAggregator = RollingCandleAggregator(max_history=60)
         self._btc_momentum: float = 0.0
         self._background_tasks: Set[asyncio.Task] = set()
+        self.performance = PerformanceMetrics()
+        self._pending_events: Dict[str, MarketContext] = {}
+        self._dispatch_tasks: Dict[str, asyncio.Task] = {}
 
     async def configure_active_symbols(self, symbols: Iterable[str]) -> bool:
         """Replace the subscribed pair allowlist and reconnect the feed without restarting the bot."""
@@ -267,6 +271,8 @@ class BinanceWSListener:
                 task.cancel()
         if self._background_tasks:
             await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+        self._pending_events.clear()
+        self._dispatch_tasks.clear()
 
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
@@ -399,8 +405,13 @@ class BinanceWSListener:
     def _process_single_tick(self, data: Dict[str, Any]) -> None:
         """Normalize and dispatch ticks for all active timeframes."""
         try:
+            started = time.perf_counter()
             contexts = self._normalize_market_data(data)
+            self.performance.observe("normalization_indicators", started)
             if contexts:
+                source_age = contexts[0].spot_data_age_ms
+                if source_age is not None:
+                    self.performance.record("source_to_ingress", source_age)
                 for market_context in contexts:
                     # Key by unique symbol + timeframe to guarantee exactly 1 live round per pair (at most 24 total)
                     key = f"{market_context.symbol}_{market_context.timeframe}"
@@ -412,13 +423,33 @@ class BinanceWSListener:
                         if self.event_filter and not self.event_filter(market_context):
                             continue
                         self._events_dispatched += 1
-                        self._spawn_task(self._safe_dispatch_event(market_context))
+                        self._schedule_market_event(market_context)
         except Exception as err:
             logger.error(f"Error processing single tick: {err}", exc_info=True)
+
+    def _schedule_market_event(self, context: MarketContext) -> None:
+        key = f"{context.symbol}_{context.timeframe}"
+        self._pending_events[key] = context
+        if key not in self._dispatch_tasks:
+            self._dispatch_tasks[key] = self._spawn_task(self._drain_market_events(key))
+        else:
+            self.performance.counters["ticks_coalesced"] += 1
+
+    async def _drain_market_events(self, key: str) -> None:
+        try:
+            while key in self._pending_events:
+                context = self._pending_events.pop(key)
+                if self.event_filter and not self.event_filter(context):
+                    continue
+                await self._safe_dispatch_event(context)
+        finally:
+            self._pending_events.pop(key, None)
+            self._dispatch_tasks.pop(key, None)
 
     async def _safe_dispatch_event(self, context: MarketContext) -> None:
         """Execute callback inside a protected non-blocking task."""
         try:
+            self.performance.record("dispatch_age", max(0, time.time() - context.timestamp) * 1000)
             context.is_stale = (self.network_state == "OFFLINE")
             if self.on_market_event:
                 await self.on_market_event(context)
@@ -787,7 +818,7 @@ class BinanceWSListener:
 
                 if self.on_market_event:
                     self._events_dispatched += 1
-                    self._spawn_task(self._safe_dispatch_event(market))
+                    self._schedule_market_event(market)
 
                 await asyncio.sleep(2.0)
 
@@ -840,6 +871,10 @@ class BinanceWSListener:
         if self.state == ConnectionState.CONNECTED:
             return "ONLINE"
         return "DEGRADED"
+
+    def get_latest_market(self, symbol: str, timeframe: str) -> Optional[MarketContext]:
+        market = self._active_markets.get(f"{symbol}_{timeframe}")
+        return market.model_copy(deep=True) if market is not None else None
 
     def get_active_markets(self) -> List[Dict[str, Any]]:
         """

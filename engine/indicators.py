@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime
 import math
 import time
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Any, Set
 
@@ -31,13 +32,17 @@ class Candle:
 
 
 def compute_ema(values: List[float], period: int) -> float:
-    """Calculate Exponential Moving Average."""
+    """Reuse the completed history and apply the active close without rounding."""
     if not values:
         return 0.0
-    if len(values) < period:
+    if len(values) <= period:
         return sum(values) / len(values)
-    
-    # Initialize with SMA of first `period` items
+    ema = _ema_history(tuple(values[:-1]), period)
+    return (values[-1] - ema) * (2.0 / (period + 1)) + ema
+
+
+@lru_cache(maxsize=256)
+def _ema_history(values: Tuple[float, ...], period: int) -> float:
     ema = sum(values[:period]) / period
     multiplier = 2.0 / (period + 1)
     for price in values[period:]:
@@ -45,76 +50,64 @@ def compute_ema(values: List[float], period: int) -> float:
     return ema
 
 
-def compute_rsi(closes: List[float], period: int = 14) -> float:
-    """
-    Calculate Relative Strength Index (RSI) using Wilder's smoothing.
-    Returns float between 0.0 and 100.0 (defaults to 50.0 if insufficient data).
-    """
-    if len(closes) < period + 1:
-        return 50.0
-
-    gains: List[float] = []
-    losses: List[float] = []
-
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        if diff >= 0:
-            gains.append(diff)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(diff))
-
-    # Initial average gain/loss
+@lru_cache(maxsize=256)
+def _rsi_history(closes: Tuple[float, ...], period: int) -> Tuple[float, float]:
+    gains, losses = [], []
+    for previous, current in zip(closes, closes[1:]):
+        diff = current - previous
+        gains.append(max(0.0, diff))
+        losses.append(max(0.0, -diff))
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    return avg_gain, avg_loss
 
-    # Wilder's smoothing for subsequent periods
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
-    if avg_loss == 0.0:
+def compute_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    if len(closes) == period + 1:
+        avg_gain, avg_loss = _rsi_history(tuple(closes), period)
+    else:
+        avg_gain, avg_loss = _rsi_history(tuple(closes[:-1]), period)
+        diff = closes[-1] - closes[-2]
+        avg_gain = (avg_gain * (period - 1) + max(0.0, diff)) / period
+        avg_loss = (avg_loss * (period - 1) + max(0.0, -diff)) / period
+    if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
+    return round(max(0.0, min(100.0, 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))), 2)
 
-    rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return round(max(0.0, min(100.0, rsi)), 2)
+
+@lru_cache(maxsize=256)
+def _atr_history(values: Tuple[Tuple[float, float, float], ...], period: int) -> float:
+    ranges = [max(high - low, abs(high - previous[2]), abs(low - previous[2]))
+              for previous, (high, low, close) in zip(values, values[1:])]
+    if len(ranges) < period:
+        return sum(ranges)
+    atr = sum(ranges[:period]) / period
+    for value in ranges[period:]:
+        atr = (atr * (period - 1) + value) / period
+    return atr
 
 
 def compute_atr(candles: List[Candle], period: int = 14) -> float:
-    """
-    Calculate Average True Range (ATR) from OHLC candles.
-    Returns estimated range in base currency units.
-    """
     if len(candles) < 2:
-        if candles:
-            return max(0.01, candles[-1].high - candles[-1].low)
-        return 1.0
-
-    tr_list: List[float] = []
-    for i in range(1, len(candles)):
-        curr = candles[i]
-        prev_close = candles[i - 1].close
-        tr = max(
-            curr.high - curr.low,
-            abs(curr.high - prev_close),
-            abs(curr.low - prev_close)
-        )
-        tr_list.append(tr)
-
-    if not tr_list:
-        return 1.0
-
-    if len(tr_list) < period:
-        return round(sum(tr_list) / len(tr_list), 4)
-
-    # Wilder's smoothing
-    atr = sum(tr_list[:period]) / period
-    for i in range(period, len(tr_list)):
-        atr = (atr * (period - 1) + tr_list[i]) / period
-
-    return round(max(0.0001, atr), 4)
+        return max(0.01, candles[-1].high - candles[-1].low) if candles else 1.0
+    # Immutable completed OHLC keys automatically invalidate on seed or rollover.
+    history = tuple((c.high, c.low, c.close) for c in candles[:-1])
+    previous = _atr_history(history, period)
+    current = candles[-1]
+    previous_close = candles[-2].close
+    last_range = max(current.high - current.low, abs(current.high - previous_close),
+                     abs(current.low - previous_close))
+    count = len(candles) - 1
+    if count <= period:
+        atr = (previous + last_range) / count
+    else:
+        atr = (previous * (period - 1) + last_range) / period
+    return round(max(0.0001, atr), 4) if count >= period else round(atr, 4)
 
 
 def compute_dvr(

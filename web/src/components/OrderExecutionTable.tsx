@@ -24,6 +24,7 @@ interface OrderExecutionTableProps {
   orders: OrderItem[];
   openPositions?: PositionItem[];
   closedPositions?: ClosedPositionItem[];
+  historyControls?: React.ReactNode;
   onClaimWinnings?: () => Promise<void> | void;
 }
 
@@ -34,6 +35,7 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
   orders = [], 
   openPositions = [], 
   closedPositions = [],
+  historyControls,
   onClaimWinnings
 }) => {
   const [activeTab, setActiveTab] = useState<MainTab>('OPEN_POSITIONS');
@@ -363,6 +365,7 @@ const OrderExecutionTableComponent: React.FC<OrderExecutionTableProps> = ({
       {/* ========================================================================= */}
       {activeTab === 'CLOSED_POSITIONS' && (
         <div className="space-y-4">
+          {historyControls}
           
           {/* Summary Metric Ribbon for Closed Positions */}
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800/70 font-mono text-xs items-center">

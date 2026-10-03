@@ -41,6 +41,7 @@ from config import settings
 from engine.binance_client import BinanceClient, OrderResult
 from engine.jev_client import JevClient, JevEvaluationResult, MarketContext
 from engine.risk_guard import RiskGuard, RiskEvaluationResult
+from engine.performance import PerformanceMetrics, DashboardSender
 from engine.symbols import DEFAULT_ACTIVE_SYMBOLS, normalize_active_symbols
 from streams.ws_listener import BinanceWSListener, ConnectionState
 
@@ -280,14 +281,15 @@ class TradingBotCoordinator:
         # Telemetry storage
         self.recent_decisions: List[Dict[str, Any]] = []
         self.ws_clients: Set[WebSocket] = set()
+        self.performance = PerformanceMetrics()
+        self._dashboard_senders = {}
+        self.max_ai_concurrency = settings.ai_max_concurrency
         self._ws_session_digests: Dict[WebSocket, str] = {}
         self._last_eval_time: Dict[str, float] = {}
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._background_tasks: Set[asyncio.Task] = set()
         self._eval_in_progress: Set[str] = set()
         self._order_execution_lock: asyncio.Lock = asyncio.Lock()
-        self._last_closed_pos_count: int = -1
-        self._last_closed_pos_head_id: Optional[str] = None
         self._last_oracle_log: Dict[str, float] = {}
         self._last_fast_oracle_sync: float = 0.0
 
@@ -400,6 +402,8 @@ class TradingBotCoordinator:
         if self._background_tasks:
             await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
 
+        senders = list(self._dashboard_senders.values())
+        await asyncio.gather(*(sender.stop() for sender in senders), return_exceptions=True)
         await self.ws_listener.stop()
         await self.binance_client.close()
         await self.jev_client.close()
@@ -490,29 +494,8 @@ class TradingBotCoordinator:
                         "active_markets": markets,
                         "open_positions": open_pos,
                     }
-                    # Only include heavy closed_positions history if it changed or every 30s
-                    closed_pos = self.binance_client.get_closed_positions()
-                    current_head_id = closed_pos[0].get("position_id") if closed_pos else None
-                    if (
-                        len(closed_pos) != self._last_closed_pos_count
-                        or current_head_id != self._last_closed_pos_head_id
-                        or (heartbeat_ticks % 30 == 0)
-                    ):
-                        msg["closed_positions"] = closed_pos
-                        self._last_closed_pos_count = len(closed_pos)
-                        self._last_closed_pos_head_id = current_head_id
-                    disconnected: List[WebSocket] = []
-                    for client in list(self.ws_clients):
-                        try:
-                            if _username_for_digest(self._ws_session_digests.get(client, "")) is None:
-                                disconnected.append(client)
-                                await client.close(code=4401)
-                                continue
-                            await asyncio.wait_for(client.send_json(msg), timeout=0.8)
-                        except Exception:
-                            disconnected.append(client)
-                    for dead in disconnected:
-                        self.ws_clients.discard(dead)
+                    msg.update(self.binance_client.get_closed_positions_page())
+                    self._enqueue_dashboard(msg)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -642,6 +625,11 @@ class TradingBotCoordinator:
         if (now - last_eval) < self.eval_interval_seconds:
             return
 
+        if len(self._eval_in_progress) >= self.max_ai_concurrency:
+            self.performance.counters["ai_capacity_skipped"] += 1
+            return
+
+        pipeline_started = time.perf_counter()
         # Record this evaluation timestamp
         self.last_eval_time[market.market_id] = now
         self.evaluated_rounds.add(market.market_id)
@@ -655,11 +643,13 @@ class TradingBotCoordinator:
                 min(self.risk_guard.max_position_size_usdt,
                     self.risk_guard.default_order_contracts * 0.50),
             )
+            quote_started = time.perf_counter()
             quote_snapshot = await self.binance_client.get_prediction_quote_snapshot(
                 symbol=market.symbol,
                 timeframe=market.timeframe,
                 estimated_cost_usdt=quote_cost,
             )
+            self.performance.observe("quote", quote_started)
             if not quote_snapshot:
                 logger.warning(
                     "[AI SKIPPED] Could not obtain fresh UP and DOWN execution quotes for %s; no synthetic quote fallback is used.",
@@ -689,7 +679,9 @@ class TradingBotCoordinator:
             )
 
             # Step 1: AI Evaluation via Jev AI Decision Engine
+            ai_started = time.perf_counter()
             decision: JevEvaluationResult = await self.jev_client.evaluate_market(market)
+            self.performance.observe("ai", ai_started)
             fallback_blocked = decision.is_mock and not self.binance_client.paper_trading
             if fallback_blocked:
                 logger.error(
@@ -709,10 +701,31 @@ class TradingBotCoordinator:
                 and decision.action in ("UP", "DOWN", "BUY_YES", "BUY_NO")
                 and decision.confidence >= self.risk_guard.confidence_threshold
             ):
+                lock_started = time.perf_counter()
                 async with self._order_execution_lock:
+                    self.performance.observe("execution_lock_wait", lock_started)
                     if self.bot_status != "RUNNING" or self.is_paused:
                         logger.info("[ORDER ABORTED] Bot was stopped before the order lock was acquired.")
                         return
+                    refreshed = self._refresh_execution_market(market)
+                    if refreshed is None:
+                        self.performance.counters["stale_decision_rejected"] += 1
+                        return
+                    market = refreshed
+                    if not self.binance_client.paper_trading:
+                        refresh_started = time.perf_counter()
+                        refreshed_quote = await self.binance_client.get_prediction_quote_snapshot(
+                            symbol=market.symbol, timeframe=market.timeframe,
+                            estimated_cost_usdt=quote_cost,
+                        )
+                        self.performance.observe("quote_refresh", refresh_started)
+                        if (not refreshed_quote or not 0 <= time.time() - refreshed_quote["timestamp"] <= 5):
+                            self.performance.counters["stale_quote_rejected"] += 1
+                            return
+                        market.contract_up_ask = float(refreshed_quote["up_ask"])
+                        market.contract_down_ask = float(refreshed_quote["down_ask"])
+                        market.contract_quote_timestamp = float(refreshed_quote["timestamp"])
+                        market.contract_quote_source = str(refreshed_quote["source"])
                     # Concurrency Guard inside Mutex: Eliminate cross-asset TOCTOU race conditions
                     current_open = self.binance_client.get_positions()
                     in_flight = len(getattr(self.binance_client, "_in_flight_orders", {}))
@@ -763,6 +776,7 @@ class TradingBotCoordinator:
                             f"[PRE-FLIGHT GATE] Initiating Binance authoritative pre-order verification for "
                             f"{market.symbol} {decision.action} on {market.market_id} (Est. Cost: ${est_cost:.2f})..."
                         )
+                        preflight_started = time.perf_counter()
                         pre_flight = await self.binance_client.verify_pre_flight_readiness(
                             symbol=market.symbol,
                             market_id=market.market_id,
@@ -774,6 +788,13 @@ class TradingBotCoordinator:
                             max_concurrent_positions=self.risk_guard.max_concurrent_positions,
                         )
 
+                        self.performance.observe("preflight", preflight_started)
+                        refreshed = self._refresh_execution_market(market)
+                        if refreshed is None or time.perf_counter() - preflight_started > 5.0:
+                            pre_flight.verified = False
+                            pre_flight.reason = "STALE_EXECUTION_INPUT: market or pre-flight quote expired"
+                        else:
+                            market = refreshed
                         # A stop request can arrive while the authoritative pre-flight call is in progress.
                         if self.bot_status != "RUNNING" or self.is_paused:
                             pre_flight.verified = False
@@ -818,6 +839,7 @@ class TradingBotCoordinator:
                             }
 
                             # Execute RiskGuard sizing using 100% Binance verified balance & quote price
+                            risk_started = time.perf_counter()
                             risk_result = self.risk_guard.validate_and_size_order(
                                 decision=decision,
                                 market=market,
@@ -827,6 +849,7 @@ class TradingBotCoordinator:
                                 confirmed_quote_price=pre_flight.quoted_price,
                             )
 
+                            self.performance.observe("risk", risk_started)
                             # Step 3: Order Execution (Dispatched immediately inside lock to serialize fills)
                             if risk_result.approved and risk_result.action in ("UP", "DOWN", "BUY_YES", "BUY_NO"):
                                 clean_action = "UP" if risk_result.action in ("UP", "BUY_YES") else "DOWN"
@@ -834,6 +857,7 @@ class TradingBotCoordinator:
                                     f">>> DISPATCHING PREDICTION ORDER: {clean_action} {risk_result.adjusted_contracts}x "
                                     f"on {market.market_id} ({market.timeframe}) [{risk_result.stage_label}] @ {risk_result.target_price:.3f}"
                                 )
+                                execution_started = time.perf_counter()
                                 order_result = await self.binance_client.place_prediction_order(
                                     market_id=market.market_id,
                                     symbol=market.symbol,
@@ -847,6 +871,7 @@ class TradingBotCoordinator:
                                     timeframe=market.timeframe,
                                     pre_verified_quote=pre_verified_quote,
                                 )
+                                self.performance.observe("execution", execution_started)
                                 if order_result.status in ("FILLED", "SIMULATED", "NEW"):
                                     self.traded_rounds.add(market.market_id)
                                     self.risk_guard.record_market_traded(market.market_id)
@@ -938,6 +963,7 @@ class TradingBotCoordinator:
             # Broadcast update to connected dashboard WebSocket clients
             await self._broadcast_telemetry(record)
         finally:
+            self.performance.observe("pipeline", pipeline_started)
             self._eval_in_progress.discard(market.market_id)
 
     async def _broadcast_telemetry(self, event_data: Dict[str, Any]) -> None:
@@ -946,59 +972,76 @@ class TradingBotCoordinator:
             return
 
         open_pos = self.binance_client.get_positions()
-        closed_pos = self.binance_client.get_closed_positions()
         message = {
             "type": "MARKET_EVALUATION",
             "data": event_data,
             "system_status": self.get_system_status(),
             "active_markets": self.ws_listener.get_active_markets(),
             "open_positions": open_pos,
-            "closed_positions": closed_pos,
             "positions": open_pos,
         }
 
-        disconnected: List[WebSocket] = []
-        for client in list(self.ws_clients):
-            try:
-                if _username_for_digest(self._ws_session_digests.get(client, "")) is None:
-                    disconnected.append(client)
-                    await client.close(code=4401)
-                    continue
-                await asyncio.wait_for(client.send_json(message), timeout=0.8)
-            except Exception:
-                disconnected.append(client)
-
-        for dead_client in disconnected:
-            self.ws_clients.discard(dead_client)
-            self._ws_session_digests.pop(dead_client, None)
+        message.update(self.binance_client.get_closed_positions_page())
+        self._enqueue_dashboard(message)
 
     async def broadcast_status(self) -> None:
         """Broadcast updated system status immediately to all connected dashboard websockets."""
         if not self.ws_clients:
             return
         open_pos = self.binance_client.get_positions()
-        closed_pos = self.binance_client.get_closed_positions()
         msg = {
             "type": "HEARTBEAT",
             "system_status": self.get_system_status(),
             "active_markets": self.ws_listener.get_active_markets(),
             "open_positions": open_pos,
-            "closed_positions": closed_pos,
             "positions": open_pos,
         }
-        disconnected: List[WebSocket] = []
+        msg.update(self.binance_client.get_closed_positions_page())
+        self._enqueue_dashboard(msg)
+
+    def _refresh_execution_market(self, market):
+        # Live execution must use the current round and current market data.
+        if self.binance_client.paper_trading:
+            refreshed = market.model_copy(deep=True)
+        else:
+            refreshed = self.ws_listener.get_latest_market(market.symbol, market.timeframe)
+            if refreshed is None or refreshed.market_id != market.market_id:
+                return None
+            age_ms = time.time() * 1000 - (refreshed.spot_source_timestamp_ms or 0)
+            if (refreshed.is_stale or not 0 <= age_ms <= 5000
+                    or not refreshed.strike_confirmed or refreshed.target_price <= 0
+                    or not refreshed.indicator_data_ready or not refreshed.obi_available
+                    or not refreshed.momentum_available
+                    or not self._should_evaluate_market(refreshed)):
+                return None
+            for field in ("contract_up_ask", "contract_down_ask", "contract_quote_timestamp",
+                          "contract_quote_source", "recent_performance", "martingale_step",
+                          "martingale_stage", "effective_hurdle"):
+                setattr(refreshed, field, getattr(market, field))
+        if refreshed.round_end_time_sec is not None:
+            refreshed.time_left_seconds = int(refreshed.round_end_time_sec - time.time())
+        if refreshed.time_left_seconds < self.risk_guard.min_time_left_seconds:
+            return None
+        return refreshed
+
+    def _enqueue_dashboard(self, message):
         for client in list(self.ws_clients):
-            try:
-                if _username_for_digest(self._ws_session_digests.get(client, "")) is None:
-                    disconnected.append(client)
-                    await client.close(code=4401)
-                    continue
-                await asyncio.wait_for(client.send_json(msg), timeout=0.8)
-            except Exception:
-                disconnected.append(client)
-        for dead in disconnected:
-            self.ws_clients.discard(dead)
-            self._ws_session_digests.pop(dead, None)
+            self._enqueue_dashboard_client(client, message)
+
+    def _enqueue_dashboard_client(self, client, message):
+        sender = self._dashboard_senders.get(client)
+        if sender is None:
+            def disconnected():
+                self.ws_clients.discard(client)
+                self._ws_session_digests.pop(client, None)
+                self._dashboard_senders.pop(client, None)
+            sender = DashboardSender(
+                client,
+                lambda: _username_for_digest(self._ws_session_digests.get(client, "")) is not None,
+                disconnected, self.performance,
+            )
+            self._dashboard_senders[client] = sender
+        sender.enqueue(message)
 
     def get_system_status(self) -> Dict[str, Any]:
         """Aggregate system telemetry for dashboard inspection."""
@@ -1038,6 +1081,7 @@ class TradingBotCoordinator:
                 "is_stale": self.ws_listener.metrics.get("is_stale", False),
             },
             "ws_stream": self.ws_listener.metrics,
+            "performance": {**self.performance.snapshot(), "ingress": self.ws_listener.performance.snapshot(), "ai_in_progress": len(self._eval_in_progress), "ai_capacity": self.max_ai_concurrency, "dashboard_pending": sum(len(x.events) + (x.state is not None) for x in self._dashboard_senders.values())},
             "jev_ai": self.jev_client.stats,
             "risk_guard": self.risk_guard.metrics,
             "account": account_summary,
@@ -1118,12 +1162,12 @@ async def get_orders(limit: int = Query(default=50, ge=1, le=200)) -> List[Dict[
 
 
 @app.get("/api/positions")
-async def get_positions_endpoint() -> Dict[str, Any]:
-    """Get currently active open positions and historical closed/settled positions."""
+async def get_positions_endpoint(offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100)) -> Dict[str, Any]:
+    """Return live positions and a bounded newest-first history page."""
     return {
         "status": "success",
         "open_positions": bot.binance_client.get_positions(),
-        "closed_positions": bot.binance_client.get_closed_positions(),
+        **bot.binance_client.get_closed_positions_page(offset=offset, limit=limit),
         "account": bot.binance_client.get_account_summary(),
     }
 
@@ -1796,7 +1840,7 @@ async def websocket_telemetry_endpoint(websocket: WebSocket) -> None:
         bot.ws_clients.add(websocket)
         bot._ws_session_digests[websocket] = session_digest
 
-        # Send initial snapshot immediately upon connection
+        # Send initial snapshot through the same writer as subsequent updates
         open_pos = bot.binance_client.get_positions()
         closed_pos = bot.binance_client.get_closed_positions()
         snapshot = {
@@ -1809,7 +1853,8 @@ async def websocket_telemetry_endpoint(websocket: WebSocket) -> None:
             "closed_positions": closed_pos,
             "positions": open_pos,
         }
-        await websocket.send_json(snapshot)
+        snapshot.update(bot.binance_client.get_closed_positions_page())
+        bot._enqueue_dashboard_client(websocket, snapshot)
 
         # Keep socket open and handle any incoming messages/pings
         while True:
@@ -1818,12 +1863,15 @@ async def websocket_telemetry_endpoint(websocket: WebSocket) -> None:
                 await websocket.close(code=4401)
                 break
             if data == "ping":
-                await websocket.send_text("pong")
+                bot._enqueue_dashboard_client(websocket, {"type": "PONG"})
     except WebSocketDisconnect:
         pass
     except Exception:
         logger.debug("Dashboard WebSocket closed after a connection error")
     finally:
+        sender = bot._dashboard_senders.pop(websocket, None)
+        if sender is not None:
+            await sender.stop()
         bot.ws_clients.discard(websocket)
         bot._ws_session_digests.pop(websocket, None)
 

@@ -1884,6 +1884,18 @@ class BinanceClient:
             return []
         return [p.model_dump() for p in reversed(self._closed_positions[-limit:])]
 
+    def get_closed_positions_page(self, offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+        """Serialize only the requested newest-first page."""
+        total = len(self._closed_positions)
+        end = max(0, total - offset)
+        start = max(0, end - limit)
+        return {
+            "closed_positions": [p.model_dump() for p in reversed(self._closed_positions[start:end])],
+            "closed_positions_total": total,
+            "offset": offset,
+            "limit": limit,
+        }
+
     def get_recent_performance(self, symbol: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
         """
         Analyze recent closed positions for feedback-driven AI inference and risk scaling.

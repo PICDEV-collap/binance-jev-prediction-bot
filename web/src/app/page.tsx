@@ -123,6 +123,11 @@ export default function DashboardPage() {
   const [orders, setOrders] = useState<OrderItem[]>([]);
   const [openPositions, setOpenPositions] = useState<PositionItem[]>([]);
   const [closedPositions, setClosedPositions] = useState<ClosedPositionItem[]>([]);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const [historyPage, setHistoryPage] = useState<ClosedPositionItem[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isConfigOpen, setIsConfigOpen] = useState<boolean>(false);
   const [serverUrl, setServerUrl] = useState<string>('http://localhost:8899');
@@ -327,6 +332,19 @@ export default function DashboardPage() {
       socket.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
+          if (typeof message.closed_positions_total === 'number') {
+            setHistoryTotal(message.closed_positions_total);
+          }
+          if (message.closed_positions_delta) {
+            const delta = message.closed_positions_delta;
+            setClosedPositions((previous) => {
+              const rows = new Map(previous.map((row) => [row.position_id, row]));
+              for (const row of delta.upserts as ClosedPositionItem[]) rows.set(row.position_id, row);
+              return (delta.order as string[])
+                .map((id) => rows.get(id))
+                .filter((row): row is ClosedPositionItem => row !== undefined);
+            });
+          }
 
           if (message.type === 'INITIAL_SNAPSHOT') {
             if (message.system_status) {
@@ -387,17 +405,7 @@ export default function DashboardPage() {
               });
             }
             if (message.closed_positions) {
-              setClosedPositions((prev) => {
-                if (
-                  prev.length === message.closed_positions.length &&
-                  prev.length > 0 &&
-                  prev[0]?.position_id === message.closed_positions[0]?.position_id &&
-                  prev[0]?.realized_pnl === message.closed_positions[0]?.realized_pnl
-                ) {
-                  return prev;
-                }
-                return message.closed_positions;
-              });
+              setClosedPositions(message.closed_positions);
             }
             if (message.active_markets?.length > 0) {
               setMarkets(message.active_markets);
@@ -432,17 +440,7 @@ export default function DashboardPage() {
               });
             }
             if (message.closed_positions) {
-              setClosedPositions((prev) => {
-                if (
-                  prev.length === message.closed_positions.length &&
-                  prev.length > 0 &&
-                  prev[0]?.position_id === message.closed_positions[0]?.position_id &&
-                  prev[0]?.realized_pnl === message.closed_positions[0]?.realized_pnl
-                ) {
-                  return prev;
-                }
-                return message.closed_positions;
-              });
+              setClosedPositions(message.closed_positions);
             }
 
             setRecords((prev) => {
@@ -552,6 +550,41 @@ export default function DashboardPage() {
     return response;
   }, [getApiUrl, operator.token]);
 
+  useEffect(() => {
+    setHistoryOffset(0);
+    setHistoryPage([]);
+    setHistoryTotal(0);
+  }, [serverUrl, operator.token]);
+
+  useEffect(() => {
+    if (historyOffset > 0 && historyOffset >= historyTotal) {
+      setHistoryOffset(Math.max(0, Math.floor((historyTotal - 1) / 50) * 50));
+    }
+  }, [historyOffset, historyTotal]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setHistoryError('');
+    if (historyOffset === 0 || !isAuthenticated) {
+      setHistoryLoading(false);
+      return;
+    }
+    setHistoryLoading(true);
+    setHistoryPage([]);
+    authenticatedFetch(`/api/positions?offset=${historyOffset}&limit=50`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error('โหลดประวัติไม่สำเร็จ');
+        const data = await response.json();
+        if (!cancelled) {
+          setHistoryPage(data.closed_positions);
+          setHistoryTotal(data.closed_positions_total);
+        }
+      })
+      .catch(() => { if (!cancelled) setHistoryError('โหลดประวัติไม่สำเร็จ กรุณากลับหน้าล่าสุดแล้วลองอีกครั้ง'); })
+      .finally(() => { if (!cancelled) setHistoryLoading(false); });
+    return () => { cancelled = true; };
+  }, [historyOffset, isAuthenticated, authenticatedFetch]);
+
   // Periodic REST polling fallback to ensure 100% data sync even if WebSocket is disconnected/reconnecting
   useEffect(() => {
     let isCancelled = false;
@@ -578,6 +611,8 @@ export default function DashboardPage() {
 
         if (posRes && posRes.ok) {
           const posData = await posRes.json();
+          if (isCancelled) return;
+          setHistoryTotal(posData.closed_positions_total ?? posData.closed_positions?.length ?? 0);
           if (posData.open_positions) {
             setOpenPositions(posData.open_positions);
           }
@@ -854,7 +889,17 @@ export default function DashboardPage() {
         <OrderExecutionTable 
           orders={orders} 
           openPositions={openPositions}
-          closedPositions={closedPositions}
+          closedPositions={historyOffset === 0 ? closedPositions : historyPage}
+          historyControls={
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4 text-xs text-slate-400">
+              <span>{historyLoading ? 'กำลังโหลดประวัติ…' : historyError || `รายการ ${historyTotal ? historyOffset + 1 : 0}–${Math.min(historyOffset + 50, historyTotal)} จาก ${historyTotal} · สถิติด้านล่างคำนวณจากหน้านี้`}</span>
+              <div className="flex gap-2">
+                <button className="px-3 py-2 rounded bg-slate-800 disabled:opacity-40" disabled={historyOffset === 0 || historyLoading} onClick={() => setHistoryOffset(0)}>ล่าสุด</button>
+                <button className="px-3 py-2 rounded bg-slate-800 disabled:opacity-40" disabled={historyOffset === 0 || historyLoading} onClick={() => setHistoryOffset(Math.max(0, historyOffset - 50))}>ก่อนหน้า</button>
+                <button className="px-3 py-2 rounded bg-slate-800 disabled:opacity-40" disabled={historyOffset + 50 >= historyTotal || historyLoading} onClick={() => setHistoryOffset(historyOffset + 50)}>ถัดไป</button>
+              </div>
+            </div>
+          }
         />
 
         {/* Live Terminal Log Stream */}

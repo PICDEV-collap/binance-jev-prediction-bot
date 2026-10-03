@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     target_symbol: str = Field(default="BTCUSDT", alias="TARGET_SYMBOL")
     target_timeframe: str = Field(default="5m", alias="TARGET_TIMEFRAME")
     evaluations_per_round: int = Field(default=1, alias="EVALUATIONS_PER_ROUND")
+    ai_max_concurrency: int = Field(default=4, ge=1, le=24, alias="AI_MAX_CONCURRENCY")
 
     # --- Binance Prediction Trading & Network Resilience ---
     funding_source: str = Field(default="CEX", alias="FUNDING_SOURCE")  # "CEX" or "MPC"

@@ -1,5 +1,7 @@
 # Binance Prediction Markets Event-Driven Trading Bot + Jev AI Decision Engine
 
+Runtime performance controls, measurements, and history pagination: [Performance guide](docs/performance.md).
+
 ![Architecture](https://img.shields.io/badge/Architecture-Event--Driven-emerald?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue?style=flat-square)
 ![Next.js](https://img.shields.io/badge/Next.js-14.2-black?style=flat-square)
